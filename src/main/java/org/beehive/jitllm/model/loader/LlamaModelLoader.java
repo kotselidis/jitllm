@@ -170,8 +170,13 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
                         nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")), // fp32
                 perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
-                perLayerQuantized(
-                        retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
+                // ffn_down keeps its own type: llama.cpp's Q4_0 recipe writes some layers' down
+                // projection as Q4_1, and the layer graph picks the kernel per layer.
+                retainQ4_0
+                        ? loadArrayOfTornadoTensorsNative(
+                                nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight"))
+                        : loadArrayOfTornadoTensors(
+                                nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
                 perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
                 loadTornadoTensor(tensorEntries.get("output_norm.weight")), // fp32
@@ -212,10 +217,13 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
     }
 
     /**
-     * Whether every per-layer weight the Q4_0 layer graph reads is Q4_0.
+     * Whether every per-layer weight the Q4_0 layer graph reads is Q4_0, except {@code ffn_down},
+     * which may also be Q4_1.
      *
      * <p>The norms are F32 and are read by dtype-independent kernels, so they are not consulted;
-     * these seven are the ones a Q4_0 kernel would decode.
+     * these seven are the ones a Q4_0 kernel would decode. {@code llama-quantize ... Q4_0} gives
+     * some layers' {@code ffn_down} more bits as Q4_1 (10 of 80 in Llama-3.3-70B, 2 of 16 in
+     * Llama-3.2-1B), and the layer graph has a Q4_1 kernel for exactly that projection.
      */
     private static boolean allQ4_0(Map<String, GGMLTensorEntry> tensorEntries, int layers) {
         String[] kinds = {
@@ -224,7 +232,9 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
         for (int layer = 0; layer < layers; layer++) {
             for (String kind : kinds) {
                 GGMLTensorEntry entry = tensorEntries.get("blk." + layer + "." + kind + ".weight");
-                if (entry == null || entry.ggmlType() != GGMLType.Q4_0) {
+                boolean q4_1Down = kind.equals("ffn_down") && entry != null
+                        && entry.ggmlType() == GGMLType.Q4_1;
+                if (entry == null || (entry.ggmlType() != GGMLType.Q4_0 && !q4_1Down)) {
                     return false;
                 }
             }

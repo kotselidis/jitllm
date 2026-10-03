@@ -2,12 +2,14 @@ package org.beehive.jitllm.backend.tornado.layers.type.q4_0;
 
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_1;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LlamaQ8_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
 import org.beehive.jitllm.model.llama.LlamaConfiguration;
+import org.beehive.jitllm.runtime.tensor.DataType;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.WorkerGrid;
@@ -214,9 +216,12 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 config.hiddenDim(),
                 LOCAL_WORK_GROUP_SIZE_ALLOC);
 
+        // Q4_1 for the layers llama-quantize gave more bits; same arguments and grid.
         unifiedLayer.task(
                 "ffn_down_proj",
-                TransformerComputeKernelsQ4_0::matrixVectorGenericWithResidualQ4_0,
+                weights.w2Layered[layerIndex].dataType() == DataType.Q4_1
+                        ? TransformerComputeKernelsQ4_1::matrixVectorGenericWithResidualQ4_1
+                        : TransformerComputeKernelsQ4_0::matrixVectorGenericWithResidualQ4_0,
                 context,
                 state.workspace.wrapHb,
                 state.workspace.wrapX,
