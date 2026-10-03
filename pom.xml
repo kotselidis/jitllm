@@ -297,6 +297,44 @@
     <!-- Profiles for optional/conditional builds -->
     <profiles>
 
+        <!-- Multi-GPU pipeline split with NCCL: `mvn install -Pnccl`. Needs a TornadoVM SDK that
+             ships tornado-nccl. Without it the split still runs with
+             -Djitllm.pipeline.transport=host. -->
+        <profile>
+            <id>nccl</id>
+            <dependencies>
+                <dependency>
+                    <groupId>io.github.beehive-lab</groupId>
+                    <artifactId>tornado-nccl</artifactId>
+                    <version>${tornadovm.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>add-nccl-sources</id>
+                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>add-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/nccl/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
         <!-- ─── Class B: accelerator qualification gates ─────────────────────────
                  Opt-in: `mvn verify -Paccel-tests`. Needs TORNADOVM_HOME, a device, and
                  the pinned model fixtures (JITLLM_TEST_MODELS or ~/.jitllm/test-models).

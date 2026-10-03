@@ -58,7 +58,45 @@ public abstract class AbstractTransformerLayerTaskGraphs<W extends Weights, C ex
     protected void setupFFNLayers() {
         int numLayers = config.numberOfLayers();
 
-        this.ffnLayerITGs = IntStream.range(0, numLayers).mapToObj(this::setupFFNLayer).toList();
+        this.ffnLayerITGs =
+                IntStream.range(firstLayer, endLayer(numLayers))
+                        .mapToObj(this::setupFFNLayer)
+                        .toList();
+    }
+
+    /**
+     * First layer this stack builds. Zero unless the stack is one stage of a pipeline split across
+     * devices, in which case it builds layers {@code [firstLayer, endLayer)}.
+     */
+    protected int firstLayer = 0;
+
+    /** One past the last layer this stack builds, or -1 for every remaining layer. */
+    protected int endLayer = -1;
+
+    /**
+     * Restricts this stack to layers {@code [first, end)}. Called by a subclass constructor before
+     * {@link #setupFFNLayers()}.
+     */
+    protected void restrictToLayers(int first, int end) {
+        if (first < 0 || end > config.numberOfLayers() || first >= end) {
+            throw new IllegalArgumentException(
+                    "layer range [" + first + ", " + end + ") outside the model's "
+                            + config.numberOfLayers() + " layers");
+        }
+        this.firstLayer = first;
+        this.endLayer = end;
+    }
+
+    protected int endLayer(int numLayers) {
+        return endLayer < 0 ? numLayers : endLayer;
+    }
+
+    /**
+     * The index a layer uses in the key/value cache. A stage's cache holds only its own layers, so
+     * the index is relative to the first one.
+     */
+    protected int keyValueLayer(int layerIndex) {
+        return layerIndex - firstLayer;
     }
 
     /**
@@ -69,7 +107,7 @@ public abstract class AbstractTransformerLayerTaskGraphs<W extends Weights, C ex
     private ImmutableTaskGraph setupFFNLayer(int layerIndex) {
         TaskGraph tg = createFFNLayerTaskGraph(layerIndex);
 
-        if (layerIndex == config.numberOfLayers() - 1) {
+        if (layerIndex == endLayer(config.numberOfLayers()) - 1) {
             lastFFNLayerTaskGraphID = tg.getTaskGraphName();
         }
 

@@ -102,9 +102,16 @@ final class MemoryPreflight {
      * The backend's configured budget, or 0 when it is not set.
      *
      * <p>Read from the same property the backend charges against, so the preflight and the
-     * allocator are talking about one number.
+     * allocator are talking about one number. The budget is per device, so a model split across
+     * several devices gets it once per device.
      */
     private static long configuredBudgetBytes() {
+        return perDeviceBudgetBytes()
+                * org.beehive.jitllm.backend.tornado.TornadoVMMasterPlanPipeline
+                        .requestedDeviceCount();
+    }
+
+    private static long perDeviceBudgetBytes() {
         String configured = System.getProperty("tornado.device.memory");
         if (configured == null || configured.isBlank()) {
             return 0;
