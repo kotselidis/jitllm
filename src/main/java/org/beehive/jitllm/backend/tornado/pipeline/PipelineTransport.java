@@ -19,8 +19,8 @@ public interface PipelineTransport extends AutoCloseable {
     String NCCL_TRANSPORT = "org.beehive.jitllm.backend.tornado.pipeline.NcclTransport";
 
     /**
-     * Graph that ends a stage: sends {@code x}, produced by graph {@code producer}, to stage
-     * {@code toStage}.
+     * Graph that ends a stage: sends {@code x}, produced by graph {@code producer}, to stage {@code
+     * toStage}.
      */
     TaskGraph sendGraph(int stage, String producer, FloatArray x, int toStage);
 

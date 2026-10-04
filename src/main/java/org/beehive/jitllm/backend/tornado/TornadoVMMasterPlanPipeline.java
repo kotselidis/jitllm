@@ -132,10 +132,7 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
                 graphs.add(activation.getImmutableTaskGraph());
                 activation.updateGridScheduler(scheduler);
             } else {
-                graphs.add(
-                        transport
-                                .receiveGraph(s, stageState.workspace.wrapX, s - 1)
-                                .snapshot());
+                graphs.add(transport.receiveGraph(s, stageState.workspace.wrapX, s - 1).snapshot());
             }
 
             AbstractTransformerLayerTaskGraphs<?, ?> layers =

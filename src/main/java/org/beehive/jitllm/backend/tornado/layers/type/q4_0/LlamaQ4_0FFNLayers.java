@@ -13,8 +13,8 @@ import org.beehive.jitllm.runtime.tensor.DataType;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.KernelContext;
 import uk.ac.manchester.tornado.api.TaskGraph;
-import uk.ac.manchester.tornado.api.common.TornadoFunctions;
 import uk.ac.manchester.tornado.api.WorkerGrid;
+import uk.ac.manchester.tornado.api.common.TornadoFunctions;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
@@ -116,7 +116,9 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
         unifiedLayer = configureLayerDataTransfers(unifiedLayer, layerIndex);
         if (DP4A) {
             Object[] packed = {
-                state.workspace.wrapXbQuants, state.workspace.wrapXbScales, state.workspace.wrapXbSums
+                state.workspace.wrapXbQuants,
+                state.workspace.wrapXbScales,
+                state.workspace.wrapXbSums
             };
             if (layerIndex == firstLayer) {
                 unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, packed);
@@ -155,11 +157,23 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
         if (DP4A) {
             // Three packed projections reading the one activation the apply quantized.
             packedProjection(
-                    unifiedLayer, "q_proj", state.workspace.wrapQ, weights.wqLayered[layerIndex].asByteArray(), config.dim());
+                    unifiedLayer,
+                    "q_proj",
+                    state.workspace.wrapQ,
+                    weights.wqLayered[layerIndex].asByteArray(),
+                    config.dim());
             packedProjection(
-                    unifiedLayer, "k_proj", state.workspace.wrapK, weights.wkLayered[layerIndex].asByteArray(), config.kvDim());
+                    unifiedLayer,
+                    "k_proj",
+                    state.workspace.wrapK,
+                    weights.wkLayered[layerIndex].asByteArray(),
+                    config.kvDim());
             packedProjection(
-                    unifiedLayer, "v_proj", state.workspace.wrapV, weights.wvLayered[layerIndex].asByteArray(), config.kvDim());
+                    unifiedLayer,
+                    "v_proj",
+                    state.workspace.wrapV,
+                    weights.wvLayered[layerIndex].asByteArray(),
+                    config.kvDim());
         } else {
             // Llama's query width is dim; the kernel takes it explicitly so the same code serves a
             // family whose head dimension is stated independently.
@@ -272,7 +286,8 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                     "ffn_down_proj",
                     q4_1Down
                             ? TransformerComputeKernelsQ4_1::matrixVectorGenericWithResidualQ4_1DP4A
-                            : TransformerComputeKernelsQ4_0::matrixVectorGenericWithResidualQ4_0DP4A,
+                            : TransformerComputeKernelsQ4_0
+                                    ::matrixVectorGenericWithResidualQ4_0DP4A,
                     weights.w2Layered[layerIndex].asByteArray(),
                     config.hiddenDim(),
                     config.dim());
@@ -297,15 +312,17 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
         return unifiedLayer;
     }
 
-    /** Lanes per workgroup for a packed projection: a multiple of 32, as its warp reduction needs. */
+    /**
+     * Lanes per workgroup for a packed projection: a multiple of 32, as its warp reduction needs.
+     */
     private static final int PACKED_LOCAL = 128;
 
     // @formatter:off
     /**
      * Whether the projections read an activation quantized to eight bits and run as packed integer
-     * dot products ({@code dp4a}) rather than in floating point. The path the Qwen3.5 layers take on
-     * CUDA, granted where the device lowers {@code dp4a}; {@code -Djitllm.llama.packedIntegerDot=false}
-     * turns it off.
+     * dot products ({@code dp4a}) rather than in floating point. The path the Qwen3.5 layers take
+     * on CUDA, granted where the device lowers {@code dp4a}; {@code
+     * -Djitllm.llama.packedIntegerDot=false} turns it off.
      */
     // @formatter:on
     private static final boolean DP4A =
@@ -355,7 +372,8 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 state.workspace.wrapXbSums);
     }
 
-    private void packedProjection(TaskGraph graph, String name, FloatArray out, ByteArray w, int rows) {
+    private void packedProjection(
+            TaskGraph graph, String name, FloatArray out, ByteArray w, int rows) {
         graph.task(
                 name,
                 TransformerComputeKernelsQ4_0::matrixVectorGenericQ4_0DP4A,
@@ -373,7 +391,17 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
     private void packedResidualProjection(
             TaskGraph graph,
             String name,
-            TornadoFunctions.Task9<KernelContext, IntArray, FloatArray, IntArray, FloatArray, ByteArray, Integer, Integer, Integer> kernel,
+            TornadoFunctions.Task9<
+                            KernelContext,
+                            IntArray,
+                            FloatArray,
+                            IntArray,
+                            FloatArray,
+                            ByteArray,
+                            Integer,
+                            Integer,
+                            Integer>
+                    kernel,
             ByteArray w,
             int n,
             int rows) {
@@ -437,19 +465,29 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
             if (DP4A) {
                 String layer = "layer_" + i + ".";
                 tornadoForwardScheduler.addWorkerGrid(layer + "attn_rms_reduce", rmsReduceWorker);
-                tornadoForwardScheduler.addWorkerGrid(layer + "attn_rms_apply", quantizeWorker(config.dim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "attn_rms_apply", quantizeWorker(config.dim()));
                 tornadoForwardScheduler.addWorkerGrid(layer + "q_proj", packedWorker(config.dim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "k_proj", packedWorker(config.kvDim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "v_proj", packedWorker(config.kvDim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "rope_and_kv_cache", ropeWithCacheWorker);
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "k_proj", packedWorker(config.kvDim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "v_proj", packedWorker(config.kvDim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "rope_and_kv_cache", ropeWithCacheWorker);
                 tornadoForwardScheduler.addWorkerGrid(layer + "attention", parallelAttentionWorker);
-                tornadoForwardScheduler.addWorkerGrid(layer + "attn_out_quantize", quantizeWorker(config.dim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "attn_output_proj", packedWorker(config.dim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "attn_out_quantize", quantizeWorker(config.dim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "attn_output_proj", packedWorker(config.dim()));
                 tornadoForwardScheduler.addWorkerGrid(layer + "ffn_rms_reduce", rmsReduceWorker);
-                tornadoForwardScheduler.addWorkerGrid(layer + "ffn_rms_apply", quantizeWorker(config.dim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "ffn_gate_up", packedWorker(config.hiddenDim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "ffn_down_quantize", quantizeWorker(config.hiddenDim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "ffn_down_proj", packedWorker(config.dim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "ffn_rms_apply", quantizeWorker(config.dim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "ffn_gate_up", packedWorker(config.hiddenDim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "ffn_down_quantize", quantizeWorker(config.hiddenDim()));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "ffn_down_proj", packedWorker(config.dim()));
                 continue;
             }
             tornadoForwardScheduler.addWorkerGrid(

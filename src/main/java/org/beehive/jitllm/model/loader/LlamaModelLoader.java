@@ -232,8 +232,10 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
         for (int layer = 0; layer < layers; layer++) {
             for (String kind : kinds) {
                 GGMLTensorEntry entry = tensorEntries.get("blk." + layer + "." + kind + ".weight");
-                boolean q4_1Down = kind.equals("ffn_down") && entry != null
-                        && entry.ggmlType() == GGMLType.Q4_1;
+                boolean q4_1Down =
+                        kind.equals("ffn_down")
+                                && entry != null
+                                && entry.ggmlType() == GGMLType.Q4_1;
                 if (entry == null || (entry.ggmlType() != GGMLType.Q4_0 && !q4_1Down)) {
                     return false;
                 }

@@ -175,6 +175,14 @@ class LlamaRunner:
         if args.fp32_kv_cache:
             cmd.append("-Djitllm.kvcache.fp32=true")
 
+        # Several GPUs: the model's layers split across them, one pipeline stage per device.
+        if args.devices:
+            cmd.append(f"-Djitllm.pipeline.devices={args.devices}")
+        if args.tensor_split:
+            cmd.append(f"-Djitllm.pipeline.split={args.tensor_split}")
+        if args.split_transport:
+            cmd.append(f"-Djitllm.pipeline.transport={args.split_transport}")
+
         # Debug options
         debug_config = []
 
@@ -689,6 +697,14 @@ def create_parser(command=None) -> argparse.ArgumentParser:
                                    "(default: auto-detected)")
     hw_group.add_argument("--gpu-memory", default="14GB", metavar="SIZE",
                           help="Device memory TornadoVM may allocate")
+    hw_group.add_argument("--devices", default=None, metavar="LIST",
+                          help="Split the model's layers across these TornadoVM devices, one "
+                               "pipeline stage each, e.g. 0:0,0:1 (--gpu-memory applies per device)")
+    hw_group.add_argument("--tensor-split", default=None, metavar="LIST",
+                          help="Share of layers per device for --devices, e.g. 41,39 (default: equal)")
+    hw_group.add_argument("--split-transport", default=None, choices=["nccl", "host"],
+                          help="How the hidden state moves between --devices: NCCL (default) or "
+                               "through host memory")
     hw_group.add_argument("--heap-min", default="20g", metavar="SIZE", help="Minimum JVM heap")
     hw_group.add_argument("--heap-max", default="20g", metavar="SIZE", help="Maximum JVM heap")
 

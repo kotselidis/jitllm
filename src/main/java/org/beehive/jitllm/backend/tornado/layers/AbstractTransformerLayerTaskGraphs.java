@@ -80,8 +80,13 @@ public abstract class AbstractTransformerLayerTaskGraphs<W extends Weights, C ex
     protected void restrictToLayers(int first, int end) {
         if (first < 0 || end > config.numberOfLayers() || first >= end) {
             throw new IllegalArgumentException(
-                    "layer range [" + first + ", " + end + ") outside the model's "
-                            + config.numberOfLayers() + " layers");
+                    "layer range ["
+                            + first
+                            + ", "
+                            + end
+                            + ") outside the model's "
+                            + config.numberOfLayers()
+                            + " layers");
         }
         this.firstLayer = first;
         this.endLayer = end;
