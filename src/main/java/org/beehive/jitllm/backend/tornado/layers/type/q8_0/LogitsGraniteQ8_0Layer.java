@@ -88,5 +88,12 @@ public class LogitsGraniteQ8_0Layer extends LogitsQ8_0Layer {
         logits.transferToHost(DataTransferMode.EVERY_EXECUTION, state.workspace.wrapLogits);
         return logits;
     }
+
     // @formatter:on
+
+    /** Granite adds its own scaled {@code vocab_proj} task over the shared grid. */
+    @Override
+    protected boolean simdgroupVocabulary(TornadoWeights weights) {
+        return false;
+    }
 }

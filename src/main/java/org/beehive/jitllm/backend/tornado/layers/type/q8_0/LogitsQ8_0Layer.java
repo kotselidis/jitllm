@@ -124,6 +124,23 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
                                         .PACKED_INTEGER_DOT);
     }
 
+    /**
+     * Whether the Q8_0 vocabulary projection runs one 32-lane simdgroup per row, reduced with
+     * shuffles ({@link TransformerComputeKernelsLayered#matrixVectorQ8_0Simd32}), instead of 256
+     * threads per row reduced in shared memory. Where 32-wide shuffles are supported (Metal), the
+     * 2048-wide rows leave the 256-thread groups two steps of work each before eight barriered
+     * reduction steps: on an M1 Pro the projection takes 2.4 ms that way and 1.6 ms this way. Read
+     * by both the task and its grid; a family that adds its own {@code vocab_proj} task over the
+     * shared grid returns false.
+     */
+    protected boolean simdgroupVocabulary(TornadoWeights weights) {
+        return weights.wclsByteArray.dataType() == org.beehive.jitllm.runtime.tensor.DataType.Q8_0
+                && !packedVocabulary(weights)
+                && config.dim() % 128 == 0
+                && org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService
+                        .isSubgroupShuffle32Supported();
+    }
+
     /** The vocabulary projection task, chosen by what the output projection actually holds. */
     /**
      * The vocabulary projection, by the output tensor's own representation.
@@ -165,6 +182,18 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
                     config.dim(),
                     config.vocabularySize(),
                     localSize);
+            return;
+        }
+        if (simdgroupVocabulary(weights)) {
+            logits.task(
+                    "vocab_proj",
+                    TransformerComputeKernelsLayered::matrixVectorQ8_0Simd32,
+                    context,
+                    state.workspace.wrapX,
+                    state.workspace.wrapLogits,
+                    w.asByteArray(),
+                    config.dim(),
+                    config.vocabularySize());
             return;
         }
         switch (w.dataType()) {
@@ -258,6 +287,11 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
                 config.vocabularySize() * LOCAL_WORK_GROUP_SIZE_ALLOC * THREAD_SCALE_FOR_LOGITS;
         var vocabWorker = new WorkerGrid1D(vocabSizeRowMajor);
         vocabWorker.setLocalWork(LOCAL_WORK_GROUP_SIZE_ALLOC * THREAD_SCALE_FOR_LOGITS, 1, 1);
+        if (weights instanceof TornadoWeights tornadoWeights
+                && simdgroupVocabulary(tornadoWeights)) {
+            vocabWorker = new WorkerGrid1D(config.vocabularySize() * 32);
+            vocabWorker.setLocalWork(32, 1, 1);
+        }
         tornadoForwardScheduler.addWorkerGrid("logits.vocab_proj", vocabWorker);
         tornadoForwardScheduler.addWorkerGrid("logits.rms_reduce", rmsReduceWorker(logitsRMS));
         tornadoForwardScheduler.addWorkerGrid("logits.mapContextLogits", logitsRMS);

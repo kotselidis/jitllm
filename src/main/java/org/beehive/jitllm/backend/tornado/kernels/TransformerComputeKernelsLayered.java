@@ -2854,6 +2854,50 @@ public class TransformerComputeKernelsLayered {
     }
 
     /**
+     * {@code output[r] = w[r] . x} for Q8_0 {@code w}: one 32-lane simdgroup per row, four
+     * consecutive quants per lane per step, reduced with {@code simdShuffleDown}. Worker: {@code
+     * dim0} groups of 32 threads. Needs {@code dim1 % 128 == 0}.
+     */
+    public static void matrixVectorQ8_0Simd32(
+            KernelContext context,
+            FloatArray x,
+            FloatArray output,
+            ByteArray q,
+            int dim1,
+            int dim0) {
+        int rowId = context.groupIdx;
+        int lane = context.localIdx;
+
+        if (rowId >= dim0) {
+            return;
+        }
+
+        final int Q8_0_BLOCK_BYTES = 34; // 2-byte scale + 32 int8 quants
+        int rowBlockOffset = rowId * (dim1 / 32);
+        float sum = 0.0f;
+        for (int j = lane * 4; j < dim1; j += 128) {
+            int blockByteOffset = (rowBlockOffset + (j >> 5)) * Q8_0_BLOCK_BYTES;
+            int quants = blockByteOffset + 2 + (j & 31);
+            sum +=
+                    q.getHalfFloat(blockByteOffset).getFloat32()
+                            * (q.get(quants) * x.get(j)
+                                    + q.get(quants + 1) * x.get(j + 1)
+                                    + q.get(quants + 2) * x.get(j + 2)
+                                    + q.get(quants + 3) * x.get(j + 3));
+        }
+
+        sum += context.simdShuffleDown(sum, 16);
+        sum += context.simdShuffleDown(sum, 8);
+        sum += context.simdShuffleDown(sum, 4);
+        sum += context.simdShuffleDown(sum, 2);
+        sum += context.simdShuffleDown(sum, 1);
+
+        if (lane == 0) {
+            output.set(rowId, sum);
+        }
+    }
+
+    /**
      * Gate/up projections + SiLU + GLU over an input normalized beforehand ({@code xb}, e.g. by
      * {@link #reductionOneBlock2WithLayer}): one 32-lane simdgroup per output row, four consecutive
      * quants of W1 and W3 per lane per step against the same four activations, reduced with {@code
