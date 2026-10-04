@@ -271,6 +271,10 @@ public class LlamaQ8_0FFNLayers
             // the kernels reading a mapping that no longer exists, silently.
             unifiedLayer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION, state.workspace.wrapBlockTable);
+            if (attentionSplits() > 0) {
+                unifiedLayer.transferToDevice(
+                        DataTransferMode.FIRST_EXECUTION, state.workspace.wrapAttSplit);
+            }
         } else {
             // Subsequent layers: Consume data already on device from previous layer
             unifiedLayer.consumeFromDevice(
@@ -289,6 +293,9 @@ public class LlamaQ8_0FFNLayers
                     weights.freq_cis_realFlat.asFloatArray(),
                     weights.freq_cis_imagFlat.asFloatArray());
             unifiedLayer.consumeFromDevice(state.workspace.wrapBlockTable);
+            if (attentionSplits() > 0) {
+                unifiedLayer.consumeFromDevice(state.workspace.wrapAttSplit);
+            }
         }
         return unifiedLayer;
     }
@@ -317,8 +324,7 @@ public class LlamaQ8_0FFNLayers
 
         WorkerGrid ropeWithCacheWorker = WorkerGridFactory.genericWorker(config.dim() / 2, 512);
 
-        WorkerGrid parallelAttentionWorker =
-                WorkerGridFactory.createAttentionWorker(config.numberOfHeads(), config.headSize());
+        WorkerGrid parallelAttentionWorker = attentionWorker();
 
         // === Per-Layer Grid Assignments (ordered by TaskGraph flow) ===
         for (int i = firstLayer; i < endLayer(config.numberOfLayers()); i++) {
@@ -332,6 +338,7 @@ public class LlamaQ8_0FFNLayers
                     "layer_" + i + ".rope_and_kv_cache", ropeWithCacheWorker);
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".attention", parallelAttentionWorker);
+            addAttentionCombineGrid(tornadoForwardScheduler, i);
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".attn_output_proj", configDimRowMajorGlobalWorker);
             // --- FFN Block ---
@@ -409,8 +416,88 @@ public class LlamaQ8_0FFNLayers
                 : state.workspace.wrapValueCache;
     }
 
+    /**
+     * Split-KV partitions per head for attention, or 0 for one workgroup per head. Asked for with
+     * {@code -Djitllm.attention.splitKv=true} (and {@code .count}); taken on the NVIDIA path with
+     * an FP16 cache, where the split kernels exist.
+     */
+    protected int attentionSplits() {
+        var partitions = state.executionPolicy().splitKvPartitions();
+        if (partitions.isEmpty() || !useFp16KVCache() || schedulerType != SchedulerType.NVIDIA) {
+            return 0;
+        }
+        int splits = partitions.getAsInt();
+        if (splits > org.beehive.jitllm.inference.state.State.SPLIT_KV) {
+            throw new IllegalArgumentException(
+                    "split-KV working partitions "
+                            + splits
+                            + " exceed the "
+                            + org.beehive.jitllm.inference.state.State.SPLIT_KV
+                            + " the attention scratch was sized for;"
+                            + " raise jitllm.attention.splitKv.count, which is the capacity");
+        }
+        return splits;
+    }
+
+    /**
+     * The worker grid of the attention task: one workgroup per head, or per head and partition when
+     * attention is split.
+     */
+    protected WorkerGrid attentionWorker() {
+        int splits = attentionSplits();
+        return WorkerGridFactory.createAttentionWorker(
+                splits > 0 ? config.numberOfHeads() * splits : config.numberOfHeads(),
+                config.headSize());
+    }
+
+    /** Adds the combine pass's grid when attention is split. */
+    protected void addAttentionCombineGrid(GridScheduler scheduler, int layer) {
+        if (attentionSplits() > 0) {
+            scheduler.addWorkerGrid(
+                    "layer_" + layer + ".attention_combine",
+                    WorkerGridFactory.createAttentionWorker(
+                            config.numberOfHeads(), config.headSize()));
+        }
+    }
+
     /** Attention is dtype-independent — a Q4_0 sibling reuses this unchanged. */
     protected TaskGraph configureAttention(TaskGraph unifiedLayer, int layerIndex) {
+        int splits = attentionSplits();
+        if (splits > 0) {
+            // Flash-decoding: every head's positions are split across several workgroups, and a
+            // combine pass merges their partial results. More workgroups than there are heads,
+            // which is what keeps a GPU busy at short contexts.
+            unifiedLayer.task(
+                    "attention",
+                    packedHalf2Attention
+                            ? TransformerPagedKvKernels
+                                    ::processHeadsFlashAttentionSplitKVFP16PackedPaged
+                            : TransformerPagedKvKernels::processHeadsFlashAttentionSplitKVFP16Paged,
+                    context,
+                    state.workspace.wrapQ,
+                    state.workspace.wrapKeyCacheFP16,
+                    state.workspace.wrapValueCacheFP16,
+                    state.workspace.wrapAttSplit,
+                    config.numberOfHeads(),
+                    config.headSize(),
+                    config.kvDim(),
+                    config.kvMul(),
+                    state.workspace.positionHolder,
+                    keyValueLayer(layerIndex),
+                    state.workspace.wrapBlockTable,
+                    state.kvBlockCfg,
+                    state.kvBlockStride,
+                    splits);
+            return unifiedLayer.task(
+                    "attention_combine",
+                    TransformerComputeKernelsLayered::combineSplitKVAttention,
+                    context,
+                    state.workspace.wrapAttSplit,
+                    state.workspace.wrapXb,
+                    config.numberOfHeads(),
+                    config.headSize(),
+                    splits);
+        }
         if (useFp16KVCache()) {
             // Flash attention over the half-precision cache, FP32 accumulation.
             return unifiedLayer.task(
