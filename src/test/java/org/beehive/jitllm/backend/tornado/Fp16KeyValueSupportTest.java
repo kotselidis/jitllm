@@ -67,11 +67,21 @@ public class Fp16KeyValueSupportTest {
         assertEquals(
                 Optional.empty(),
                 check("llama", DataType.Q4_0, ExecutionMode.STANDARD, BackendId.CUDA, true, false));
+        // The batched prefill decodes the Q4_0 weights for cuBLAS and writes the same cache.
+        assertEquals(
+                Optional.empty(),
+                check(
+                        "llama",
+                        DataType.Q4_0,
+                        ExecutionMode.BATCH_PREFILL_DECODE,
+                        BackendId.CUDA,
+                        true,
+                        true));
         assertTrue(
                 check(
                                 "llama",
                                 DataType.Q4_0,
-                                ExecutionMode.BATCH_PREFILL_DECODE,
+                                ExecutionMode.PREFILL_DECODE,
                                 BackendId.CUDA,
                                 true,
                                 true)

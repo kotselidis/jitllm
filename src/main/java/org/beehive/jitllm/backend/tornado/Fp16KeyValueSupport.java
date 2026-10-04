@@ -112,8 +112,7 @@ public final class Fp16KeyValueSupport {
                             q4Llama
                                     ? Optional.of("Q4_0 has no sequential prefill/decode plan")
                                     : Optional.empty();
-                    case BATCH_PREFILL_DECODE ->
-                            q4Llama ? Optional.of("Q4_0 has no batched prefill") : Optional.empty();
+                    case BATCH_PREFILL_DECODE -> Optional.empty();
                 };
             }
             case "mistral" -> {
