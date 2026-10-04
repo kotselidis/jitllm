@@ -85,10 +85,31 @@ public final class BatchPrefillSupport {
         }
         Combination combination = Fp16KeyValueSupport.resolve(model, policy, gpu);
         unsupported(combination)
+                .or(() -> needsNativeProjections(combination, policy))
                 .ifPresent(
                         reason -> {
                             throw new UnsupportedOperationException(refusal(combination, reason));
                         });
+    }
+
+    /**
+     * Llama Q4_0's batched prefill exists only with its projections in cuBLAS: without native
+     * libraries there is nothing to build.
+     */
+    static Optional<String> needsNativeProjections(
+            Combination c, org.beehive.jitllm.runtime.policy.ExecutionPolicy policy) {
+        boolean llamaQ4 =
+                c.architecture().equals("llama")
+                        && c.weights() == org.beehive.jitllm.runtime.tensor.DataType.Q4_0;
+        if (c.mode() == ExecutionMode.BATCH_PREFILL_DECODE
+                && !BackendId.CPU.equals(c.backend())
+                && llamaQ4
+                && !NativePrefillSupport.nativeProjections(policy)) {
+            return Optional.of(
+                    "the llama Q4_0 batched prefill runs its projections through cuBLAS; add"
+                            + " --with-native-libraries on a CUDA device with tensor cores");
+        }
+        return Optional.empty();
     }
 
     /** The refusal: the combination, why, and that it holds for either cache. */

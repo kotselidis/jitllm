@@ -59,6 +59,29 @@ public class NativeLibrarySupportTest {
     }
 
     @Test
+    public void llamaQ4_0BatchedPrefillOnTensorCoresIsImplemented() {
+        assertEquals(
+                Optional.empty(),
+                check(
+                        "llama",
+                        DataType.Q4_0,
+                        ExecutionMode.BATCH_PREFILL_DECODE,
+                        BackendId.CUDA,
+                        true));
+        assertTrue(
+                check(
+                                "llama",
+                                DataType.Q4_0,
+                                ExecutionMode.BATCH_PREFILL_DECODE,
+                                BackendId.CUDA,
+                                false)
+                        .isPresent());
+        assertTrue(
+                check("llama", DataType.Q4_0, ExecutionMode.STANDARD, BackendId.CUDA, true)
+                        .isPresent());
+    }
+
+    @Test
     public void everythingElseIsRefused() {
         assertTrue(
                 check(
