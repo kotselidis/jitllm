@@ -3,6 +3,7 @@ package org.beehive.jitllm.backend.tornado.layers.type.q8_0;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.inference.state.LlamaState;
@@ -189,18 +190,34 @@ public class LlamaQ8_0FFNLayers
         }
 
         // Fully fused: RMS apply + Gate/Up projections + SiLU + GLU (Q8 dequantization)
-        unifiedLayer.task(
-                "rms_ffn_gate_up",
-                TransformerComputeKernelsLayered::fullyFusedRmsNormFFNGateUpQ8,
-                context,
-                state.workspace.wrapX, // raw input (FP32)
-                state.workspace.wrapHb, // output
-                weights.rms_ffn_weightLayered[layerIndex].asFloatArray(), // RMS weights
-                weights.w1Layered[layerIndex].asByteArray(), // W1 (Q8)
-                weights.w3Layered[layerIndex].asByteArray(), // W3 (Q8)
-                config.dim(), // input dimension
-                config.hiddenDim(), // output dimension
-                LOCAL_WORK_GROUP_SIZE_ALLOC);
+        if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
+            // Simdgroup-reduced, reusing the RMS scale ffn_rms_reduce already computed
+            unifiedLayer.task(
+                    "rms_ffn_gate_up",
+                    TransformerComputeKernelsLayered::fusedRmsScaledFFNGateUpQ8_0Simd32,
+                    context,
+                    state.workspace.wrapX, // raw input (FP32)
+                    state.workspace.wrapHb, // output
+                    weights.rms_ffn_weightLayered[layerIndex].asFloatArray(), // RMS weights
+                    state.workspace.tempFFN, // RMS scale in [0]
+                    weights.w1Layered[layerIndex].asByteArray(), // W1 (Q8)
+                    weights.w3Layered[layerIndex].asByteArray(), // W3 (Q8)
+                    config.dim(), // input dimension
+                    config.hiddenDim()); // output dimension
+        } else {
+            unifiedLayer.task(
+                    "rms_ffn_gate_up",
+                    TransformerComputeKernelsLayered::fullyFusedRmsNormFFNGateUpQ8,
+                    context,
+                    state.workspace.wrapX, // raw input (FP32)
+                    state.workspace.wrapHb, // output
+                    weights.rms_ffn_weightLayered[layerIndex].asFloatArray(), // RMS weights
+                    weights.w1Layered[layerIndex].asByteArray(), // W1 (Q8)
+                    weights.w3Layered[layerIndex].asByteArray(), // W3 (Q8)
+                    config.dim(), // input dimension
+                    config.hiddenDim(), // output dimension
+                    LOCAL_WORK_GROUP_SIZE_ALLOC);
+        }
 
         // Down projection (W2) with residual (Q8 dequantization)
         unifiedLayer.task(
@@ -414,7 +431,9 @@ public class LlamaQ8_0FFNLayers
                     state.kvBlockCfg,
                     state.kvBlockStride);
         }
-        if (schedulerType == SchedulerType.NVIDIA) {
+        // Metal takes the workgroup-per-head flash kernel too, as Qwen3 does there: the
+        // thread-per-head fallback below keeps one lane of each group busy and grows with position.
+        if (schedulerType == SchedulerType.NVIDIA || SchedulerDetectionService.isMetalBackend()) {
             return unifiedLayer.task(
                     "attention",
                     TransformerPagedKvKernels::processHeadsFlashAttentionPaged,

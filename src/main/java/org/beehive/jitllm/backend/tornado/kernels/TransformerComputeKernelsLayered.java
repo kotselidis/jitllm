@@ -2854,6 +2854,95 @@ public class TransformerComputeKernelsLayered {
     }
 
     /**
+     * Simdgroup twin of {@link #fullyFusedRmsNormFFNGateUpQ8}: one 32-lane simdgroup per output
+     * row, reduced with {@code simdShuffleDown} instead of a shared-memory tree. The RMS scale is
+     * read from {@code rmsScale[0]}, where {@code ffn_rms_reduce} (and its finalize step) left it,
+     * instead of every workgroup re-reading the whole input to recompute it. Each lane takes eight
+     * consecutive quants of a block from W1 and W3 together, so a block's scales and the normalized
+     * activations are loaded once per eight weights of each matrix. Four lanes cover a 32-quant
+     * block; the simdgroup covers eight blocks per step. Needs {@code dim % 32 == 0}.
+     */
+    public static void fusedRmsScaledFFNGateUpQ8_0Simd32(
+            KernelContext context,
+            FloatArray x,
+            FloatArray hb,
+            FloatArray rmsWeights,
+            FloatArray rmsScale,
+            ByteArray w1,
+            ByteArray w3,
+            int dim,
+            int hiddenDim) {
+        int rowId = context.groupIdx;
+        int lane = context.localIdx;
+
+        if (rowId >= hiddenDim) {
+            return;
+        }
+
+        final int Q8_0_BLOCK_BYTES = 34; // 2-byte scale + 32 int8 quants
+        int blocksPerRow = dim / 32;
+        int rowByteOffset = rowId * blocksPerRow * Q8_0_BLOCK_BYTES;
+        int sub = (lane & 3) * 8;
+
+        float sum1 = 0.0f;
+        float sum3 = 0.0f;
+        for (int b = lane >> 2; b < blocksPerRow; b += 8) {
+            int blockByteOffset = rowByteOffset + b * Q8_0_BLOCK_BYTES;
+            int q = blockByteOffset + 2 + sub;
+            int j = b * 32 + sub;
+
+            float x0 = rmsWeights.get(j) * x.get(j);
+            float x1 = rmsWeights.get(j + 1) * x.get(j + 1);
+            float x2 = rmsWeights.get(j + 2) * x.get(j + 2);
+            float x3 = rmsWeights.get(j + 3) * x.get(j + 3);
+            float x4 = rmsWeights.get(j + 4) * x.get(j + 4);
+            float x5 = rmsWeights.get(j + 5) * x.get(j + 5);
+            float x6 = rmsWeights.get(j + 6) * x.get(j + 6);
+            float x7 = rmsWeights.get(j + 7) * x.get(j + 7);
+
+            float a1 =
+                    w1.get(q) * x0
+                            + w1.get(q + 1) * x1
+                            + w1.get(q + 2) * x2
+                            + w1.get(q + 3) * x3
+                            + w1.get(q + 4) * x4
+                            + w1.get(q + 5) * x5
+                            + w1.get(q + 6) * x6
+                            + w1.get(q + 7) * x7;
+            float a3 =
+                    w3.get(q) * x0
+                            + w3.get(q + 1) * x1
+                            + w3.get(q + 2) * x2
+                            + w3.get(q + 3) * x3
+                            + w3.get(q + 4) * x4
+                            + w3.get(q + 5) * x5
+                            + w3.get(q + 6) * x6
+                            + w3.get(q + 7) * x7;
+
+            sum1 += w1.getHalfFloat(blockByteOffset).getFloat32() * a1;
+            sum3 += w3.getHalfFloat(blockByteOffset).getFloat32() * a3;
+        }
+
+        sum1 += context.simdShuffleDown(sum1, 16);
+        sum1 += context.simdShuffleDown(sum1, 8);
+        sum1 += context.simdShuffleDown(sum1, 4);
+        sum1 += context.simdShuffleDown(sum1, 2);
+        sum1 += context.simdShuffleDown(sum1, 1);
+        sum3 += context.simdShuffleDown(sum3, 16);
+        sum3 += context.simdShuffleDown(sum3, 8);
+        sum3 += context.simdShuffleDown(sum3, 4);
+        sum3 += context.simdShuffleDown(sum3, 2);
+        sum3 += context.simdShuffleDown(sum3, 1);
+
+        if (lane == 0) {
+            float scale = rmsScale.get(0);
+            float gate = sum1 * scale;
+            float silu = gate / (1.0f + TornadoMath.exp(-gate));
+            hb.set(rowId, silu * (sum3 * scale));
+        }
+    }
+
+    /**
      * Fused RMSNorm apply + Gate/Up Q8 projection + SiLU + GLU in one kernel.
      *
      * <p>Each workgroup computes one output element by:
