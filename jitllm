@@ -146,6 +146,10 @@ class LlamaRunner:
             "jdk.incubator.vector",
             # Prompt ingestion emits more interpreter bytecode than the default buffer holds.
             "-Dtornado.tvm.maxbytecodesize=65536",
+            # Metal only: a task graph's execute() commits its batched kernels without waiting
+            # for them; the next host read of a result waits instead. jitllm runs ~18 graphs per
+            # token, so this takes 17 GPU round trips off every token. Ignored by other backends.
+            "-Dtornado.metal.dispatch.lazySync=True",
         ]
 
         # GPU options

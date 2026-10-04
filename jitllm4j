@@ -351,7 +351,10 @@ List<String> buildCommand(Config cfg, String javaHome, String tornadoSdk, String
         // Not in the argfile: FloatTensor's static initializer reaches the Vector API.
         "--add-modules", "jdk.incubator.vector",
         // Prompt ingestion emits more interpreter bytecode than the default buffer holds.
-        "-Dtornado.tvm.maxbytecodesize=65536"
+        "-Dtornado.tvm.maxbytecodesize=65536",
+        // Metal only: execute() commits a graph's batched kernels without waiting for them; the
+        // next host read of a result waits instead. Ignored by other backends.
+        "-Dtornado.metal.dispatch.lazySync=True"
     ));
 
     if (cfg.useGpu()) cmd.add("-Duse.tornadovm=true");
