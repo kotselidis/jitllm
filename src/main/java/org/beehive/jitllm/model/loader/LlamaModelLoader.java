@@ -182,7 +182,12 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
                 loadTornadoTensor(tensorEntries.get("output_norm.weight")), // fp32
                 TornadoTensorLoader.fromFloats(ropeFreqs.first()),
                 TornadoTensorLoader.fromFloats(ropeFreqs.second()),
-                loadTornadoTensor(outputWeight),
+                // Q4_0 files keep the output projection as Q6_K. Kept as it is, the logits graph
+                // reads it with the packed-integer Q6_K kernel instead of a Q8_0 copy that is a
+                // quarter larger and read in floating point.
+                retainQ4_0 && outputWeight.ggmlType() == GGMLType.Q6_K
+                        ? loadTornadoTensorNative(outputWeight)
+                        : loadTornadoTensor(outputWeight),
                 weightType);
     }
 
