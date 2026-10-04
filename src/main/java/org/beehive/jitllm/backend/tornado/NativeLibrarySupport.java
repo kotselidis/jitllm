@@ -18,6 +18,9 @@ import org.beehive.jitllm.runtime.tensor.DataType;
  * cuDNN where it is usable), which costs a second copy of those projections on the device — for
  * Qwen3-8B F16, 8.6 GB beside 13.2 GB of weights.
  *
+ * <p>On Metal the library is Apple MLX: Llama Q8_0 batched-prefill projections become MLX quantized
+ * GEMMs over the weights repacked into MLX's affine 8-bit format (see {@link MlxPrefillSupport}).
+ *
  * <p>Asking for it anywhere it is not implemented is refused, never ignored: a request that quietly
  * runs the JIT kernels would read, in a benchmark, as a measurement of the libraries.
  */
@@ -30,8 +33,24 @@ public final class NativeLibrarySupport {
         if (BackendId.CPU.equals(c.backend())) {
             return Optional.of("the CPU path has no native-library implementation");
         }
+        if (BackendId.METAL.equals(c.backend())) {
+            if (!(c.architecture().equals("llama") && c.weights() == DataType.Q8_0)) {
+                return Optional.of(
+                        "no MLX path is implemented for "
+                                + c.architecture()
+                                + " / "
+                                + c.weights()
+                                + " yet (Llama Q8_0 only on Metal)");
+            }
+            if (c.mode() != ExecutionMode.BATCH_PREFILL_DECODE) {
+                return Optional.of(
+                        "native libraries replace batched-prefill kernels only; add"
+                                + " --with-prefill-decode --batch-prefill-size N");
+            }
+            return Optional.empty();
+        }
         if (!BackendId.CUDA.equals(c.backend())) {
-            return Optional.of("native libraries are implemented on CUDA only");
+            return Optional.of("native libraries are implemented on CUDA and Metal only");
         }
         boolean qwen3 = c.architecture().equals("qwen3") && c.weights() == DataType.F16;
         boolean gemma4 =
@@ -67,7 +86,11 @@ public final class NativeLibrarySupport {
         }
         Combination combination = Fp16KeyValueSupport.resolve(model, policy, gpu);
         Optional<String> reason = unsupported(combination);
-        if (reason.isEmpty() && !NativePrefillSupport.cublasAvailable()) {
+        if (reason.isEmpty() && BackendId.METAL.equals(combination.backend())) {
+            if (!MlxPrefillSupport.mlxProjections(policy)) {
+                reason = Optional.of("Apple MLX (mlx-c) could not be loaded in this process");
+            }
+        } else if (reason.isEmpty() && !NativePrefillSupport.cublasAvailable()) {
             reason = Optional.of("cuBLAS could not be loaded in this process");
         }
         reason.ifPresent(

@@ -895,6 +895,22 @@ public final class TransformerBatchPrefillKernels {
         residual.set(gid, residual.get(gid) + delta.get(gid));
     }
 
+    /**
+     * SwiGLU over a stacked gate/up GEMM result: each row of {@code gateUp} is {@code [gate
+     * (hidDim) | up (hidDim)]}, and {@code hb[b, j] = silu(gate[b, j]) * up[b, j]}. Worker:
+     * B*hidDim threads.
+     */
+    public static void batchedSwiGLUStackedFP32(
+            KernelContext context, FloatArray gateUp, FloatArray hb, int hidDim) {
+        int gid = context.globalIdx;
+        int b = gid / hidDim;
+        int j = gid % hidDim;
+        int row = b * 2 * hidDim;
+        float gate = gateUp.get(row + j);
+        float up = gateUp.get(row + hidDim + j);
+        hb.set(gid, gate / (1.0f + TornadoMath.exp(-gate)) * up);
+    }
+
     // ── Fused MMA projections ─────────────────────────────────────────────────
     //
     // Q, K, V (and gate/up) share the same A operand and the same K dimension,

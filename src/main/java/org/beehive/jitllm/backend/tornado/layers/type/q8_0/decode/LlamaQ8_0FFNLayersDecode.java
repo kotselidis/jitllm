@@ -1,5 +1,6 @@
 package org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode;
 
+import org.beehive.jitllm.backend.tornado.MlxPrefillSupport;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LlamaQ8_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.inference.state.LlamaState;
@@ -82,9 +83,13 @@ public class LlamaQ8_0FFNLayersDecode extends LlamaQ8_0FFNLayers {
      * This class builds the decode half of a batched prefill/decode plan, where the matching {@code
      * batchPrefillLayer_<i>} graph has already uploaded this layer's weights and always runs first,
      * so the decode graph binds that copy instead of a second one.
+     *
+     * <p>Not when the prefill projections go to MLX ({@link MlxPrefillSupport#mlxProjections()}):
+     * that graph binds MLX's repacked copy and never the Q8_0 weights, so there is nothing to
+     * consume and the decode graph uploads its own.
      */
     @Override
     protected String weightSourceGraphName(int layerIndex) {
-        return "batchPrefillLayer_" + layerIndex;
+        return MlxPrefillSupport.mlxProjections() ? null : "batchPrefillLayer_" + layerIndex;
     }
 }

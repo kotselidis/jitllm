@@ -146,6 +146,14 @@
             <version>${tornadovm.version}</version>
             <scope>provided</scope>
         </dependency>
+        <!-- Apple MLX bindings: the Metal counterpart of the two above for the batched prefill
+             projections (quantized matmul). -->
+        <dependency>
+            <groupId>io.github.beehive-lab</groupId>
+            <artifactId>tornado-mlx</artifactId>
+            <version>${tornadovm.version}</version>
+            <scope>provided</scope>
+        </dependency>
         <dependency>
             <groupId>io.github.beehive-lab</groupId>
             <artifactId>tornado-runtime</artifactId>

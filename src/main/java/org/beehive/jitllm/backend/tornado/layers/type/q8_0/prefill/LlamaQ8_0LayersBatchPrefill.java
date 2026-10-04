@@ -2,6 +2,8 @@ package org.beehive.jitllm.backend.tornado.layers.type.q8_0.prefill;
 
 import java.util.List;
 import java.util.stream.IntStream;
+import org.beehive.jitllm.backend.tornado.MlxPrefillSupport;
+import org.beehive.jitllm.backend.tornado.MlxPrefillSupport.Q8_0AsAffine;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.layers.BatchPrefillTransformerLayerTaskGraphs;
@@ -15,6 +17,8 @@ import uk.ac.manchester.tornado.api.KernelContext;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.WorkerGrid;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
+import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.mlx.Mlx;
 
 /**
  * Batched-prefill transformer-layer TaskGraphs for the unified batched prefill-decode plan (Q8_0).
@@ -32,6 +36,13 @@ import uk.ac.manchester.tornado.api.enums.DataTransferMode;
  *   <li>{@code wrapXbFP16Batch} is not used.
  *   <li>Weight matrices are {@code ByteArray} (Q8_0 format).
  * </ul>
+ *
+ * <p>With {@link MlxPrefillSupport#mlxProjections()} (Metal, {@code --with-native-libraries}) the
+ * seven projections are Apple MLX quantized GEMMs instead, as cuBLAS takes them on CUDA: the Q8_0
+ * weights are repacked once into MLX's affine 8-bit format (exact), gate and up stacked into one
+ * matrix. MLX writes its result rather than accumulating, so the output and down projections land
+ * in {@code projOutBatch} and a residual add follows; SwiGLU runs over the stacked gate/up result.
+ * RoPE, the KV cache and attention stay on the Tornado kernels.
  */
 public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayerTaskGraphs {
 
@@ -45,6 +56,24 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
 
+    /**
+     * Projections through Apple MLX (see the class comment); the fields below are null otherwise.
+     */
+    private final boolean mlx;
+
+    private final Q8_0AsAffine[] mlxQ;
+    private final Q8_0AsAffine[] mlxK;
+    private final Q8_0AsAffine[] mlxV;
+    private final Q8_0AsAffine[] mlxO;
+    private final Q8_0AsAffine[] mlxGateUp;
+    private final Q8_0AsAffine[] mlxDown;
+
+    /** [batch, dim]: the output and down projections, before their residual add. */
+    private final FloatArray projOutBatch;
+
+    /** [batch, 2 * hiddenDim]: gate and up side by side, from the stacked GEMM. */
+    private final FloatArray gateUpBatch;
+
     public LlamaQ8_0LayersBatchPrefill(
             LlamaState state,
             LlamaTornadoWeights weights,
@@ -54,6 +83,38 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         this.weights = weights;
         this.config = config;
         this.batchSize = batchSize;
+        this.mlx = MlxPrefillSupport.mlxProjections();
+        if (mlx) {
+            int layers = config.numberOfLayers();
+            int dim = config.dim();
+            int kvDim = config.kvDim();
+            int hidDim = config.hiddenDim();
+            mlxQ = new Q8_0AsAffine[layers];
+            mlxK = new Q8_0AsAffine[layers];
+            mlxV = new Q8_0AsAffine[layers];
+            mlxO = new Q8_0AsAffine[layers];
+            mlxGateUp = new Q8_0AsAffine[layers];
+            mlxDown = new Q8_0AsAffine[layers];
+            for (int l = 0; l < layers; l++) {
+                mlxQ[l] = Q8_0AsAffine.of(weights.wqLayered[l].asByteArray(), dim, dim);
+                mlxK[l] = Q8_0AsAffine.of(weights.wkLayered[l].asByteArray(), kvDim, dim);
+                mlxV[l] = Q8_0AsAffine.of(weights.wvLayered[l].asByteArray(), kvDim, dim);
+                mlxO[l] = Q8_0AsAffine.of(weights.woLayered[l].asByteArray(), dim, dim);
+                mlxGateUp[l] =
+                        Q8_0AsAffine.stack(
+                                hidDim,
+                                dim,
+                                weights.w1Layered[l].asByteArray(),
+                                weights.w3Layered[l].asByteArray());
+                mlxDown[l] = Q8_0AsAffine.of(weights.w2Layered[l].asByteArray(), dim, hidDim);
+            }
+            projOutBatch = new FloatArray(batchSize * dim);
+            gateUpBatch = new FloatArray(batchSize * 2 * hidDim);
+        } else {
+            mlxQ = mlxK = mlxV = mlxO = mlxGateUp = mlxDown = null;
+            projOutBatch = null;
+            gateUpBatch = null;
+        }
         this.layerITGs =
                 IntStream.range(0, config.numberOfLayers())
                         .mapToObj(this::createBatchPrefillLayerTaskGraph)
@@ -89,6 +150,9 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
                     keyCache(),
                     valueCache());
             layer.consumeFromDevice("prefillActivation", state.workspace.wrapXBatch);
+            if (mlx) {
+                layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, projOutBatch, gateUpBatch);
+            }
         } else {
             String pred = "batchPrefillLayer_" + (layerIndex - 1);
             layer.consumeFromDevice(
@@ -105,6 +169,9 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
                     state.workspace.batchStartPosHolder,
                     state.workspace.attnScaleBatch,
                     state.workspace.ffnScaleBatch);
+            if (mlx) {
+                layer.consumeFromDevice(pred, projOutBatch, gateUpBatch);
+            }
         }
 
         if (layerIndex == 0) {
@@ -116,6 +183,10 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         } else {
             layer.consumeFromDevice(
                     "batchPrefillLayer_" + (layerIndex - 1), state.workspace.wrapBlockTable);
+        }
+
+        if (mlx) {
+            return createMlxProjectionLayer(layer, layerIndex);
         }
 
         // Per-layer weights: upload once (Q8_0 format)
@@ -173,88 +244,7 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
                 kvDim,
                 LOCAL_WORK_GROUP_SIZE);
 
-        if (useFp16KVCache()) {
-            layer.task(
-                    "batch_rope_kv",
-                    TransformerPagedKvBatchPrefillKernels::batchedRopeWithKVCacheFP16Paged,
-                    context,
-                    state.workspace.batchStartPosHolder,
-                    state.workspace.wrapQBatch,
-                    state.workspace.wrapKBatch,
-                    state.workspace.wrapVBatch,
-                    state.workspace.wrapKeyCacheFP16,
-                    state.workspace.wrapValueCacheFP16,
-                    weights.freq_cis_realFlat.asFloatArray(),
-                    weights.freq_cis_imagFlat.asFloatArray(),
-                    kvDim,
-                    config.headSize(),
-                    layerIndex,
-                    state.workspace.wrapBlockTable,
-                    state.kvBlockCfg,
-                    state.kvBlockStride,
-                    dim);
-        } else {
-            layer.task(
-                    "batch_rope_kv",
-                    TransformerPagedKvBatchPrefillKernels::batchedRopeWithKVCachePaged,
-                    context,
-                    state.workspace.batchStartPosHolder,
-                    state.workspace.wrapQBatch,
-                    state.workspace.wrapKBatch,
-                    state.workspace.wrapVBatch,
-                    state.workspace.wrapKeyCache,
-                    state.workspace.wrapValueCache,
-                    weights.freq_cis_realFlat.asFloatArray(),
-                    weights.freq_cis_imagFlat.asFloatArray(),
-                    kvDim,
-                    config.headSize(),
-                    layerIndex,
-                    state.workspace.wrapBlockTable,
-                    state.kvBlockCfg,
-                    state.kvBlockStride,
-                    dim);
-        }
-
-        // Overwrites wrapXbBatch with attention output
-        if (useFp16KVCache()) {
-            layer.task(
-                    "batch_attention",
-                    TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionKVFP16Paged,
-                    context,
-                    state.workspace.batchStartPosHolder,
-                    state.workspace.wrapQBatch,
-                    state.workspace.wrapKeyCacheFP16,
-                    state.workspace.wrapValueCacheFP16,
-                    state.workspace.wrapXbBatch,
-                    config.numberOfHeads(),
-                    config.headSize(),
-                    kvDim,
-                    config.kvMul(),
-                    layerIndex,
-                    state.workspace.wrapBlockTable,
-                    state.kvBlockCfg,
-                    state.kvBlockStride,
-                    dim);
-        } else {
-            layer.task(
-                    "batch_attention",
-                    TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionPaged,
-                    context,
-                    state.workspace.batchStartPosHolder,
-                    state.workspace.wrapQBatch,
-                    state.workspace.wrapKeyCache,
-                    state.workspace.wrapValueCache,
-                    state.workspace.wrapXbBatch,
-                    config.numberOfHeads(),
-                    config.headSize(),
-                    kvDim,
-                    config.kvMul(),
-                    layerIndex,
-                    state.workspace.wrapBlockTable,
-                    state.kvBlockCfg,
-                    state.kvBlockStride,
-                    dim);
-        }
+        addRopeAndAttention(layer, layerIndex);
 
         layer.task(
                 "batch_attn_out",
@@ -307,6 +297,285 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         return layer;
     }
 
+    /**
+     * RoPE with the KV-cache write, then flash attention over the cache, overwriting {@code
+     * wrapXbBatch} with the attention output: the same on the Q8_0 and the MLX projection paths.
+     */
+    private void addRopeAndAttention(TaskGraph layer, int layerIndex) {
+        int dim = config.dim();
+        int kvDim = config.kvDim();
+        if (useFp16KVCache()) {
+            layer.task(
+                    "batch_rope_kv",
+                    TransformerPagedKvBatchPrefillKernels::batchedRopeWithKVCacheFP16Paged,
+                    context,
+                    state.workspace.batchStartPosHolder,
+                    state.workspace.wrapQBatch,
+                    state.workspace.wrapKBatch,
+                    state.workspace.wrapVBatch,
+                    state.workspace.wrapKeyCacheFP16,
+                    state.workspace.wrapValueCacheFP16,
+                    weights.freq_cis_realFlat.asFloatArray(),
+                    weights.freq_cis_imagFlat.asFloatArray(),
+                    kvDim,
+                    config.headSize(),
+                    layerIndex,
+                    state.workspace.wrapBlockTable,
+                    state.kvBlockCfg,
+                    state.kvBlockStride,
+                    dim);
+        } else {
+            layer.task(
+                    "batch_rope_kv",
+                    TransformerPagedKvBatchPrefillKernels::batchedRopeWithKVCachePaged,
+                    context,
+                    state.workspace.batchStartPosHolder,
+                    state.workspace.wrapQBatch,
+                    state.workspace.wrapKBatch,
+                    state.workspace.wrapVBatch,
+                    state.workspace.wrapKeyCache,
+                    state.workspace.wrapValueCache,
+                    weights.freq_cis_realFlat.asFloatArray(),
+                    weights.freq_cis_imagFlat.asFloatArray(),
+                    kvDim,
+                    config.headSize(),
+                    layerIndex,
+                    state.workspace.wrapBlockTable,
+                    state.kvBlockCfg,
+                    state.kvBlockStride,
+                    dim);
+        }
+
+        if (useFp16KVCache()) {
+            layer.task(
+                    "batch_attention",
+                    TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionKVFP16Paged,
+                    context,
+                    state.workspace.batchStartPosHolder,
+                    state.workspace.wrapQBatch,
+                    state.workspace.wrapKeyCacheFP16,
+                    state.workspace.wrapValueCacheFP16,
+                    state.workspace.wrapXbBatch,
+                    config.numberOfHeads(),
+                    config.headSize(),
+                    kvDim,
+                    config.kvMul(),
+                    layerIndex,
+                    state.workspace.wrapBlockTable,
+                    state.kvBlockCfg,
+                    state.kvBlockStride,
+                    dim);
+        } else {
+            layer.task(
+                    "batch_attention",
+                    TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionPaged,
+                    context,
+                    state.workspace.batchStartPosHolder,
+                    state.workspace.wrapQBatch,
+                    state.workspace.wrapKeyCache,
+                    state.workspace.wrapValueCache,
+                    state.workspace.wrapXbBatch,
+                    config.numberOfHeads(),
+                    config.headSize(),
+                    kvDim,
+                    config.kvMul(),
+                    layerIndex,
+                    state.workspace.wrapBlockTable,
+                    state.kvBlockCfg,
+                    state.kvBlockStride,
+                    dim);
+        }
+    }
+
+    /**
+     * The layer with its seven projections as MLX quantized GEMMs over the repacked weights (see
+     * the class comment). Normalization, RoPE, the KV cache and attention are the Tornado kernels.
+     */
+    private TaskGraph createMlxProjectionLayer(TaskGraph layer, int layerIndex) {
+        int dim = config.dim();
+        int kvDim = config.kvDim();
+        int hidDim = config.hiddenDim();
+        int gs = MlxPrefillSupport.GROUP_SIZE;
+        int bits = MlxPrefillSupport.BITS;
+        Q8_0AsAffine q = mlxQ[layerIndex];
+        Q8_0AsAffine k = mlxK[layerIndex];
+        Q8_0AsAffine v = mlxV[layerIndex];
+        Q8_0AsAffine o = mlxO[layerIndex];
+        Q8_0AsAffine gateUp = mlxGateUp[layerIndex];
+        Q8_0AsAffine down = mlxDown[layerIndex];
+
+        // Only what this graph's tasks read: the Q8_0 weights are the decode graphs' to upload.
+        // Transferring an object no task of a graph uses would leave it marked as present on the
+        // device without that graph ever binding it.
+        layer.transferToDevice(
+                DataTransferMode.FIRST_EXECUTION,
+                weights.rms_att_weightLayered[layerIndex].asFloatArray(),
+                weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
+                weights.freq_cis_realFlat.asFloatArray(),
+                weights.freq_cis_imagFlat.asFloatArray(),
+                q.wq(),
+                q.scales(),
+                q.biases(),
+                k.wq(),
+                k.scales(),
+                k.biases(),
+                v.wq(),
+                v.scales(),
+                v.biases(),
+                o.wq(),
+                o.scales(),
+                o.biases(),
+                gateUp.wq(),
+                gateUp.scales(),
+                gateUp.biases(),
+                down.wq(),
+                down.scales(),
+                down.biases());
+
+        // ── Attention Block ────────────────────────────────────────────────────
+        layer.task(
+                "batch_attn_rms",
+                TransformerBatchPrefillKernels::batchedRmsReduce,
+                context,
+                state.workspace.wrapXBatch,
+                state.workspace.attnScaleBatch,
+                dim,
+                config.rmsNormEps());
+        layer.task(
+                "batch_attn_rms_apply",
+                TransformerBatchPrefillKernels::batchedRmsApplyFP32,
+                context,
+                state.workspace.wrapXbBatch,
+                state.workspace.wrapXBatch,
+                weights.rms_att_weightLayered[layerIndex].asFloatArray(),
+                state.workspace.attnScaleBatch,
+                dim);
+
+        layer.libraryTask(
+                "batch_q",
+                Mlx::quantizedMatmul,
+                state.workspace.wrapXbBatch,
+                q.wq(),
+                q.scales(),
+                q.biases(),
+                state.workspace.wrapQBatch,
+                batchSize,
+                dim,
+                dim,
+                gs,
+                bits);
+        layer.libraryTask(
+                "batch_k",
+                Mlx::quantizedMatmul,
+                state.workspace.wrapXbBatch,
+                k.wq(),
+                k.scales(),
+                k.biases(),
+                state.workspace.wrapKBatch,
+                batchSize,
+                dim,
+                kvDim,
+                gs,
+                bits);
+        layer.libraryTask(
+                "batch_v",
+                Mlx::quantizedMatmul,
+                state.workspace.wrapXbBatch,
+                v.wq(),
+                v.scales(),
+                v.biases(),
+                state.workspace.wrapVBatch,
+                batchSize,
+                dim,
+                kvDim,
+                gs,
+                bits);
+
+        addRopeAndAttention(layer, layerIndex);
+
+        layer.libraryTask(
+                "batch_attn_out",
+                Mlx::quantizedMatmul,
+                state.workspace.wrapXbBatch,
+                o.wq(),
+                o.scales(),
+                o.biases(),
+                projOutBatch,
+                batchSize,
+                dim,
+                dim,
+                gs,
+                bits);
+        layer.task(
+                "batch_attn_residual",
+                TransformerBatchPrefillKernels::batchedResidualAddFP32,
+                context,
+                state.workspace.wrapXBatch,
+                projOutBatch);
+
+        // ── FFN Block ──────────────────────────────────────────────────────────
+        layer.task(
+                "batch_ffn_rms",
+                TransformerBatchPrefillKernels::batchedFFNRmsReduce,
+                context,
+                state.workspace.wrapXBatch,
+                state.workspace.ffnScaleBatch,
+                dim,
+                config.rmsNormEps());
+        layer.task(
+                "batch_ffn_rms_apply",
+                TransformerBatchPrefillKernels::batchedRmsApplyFP32,
+                context,
+                state.workspace.wrapXbBatch,
+                state.workspace.wrapXBatch,
+                weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
+                state.workspace.ffnScaleBatch,
+                dim);
+        layer.libraryTask(
+                "batch_ffn_gate_up",
+                Mlx::quantizedMatmul,
+                state.workspace.wrapXbBatch,
+                gateUp.wq(),
+                gateUp.scales(),
+                gateUp.biases(),
+                gateUpBatch,
+                batchSize,
+                dim,
+                2 * hidDim,
+                gs,
+                bits);
+        layer.task(
+                "batch_ffn_swiglu",
+                TransformerBatchPrefillKernels::batchedSwiGLUStackedFP32,
+                context,
+                gateUpBatch,
+                state.workspace.wrapHbBatch,
+                hidDim);
+        layer.libraryTask(
+                "batch_ffn_down",
+                Mlx::quantizedMatmul,
+                state.workspace.wrapHbBatch,
+                down.wq(),
+                down.scales(),
+                down.biases(),
+                projOutBatch,
+                batchSize,
+                hidDim,
+                dim,
+                gs,
+                bits);
+        layer.task(
+                "batch_ffn_residual",
+                TransformerBatchPrefillKernels::batchedResidualAddFP32,
+                context,
+                state.workspace.wrapXBatch,
+                projOutBatch);
+
+        layer.persistOnDevice(
+                state.workspace.wrapXBatch, keyCache(), valueCache(), projOutBatch, gateUpBatch);
+        return layer;
+    }
+
     // @formatter:on
 
     public void updateGridScheduler(GridScheduler scheduler) {
@@ -342,6 +611,19 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
             String p = "batchPrefillLayer_" + i + ".";
             scheduler.addWorkerGrid(p + "batch_attn_rms", rmsWorker);
             scheduler.addWorkerGrid(p + "batch_attn_rms_apply", rmsApplyWorker);
+            if (mlx) {
+                // The projections are library tasks; only the Tornado tasks around them need grids.
+                scheduler.addWorkerGrid(p + "batch_rope_kv", ropeWorker);
+                scheduler.addWorkerGrid(p + "batch_attention", attnWorker);
+                scheduler.addWorkerGrid(p + "batch_attn_residual", rmsApplyWorker);
+                scheduler.addWorkerGrid(p + "batch_ffn_rms", rmsWorker);
+                scheduler.addWorkerGrid(p + "batch_ffn_rms_apply", rmsApplyWorker);
+                scheduler.addWorkerGrid(
+                        p + "batch_ffn_swiglu",
+                        WorkerGridFactory.genericWorker(batchSize * hidDim, 256));
+                scheduler.addWorkerGrid(p + "batch_ffn_residual", rmsApplyWorker);
+                continue;
+            }
             scheduler.addWorkerGrid(p + "batch_qkv", qkvWorker);
             scheduler.addWorkerGrid(p + "batch_rope_kv", ropeWorker);
             scheduler.addWorkerGrid(p + "batch_attention", attnWorker);
