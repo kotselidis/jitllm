@@ -1,6 +1,7 @@
 package org.beehive.jitllm.backend.tornado.workspace;
 
 import org.beehive.jitllm.inference.Logits;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
@@ -89,6 +90,14 @@ public final class TornadoWorkspace {
     // workgroup size.
     public HalfFloatArray wrapXFP16;
     public HalfFloatArray embeddingXBatch; // B × dim  (FP16 input)
+
+    /**
+     * B rows of a Q8_0 embedding as the file stores them, for a batch activation that decodes them
+     * on the device. Null unless such an activation allocated it: the host then bulk-copies raw
+     * rows here instead of decoding them element by element in Java.
+     */
+    public ByteArray embeddingQ8Batch;
+
     public FloatArray wrapXBatch; // B × dim  (live activations / Q8_0 dequant)
     public HalfFloatArray wrapXbFP16Batch; // B × dim  (RMSNorm output, FP16)
     public FloatArray wrapQBatch; // B × qDim (Q projection)

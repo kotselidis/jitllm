@@ -113,6 +113,18 @@ public final class TornadoBatchPrefillPass {
                 var embTable = weights.getTokenEmbeddingTable().asByteArray();
                 int dim = config.dim();
                 int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+                if (state.workspace.embeddingQ8Batch != null) {
+                    // The activation decodes on the device: copy each token's raw row, which is
+                    // a bulk copy even before the JIT has compiled anything here.
+                    long rowBytes = (long) blocksPerRow * Q8_0_BLOCK_BYTES;
+                    MemorySegment table = embTable.getSegment();
+                    MemorySegment rows = state.workspace.embeddingQ8Batch.getSegment();
+                    for (int b = 0; b < chunkSize; b++) {
+                        MemorySegment.copy(
+                                table, tokens[b] * rowBytes, rows, b * rowBytes, rowBytes);
+                    }
+                    break;
+                }
                 // Rows in parallel: each row decodes its own token into its own span of the
                 // batch carrier, element by element as before.
                 IntStream.range(0, chunkSize)

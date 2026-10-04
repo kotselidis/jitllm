@@ -13,7 +13,7 @@ import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LogitsQ8_0LayerDecode;
 import org.beehive.jitllm.backend.tornado.plan.components.BatchPrefillDecodeForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchDecodeActivation;
-import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillActivation;
+import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillQ8DeviceActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.inference.state.LlamaState;
@@ -70,7 +70,8 @@ public class LlamaQ4_0PlanComponents implements BatchPrefillDecodeForwardPlanCom
 
     @Override
     public ActivationTaskGraph batchPrefillActivation(int batchSize) {
-        return new BatchPrefillActivation(state, config, batchSize, true);
+        // The embedding is Q8_0 (materialized from Q4_0 or Q6_K): decoded on the device.
+        return new BatchPrefillQ8DeviceActivation(state, config, batchSize);
     }
 
     @Override
