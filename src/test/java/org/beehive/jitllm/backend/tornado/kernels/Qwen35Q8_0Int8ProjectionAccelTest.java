@@ -74,8 +74,13 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
     }
 
     private static WorkerGrid gemmGrid(int m, int n) {
-        WorkerGrid gemm = new WorkerGrid2D((m / 128) * 256, n / 128);
-        gemm.setLocalWork(256, 1, 1);
+        return gemmGrid(m, n, 1);
+    }
+
+    private static WorkerGrid gemmGrid(int m, int n, int splits) {
+        int local = Qwen35Int8Kernels.Q8_GEMM_THREADS;
+        WorkerGrid gemm = new WorkerGrid2D((m / 128) * local, n / 128 * splits);
+        gemm.setLocalWork(local, 1, 1);
         return gemm;
     }
 
@@ -118,7 +123,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 m,
                                 n,
                                 k,
-                                Qwen35Int8Kernels.EPILOGUE_STORE)
+                                Qwen35Int8Kernels.EPILOGUE_STORE,
+                                out,
+                                1)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, out, q8, dA);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("q8g.q", lanes(m * k, 256));
@@ -199,7 +206,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 m,
                                 n,
                                 k,
-                                Qwen35Int8Kernels.EPILOGUE_STORE)
+                                Qwen35Int8Kernels.EPILOGUE_STORE,
+                                stored,
+                                1)
                         .task(
                                 "r",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -212,7 +221,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 m,
                                 n,
                                 k,
-                                Qwen35Int8Kernels.EPILOGUE_RESIDUAL)
+                                Qwen35Int8Kernels.EPILOGUE_RESIDUAL,
+                                residual,
+                                1)
                         .task(
                                 "g",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -225,7 +236,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 m,
                                 n,
                                 k,
-                                Qwen35Int8Kernels.EPILOGUE_SWIGLU)
+                                Qwen35Int8Kernels.EPILOGUE_SWIGLU,
+                                swiglu,
+                                1)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, stored, residual, swiglu);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("q8e.q", lanes(m * k, 256));
@@ -305,6 +318,133 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                         accumulated.get(row * d + o),
                         1e-4 * (1 + Math.abs(expected)));
             }
+        }
+    }
+
+    /**
+     * K split in three, then the partial sums added: against the unsplit GEMM on the same operands,
+     * storing and adding to a residual. Only the order of the FP32 additions differs.
+     */
+    @Test
+    public void aSplitGemmMatchesTheUnsplitOne() throws Exception {
+        assumeTrue("no int8 tensor cores", TensorCoreSupport.isInt8MmaCapable());
+        int m = 128, n = 256, k = 448; // seven rounds: splits of three, three and one
+        int splits = 3;
+        byte[] raw = randomWeights(n, k, 51);
+        ByteArray w = toDevice(raw);
+        FloatArray a = activations(m, k, 52);
+        FloatArray before = activations(m, n, 53);
+        ByteArray q8 = new ByteArray(m * k);
+        FloatArray dA = new FloatArray(m * k / 32);
+        FloatArray whole = new FloatArray(m * n);
+        FloatArray partial = new FloatArray(splits * m * n);
+        FloatArray stored = new FloatArray(m * n);
+        FloatArray residual = new FloatArray(m * n);
+        for (int i = 0; i < m * n; i++) {
+            residual.set(i, before.get(i));
+        }
+        TaskGraph g =
+                new TaskGraph("q8s")
+                        .transferToDevice(
+                                DataTransferMode.EVERY_EXECUTION,
+                                a,
+                                w,
+                                q8,
+                                dA,
+                                whole,
+                                partial,
+                                stored,
+                                residual)
+                        .task(
+                                "q",
+                                Qwen35Int8Kernels::quantizeActivationsQ8Warp,
+                                new KernelContext(),
+                                a,
+                                q8,
+                                dA,
+                                k)
+                        .task(
+                                "w",
+                                Qwen35Int8Kernels::gemmInt8Q8_0,
+                                new KernelContext(),
+                                q8,
+                                dA,
+                                w,
+                                whole,
+                                whole,
+                                m,
+                                n,
+                                k,
+                                Qwen35Int8Kernels.EPILOGUE_STORE,
+                                whole,
+                                1)
+                        .task(
+                                "s",
+                                Qwen35Int8Kernels::gemmInt8Q8_0,
+                                new KernelContext(),
+                                q8,
+                                dA,
+                                w,
+                                stored,
+                                stored,
+                                m,
+                                n,
+                                k,
+                                Qwen35Int8Kernels.EPILOGUE_STORE,
+                                partial,
+                                splits)
+                        .task(
+                                "sr",
+                                Qwen35Int8Kernels::reduceSplitsQ8_0,
+                                new KernelContext(),
+                                partial,
+                                stored,
+                                m * n,
+                                splits,
+                                Qwen35Int8Kernels.EPILOGUE_STORE)
+                        .task(
+                                "r",
+                                Qwen35Int8Kernels::gemmInt8Q8_0,
+                                new KernelContext(),
+                                q8,
+                                dA,
+                                w,
+                                residual,
+                                residual,
+                                m,
+                                n,
+                                k,
+                                Qwen35Int8Kernels.EPILOGUE_RESIDUAL,
+                                partial,
+                                splits)
+                        .task(
+                                "rr",
+                                Qwen35Int8Kernels::reduceSplitsQ8_0,
+                                new KernelContext(),
+                                partial,
+                                residual,
+                                m * n,
+                                splits,
+                                Qwen35Int8Kernels.EPILOGUE_RESIDUAL)
+                        .transferToHost(DataTransferMode.EVERY_EXECUTION, whole, stored, residual);
+        GridScheduler s = new GridScheduler();
+        s.addWorkerGrid("q8s.q", lanes(m * k, 256));
+        s.addWorkerGrid("q8s.w", gemmGrid(m, n));
+        s.addWorkerGrid("q8s.s", gemmGrid(m, n, splits));
+        s.addWorkerGrid("q8s.r", gemmGrid(m, n, splits));
+        s.addWorkerGrid("q8s.sr", lanes(m * n, 256));
+        s.addWorkerGrid("q8s.rr", lanes(m * n, 256));
+        try (TornadoExecutionPlan plan = new TornadoExecutionPlan(g.snapshot())) {
+            plan.withGridScheduler(s).execute();
+        }
+        for (int i = 0; i < m * n; i++) {
+            float expected = whole.get(i);
+            assertEquals("stored " + i, expected, stored.get(i), 1e-5f * (1 + Math.abs(expected)));
+            assertEquals(
+                    "residual " + i,
+                    before.get(i) + expected,
+                    residual.get(i),
+                    1e-5f * (1 + Math.abs(expected)));
         }
     }
 }

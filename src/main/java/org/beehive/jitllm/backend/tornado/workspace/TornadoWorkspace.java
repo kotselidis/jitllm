@@ -238,6 +238,13 @@ public final class TornadoWorkspace {
     public FloatArray wrapDequantScratchF32;
 
     /**
+     * The partial sums of a batched Q8_0 projection whose int8 GEMM is split along K, one output
+     * matrix per split, before they are added together. Allocated by the batch prefill that needs
+     * it.
+     */
+    public FloatArray wrapQ8SplitPartial;
+
+    /**
      * The int8 pair's scratch: the chunk's activations quantized to int8 with a scale per 32 (one
      * buffer, requantized before each group of consumers in graph order), and one Q4_0 matrix
      * decoded to int8 in the B-operand word layout with its FP32 block scales.

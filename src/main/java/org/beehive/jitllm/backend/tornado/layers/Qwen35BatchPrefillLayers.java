@@ -357,6 +357,13 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         case RESIDUAL -> Qwen35Int8Kernels.EPILOGUE_RESIDUAL;
                         case SWIGLU -> Qwen35Int8Kernels.EPILOGUE_SWIGLU;
                     };
+            int splits = epilogue == Epilogue.SWIGLU ? 1 : gemmSplits(n, k);
+            FloatArray target = epilogue == Epilogue.SWIGLU ? hb : out;
+            // Unsplit, the partial-sum parameter is never read; it is bound to the output.
+            FloatArray partial = splits > 1 ? state.workspace.wrapQ8SplitPartial : target;
+            if (splits > 1) {
+                gemmSplitCounts.put(qualified, splits);
+            }
             graph.task(
                     task,
                     Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -364,12 +371,27 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     state.workspace.wrapQ8ActBatch,
                     state.workspace.wrapQ8ActScales,
                     w,
-                    epilogue == Epilogue.SWIGLU ? hb : out,
+                    target,
                     epilogue == Epilogue.SWIGLU ? gate : out,
                     batchSize,
                     n,
                     k,
-                    mode);
+                    mode,
+                    partial,
+                    splits);
+            if (splits > 1) {
+                // The splits' partial sums added in order, then stored or added to the residual.
+                splitReduceTasks.put(qualified + "_reduce", batchSize * n);
+                graph.task(
+                        task + "_reduce",
+                        Qwen35Int8Kernels::reduceSplitsQ8_0,
+                        context,
+                        partial,
+                        out,
+                        batchSize * n,
+                        splits,
+                        mode);
+            }
             return;
         }
         int8DecodeTasks.put(qualified + "_dequant", n * k / 4);
@@ -601,16 +623,17 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
 
     // @formatter:off
     /**
-     * The FP32 scratch for the Q8_0 projections that do not tile for the int8 GEMM, when native
-     * libraries are on: sized for the largest of them, and every one decodes into it in turn.
-     * Without native libraries those projections take the warp kernel and nothing is allocated.
+     * The scratch buffers this range's Q8_0 projections need: the partial sums of the int8 GEMMs
+     * split along K ({@link #gemmSplits}), sized for the largest; and, when native libraries are
+     * on, the FP32 scratch for the projections that do not tile for the int8 GEMM, sized for the
+     * largest of them. Every projection uses each in turn, so one of each is enough. Without native
+     * libraries the untiled projections take the warp kernel and need no scratch.
      */
     // @formatter:on
     private void allocateQ8Scratch() {
-        if (!org.beehive.jitllm.backend.tornado.NativePrefillSupport.nativeProjections(
-                state.executionPolicy())) {
-            return;
-        }
+        boolean nativeLibraries =
+                org.beehive.jitllm.backend.tornado.NativePrefillSupport.nativeProjections(
+                        state.executionPolicy());
         int dim = config.dim();
         // Each projection's tensors with its (outputs, inputs).
         Object[][] projections = {
@@ -628,6 +651,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             {weights.ssmOut, dim, config.deltaNetValueDim()}
         };
         long widest = 0;
+        long partials = 0;
         for (Object[] projection : projections) {
             TornadoTensor[] tensors = (TornadoTensor[]) projection[0];
             int outputs = (Integer) projection[1];
@@ -636,22 +660,92 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 if (tensors != null
                         && layer < tensors.length
                         && tensors[layer] != null
-                        && tensors[layer].dataType() == DataType.Q8_0
-                        && !q8Int8Eligible("", outputs, inputs)) {
-                    widest = Math.max(widest, (long) outputs * inputs);
+                        && tensors[layer].dataType() == DataType.Q8_0) {
+                    if (q8Int8Eligible("", outputs, inputs)) {
+                        int splits = gemmSplits(outputs, inputs);
+                        if (splits > 1) {
+                            partials = Math.max(partials, (long) splits * batchSize * outputs);
+                        }
+                    } else if (nativeLibraries) {
+                        widest = Math.max(widest, (long) outputs * inputs);
+                    }
                 }
             }
         }
-        if (widest == 0) {
-            return;
+        if (widest > 0) {
+            FloatArray current = state.workspace.wrapDequantScratchF32;
+            if (current == null || current.getSize() < widest) {
+                state.workspace.wrapDequantScratchF32 =
+                        org.beehive.jitllm.backend.tornado.workspace.TornadoWorkspaces.floats(
+                                Math.toIntExact(widest));
+            }
         }
-        FloatArray current = state.workspace.wrapDequantScratchF32;
-        if (current == null || current.getSize() < widest) {
-            state.workspace.wrapDequantScratchF32 =
-                    org.beehive.jitllm.backend.tornado.workspace.TornadoWorkspaces.floats(
-                            Math.toIntExact(widest));
+        if (partials > 0) {
+            FloatArray current = state.workspace.wrapQ8SplitPartial;
+            if (current == null || current.getSize() < partials) {
+                state.workspace.wrapQ8SplitPartial =
+                        org.beehive.jitllm.backend.tornado.workspace.TornadoWorkspaces.floats(
+                                Math.toIntExact(partials));
+            }
         }
     }
+
+    /** Streaming multiprocessors of the device, or 0 where it cannot say. */
+    private static final int SM_COUNT = streamingMultiprocessors();
+
+    private static int streamingMultiprocessors() {
+        try {
+            return uk.ac.manchester.tornado.api.runtime.TornadoRuntimeProvider.getTornadoRuntime()
+                    .getBackend(0)
+                    .getDefaultDevice()
+                    .getPhysicalDevice()
+                    .getDeviceMaxComputeUnits();
+        } catch (RuntimeException | LinkageError e) {
+            return 0;
+        }
+    }
+
+    private static final int MAX_GEMM_SPLITS = 8;
+
+    // @formatter:off
+    /**
+     * How many parts the int8 GEMM of a Q8_0 projection of {@code outputs} over {@code k} inputs
+     * splits K into, so that its 128 x 128 tiles fill the device's multiprocessors.
+     *
+     * <p>A tile is one block, and a block takes a multiprocessor to itself (its registers allow no
+     * second one), so a GEMM runs in waves of {@code SM_COUNT} tiles and its time is the number of
+     * waves times the rounds each tile runs. On the A10's 72 multiprocessors the 5,120-wide
+     * projections have 80 tiles at a 256-row chunk: two waves, the second eight tiles long. Split
+     * in {@code s}, a GEMM has {@code s} times the tiles, each running {@code 1/s} of the rounds.
+     * The split chosen is the one with the fewest (waves x rounds), taken only where it saves at
+     * least a tenth, since every split adds a pass over its partial sums.
+     */
+    // @formatter:on
+    private int gemmSplits(int outputs, int k) {
+        if (SM_COUNT <= 0) {
+            return 1;
+        }
+        int tiles = (batchSize / GEMM_TILE) * (outputs / GEMM_TILE);
+        int rounds = k / Qwen35Int8Kernels.I8_BK;
+        long unsplit = (long) ((tiles + SM_COUNT - 1) / SM_COUNT) * rounds;
+        int best = 1;
+        long bestCost = unsplit;
+        for (int splits = 2; splits <= MAX_GEMM_SPLITS && splits <= rounds; splits++) {
+            long waves = ((long) tiles * splits + SM_COUNT - 1) / SM_COUNT;
+            long cost = waves * ((rounds + splits - 1) / splits);
+            if (cost < bestCost) {
+                best = splits;
+                bestCost = cost;
+            }
+        }
+        return bestCost * 10 <= unsplit * 9 ? best : 1;
+    }
+
+    /** The K-split int8 GEMMs, by qualified task name, with their split counts. */
+    private final java.util.Map<String, Integer> gemmSplitCounts = new java.util.LinkedHashMap<>();
+
+    /** The passes that add a split GEMM's partial sums, with their lane counts. */
+    private final java.util.Map<String, Integer> splitReduceTasks = new java.util.LinkedHashMap<>();
 
     @Override
     public List<ImmutableTaskGraph> getLayerImmutableTaskGraphs() {
@@ -2101,6 +2195,10 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 layer.transferToDevice(
                         DataTransferMode.FIRST_EXECUTION, state.workspace.wrapDequantScratchF32);
             }
+            if (state.workspace.wrapQ8SplitPartial != null) {
+                layer.transferToDevice(
+                        DataTransferMode.FIRST_EXECUTION, state.workspace.wrapQ8SplitPartial);
+            }
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION, state.workspace.batchStartPosHolder);
             layer.transferToDevice(
@@ -2215,6 +2313,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             }
             if (state.workspace.wrapDequantScratchF32 != null) {
                 layer.consumeFromDevice(predecessor, state.workspace.wrapDequantScratchF32);
+            }
+            if (state.workspace.wrapQ8SplitPartial != null) {
+                layer.consumeFromDevice(predecessor, state.workspace.wrapQ8SplitPartial);
             }
         }
     }
@@ -2523,6 +2624,13 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             scheduler.addWorkerGrid(
                     entry.getKey(), WorkerGridFactory.genericWorker(entry.getValue(), GEMM_LOCAL));
         }
+        for (var entry : splitReduceTasks.entrySet()) {
+            scheduler.addWorkerGrid(
+                    entry.getKey(),
+                    WorkerGridFactory.genericWorker(
+                            (entry.getValue() + GEMM_LOCAL - 1) / GEMM_LOCAL * GEMM_LOCAL,
+                            GEMM_LOCAL));
+        }
         for (var entry : quantizeTasks.entrySet()) {
             scheduler.addWorkerGrid(
                     entry.getKey(),
@@ -2577,11 +2685,17 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         }
         Integer gemmCols = gemmTasks.get(qualifiedTask);
         if (gemmCols != null) {
-            // gemmMMA's documented worker: (M/128) * 256 by N/128, 256 threads per block.
+            // gemmMMA's documented worker: (M/128) * 256 by N/128, 256 threads per block; a split
+            // GEMM has a column of blocks per split.
+            int local =
+                    q8DirectGemms.contains(qualifiedTask)
+                            ? Qwen35Int8Kernels.Q8_GEMM_THREADS
+                            : GEMM_LOCAL;
             WorkerGrid gemm =
                     new uk.ac.manchester.tornado.api.WorkerGrid2D(
-                            (batchSize / GEMM_TILE) * GEMM_LOCAL, gemmCols / GEMM_TILE);
-            gemm.setLocalWork(GEMM_LOCAL, 1, 1);
+                            (batchSize / GEMM_TILE) * local,
+                            gemmCols / GEMM_TILE * gemmSplitCounts.getOrDefault(qualifiedTask, 1));
+            gemm.setLocalWork(local, 1, 1);
             return gemm;
         }
         Integer mmaCols = mmaTasks.get(qualifiedTask);
