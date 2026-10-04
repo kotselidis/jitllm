@@ -107,6 +107,10 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
 
     private final int batchSize;
 
+    /** How the first stage's batched prefill runs its projections, for the run configuration. */
+    private String prefillProjections =
+            "cuBLAS FP16 GEMM (Q4_0 weights decoded to FP16 per projection)";
+
     /** Per stage, the graph indices of its prefill program, in order. Null unless batched. */
     private final int[][] prefillGraphs;
 
@@ -556,6 +560,9 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                 new Qwen35BatchPrefillLayers(stageState, weights, config, batchSize, first, end);
         graphs.addAll(prefill.getLayerImmutableTaskGraphs());
         prefill.updateGridScheduler(scheduler);
+        if (s == 0) {
+            prefillProjections = prefill.describeProjections();
+        }
         String lastPrefill = prefill.getLastLayerTaskGraphID();
         if (s < last) {
             TaskGraph send = new TaskGraph("prefillHandoff");
@@ -706,7 +713,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                     state,
                     "batch-prefill-decode " + split,
                     batchSize,
-                    "cuBLAS FP16 GEMM (Q4_0 weights decoded to FP16 per projection)",
+                    prefillProjections,
                     "JIT kernels");
         }
         return PlanDiagnostics.describe(
