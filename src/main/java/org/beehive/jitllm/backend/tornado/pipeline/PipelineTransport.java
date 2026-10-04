@@ -7,34 +7,44 @@ import uk.ac.manchester.tornado.api.common.TornadoDevice;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 
 /**
- * How the hidden state crosses from one pipeline stage to the next, and how the stages run.
+ * How activations cross from one pipeline stage to the next, and how the stages run.
  *
  * <p>Two implementations: {@link HostTransport} copies through host memory and runs the stages one
  * after the other on the calling thread; {@code NcclTransport} sends device to device with NCCL and
  * runs every stage on its own thread through an {@code NcclPlanGroup}. The NCCL one is compiled
  * only with the {@code nccl} Maven profile, so it is loaded by name.
+ *
+ * <p>Send and receive are added to a graph the caller builds, so a stage can hand over several
+ * buffers (the decode hidden state, a prefill chunk's) and a receiving graph can carry other
+ * bindings as well.
  */
 public interface PipelineTransport extends AutoCloseable {
 
     String NCCL_TRANSPORT = "org.beehive.jitllm.backend.tornado.pipeline.NcclTransport";
 
     /**
-     * Graph that ends a stage: sends {@code x}, produced by graph {@code producer}, to stage {@code
+     * Adds to {@code graph} sending {@code x}, produced by graph {@code producer}, to stage {@code
      * toStage}.
      */
-    TaskGraph sendGraph(int stage, String producer, FloatArray x, int toStage);
+    void addSend(TaskGraph graph, int stage, String producer, FloatArray x, int toStage);
 
     /**
-     * Graph that starts a stage: receives {@code x} from stage {@code fromStage} and persists it on
-     * the device for the stage's first layer.
+     * Adds to {@code graph} receiving {@code x} from stage {@code fromStage}, persisted on the
+     * device for the graphs after it.
      */
-    TaskGraph receiveGraph(int stage, FloatArray x, int fromStage);
+    void addReceive(TaskGraph graph, int stage, FloatArray x, int fromStage);
 
-    /** Adds the worker grids of this stage's transport graphs. */
+    /** Adds the worker grids of the hand-off tasks this transport added to stage {@code stage}. */
     void updateGridScheduler(int stage, GridScheduler scheduler);
 
-    /** Runs one forward step: every stage's plan, all of its graphs, once. */
+    /** Runs one step: every stage's plan, all of its graphs, once. */
     void execute(TornadoExecutionPlan[] plans);
+
+    /**
+     * Runs one step in which stage {@code s} executes only the graphs {@code graphs[s]} of its
+     * plan, in order.
+     */
+    void execute(TornadoExecutionPlan[] plans, int[][] graphs, boolean cudaGraphs);
 
     /**
      * Releases the transport. {@code closePlans} runs at the point where the plans must be closed:
@@ -45,6 +55,17 @@ public interface PipelineTransport extends AutoCloseable {
     @Override
     default void close() {
         close(() -> {});
+    }
+
+    /** Executes graphs {@code graphs} of {@code plan}, in order. */
+    static void executeGraphs(TornadoExecutionPlan plan, int[] graphs, boolean cudaGraphs) {
+        for (int graph : graphs) {
+            TornadoExecutionPlan selected = plan.withGraph(graph);
+            if (cudaGraphs) {
+                selected.withCUDAGraph();
+            }
+            selected.execute();
+        }
     }
 
     /** {@code "nccl"} (the default) or {@code "host"}. */

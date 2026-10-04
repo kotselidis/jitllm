@@ -55,7 +55,7 @@ public final class TornadoBatchPrefillPass {
             int[] tokens,
             int startPos,
             int chunkSize,
-            TornadoVMMasterPlanBatchPrefillDecode plan) {
+            BatchPrefillDecodePlan plan) {
         final Configuration config = model.configuration();
         final TornadoWeights weights = (TornadoWeights) model.weights();
 
@@ -230,11 +230,7 @@ public final class TornadoBatchPrefillPass {
      * @return the logits this invocation produced, for sampling
      */
     public static Logits decode(
-            Model model,
-            State state,
-            int token,
-            int position,
-            TornadoVMMasterPlanBatchPrefillDecode plan) {
+            Model model, State state, int token, int position, BatchPrefillDecodePlan plan) {
         final Configuration config = model.configuration();
         final TornadoWeights weights = (TornadoWeights) model.weights();
 

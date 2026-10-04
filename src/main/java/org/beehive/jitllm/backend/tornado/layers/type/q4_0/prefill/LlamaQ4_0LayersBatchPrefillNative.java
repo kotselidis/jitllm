@@ -71,6 +71,8 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
     private final LlamaConfiguration config;
     private final KernelContext context = new KernelContext();
     private final int batchSize;
+    private final int firstLayer;
+    private final int endLayer;
     private final HalfFloatArray scratch;
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
@@ -80,13 +82,40 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
             LlamaTornadoWeights weights,
             LlamaConfiguration config,
             int batchSize) {
+        this(state, weights, config, batchSize, 0, config.numberOfLayers());
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)} only: one stage of a model split across devices.
+     * The first layer of the range takes the role layer 0 has otherwise, and the key/value cache of
+     * {@code state} holds just these layers.
+     */
+    public LlamaQ4_0LayersBatchPrefillNative(
+            LlamaState state,
+            LlamaTornadoWeights weights,
+            LlamaConfiguration config,
+            int batchSize,
+            int firstLayer,
+            int endLayer) {
+        if (firstLayer < 0 || endLayer > config.numberOfLayers() || firstLayer >= endLayer) {
+            throw new IllegalArgumentException(
+                    "layer range ["
+                            + firstLayer
+                            + ", "
+                            + endLayer
+                            + ") outside the model's "
+                            + config.numberOfLayers()
+                            + " layers");
+        }
         this.state = state;
         this.weights = weights;
         this.config = config;
         this.batchSize = batchSize;
+        this.firstLayer = firstLayer;
+        this.endLayer = endLayer;
         this.scratch = scratchFor(state, config);
         this.layerITGs =
-                IntStream.range(0, config.numberOfLayers())
+                IntStream.range(firstLayer, endLayer)
                         .mapToObj(this::createLayer)
                         .map(TaskGraph::snapshot)
                         .toList();
@@ -135,7 +164,7 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
     // @formatter:off
     private TaskGraph createLayer(int layerIndex) {
         String graphName = "batchPrefillLayer_" + layerIndex;
-        if (layerIndex == config.numberOfLayers() - 1) {
+        if (layerIndex == endLayer - 1) {
             lastLayerTaskGraphID = graphName;
         }
         TaskGraph layer = new TaskGraph(graphName);
@@ -157,7 +186,7 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
             state.workspace.w2Out,
             scratch
         };
-        if (layerIndex == 0) {
+        if (layerIndex == firstLayer) {
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION, state.workspace.batchStartPosHolder);
             layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, intermediates);
@@ -193,6 +222,8 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
         int kvDim = config.kvDim();
         int hidDim = config.hiddenDim();
         int qkvDim = dim + 2 * kvDim;
+        // The stage's cache holds only its own layers.
+        int kvLayer = layerIndex - firstLayer;
 
         // ── Attention ──────────────────────────────────────────────────────────
         layer.task(
@@ -239,7 +270,7 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                     weights.freq_cis_imagFlat.asFloatArray(),
                     kvDim,
                     config.headSize(),
-                    layerIndex,
+                    kvLayer,
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride,
@@ -262,7 +293,7 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                     config.headSize(),
                     kvDim,
                     config.kvMul(),
-                    layerIndex,
+                    kvLayer,
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride,
@@ -280,7 +311,7 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                     weights.freq_cis_imagFlat.asFloatArray(),
                     kvDim,
                     config.headSize(),
-                    layerIndex,
+                    kvLayer,
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride,
@@ -298,7 +329,7 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                     config.headSize(),
                     kvDim,
                     config.kvMul(),
-                    layerIndex,
+                    kvLayer,
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride,
@@ -455,7 +486,7 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
         WorkerGrid attention =
                 WorkerGridFactory.genericWorker(batchSize * nHeads * attnLocal, attnLocal);
 
-        for (int i = 0; i < config.numberOfLayers(); i++) {
+        for (int i = firstLayer; i < endLayer; i++) {
             String p = "batchPrefillLayer_" + i + ".";
             scheduler.addWorkerGrid(p + "batch_attn_rms", rms);
             scheduler.addWorkerGrid(p + "batch_attn_rms_apply", rmsApply);

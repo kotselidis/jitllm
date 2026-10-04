@@ -3,12 +3,18 @@ package org.beehive.jitllm.backend.tornado;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.IntStream;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.layers.Activation;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.LlamaQ4_0FFNLayers;
+import org.beehive.jitllm.backend.tornado.layers.type.q4_0.decode.LlamaQ4_0FFNLayersDecode;
+import org.beehive.jitllm.backend.tornado.layers.type.q4_0.prefill.LlamaQ4_0LayersBatchPrefillNative;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LlamaQ8_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
+import org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LogitsQ8_0LayerDecode;
 import org.beehive.jitllm.backend.tornado.pipeline.PipelineTransport;
+import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchDecodeActivation;
+import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillQ8DeviceActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.inference.state.LlamaState;
@@ -25,6 +31,7 @@ import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.common.TornadoDevice;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.IntArray;
 
 // @formatter:off
 /**
@@ -51,7 +58,7 @@ import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
  * Llama-family models with Q4_0 or Q8_0 layers only.
  */
 // @formatter:on
-public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
+public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan {
 
     private static final String DEVICES_PROPERTY = "jitllm.pipeline.devices";
 
@@ -85,6 +92,20 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
     private final PipelineTransport transport;
     private final String transportName;
 
+    /**
+     * Whether the prompt is prefilled in chunks: then each stage's plan holds a prefill program and
+     * a decode program, and a step runs one of them; otherwise a step runs the whole plan.
+     */
+    private final boolean batched;
+
+    private final int batchSize;
+
+    /** Per stage, the graph indices of its prefill program, in order. Null unless batched. */
+    private final int[][] prefillGraphs;
+
+    /** Per stage, the graph indices of its decode program, in order. Null unless batched. */
+    private final int[][] decodeGraphs;
+
     public TornadoVMMasterPlanPipeline(State state, Model model, MetricsSink sink) {
         if (!(state instanceof LlamaState) || !(model.weights() instanceof LlamaTornadoWeights)) {
             throw new UnsupportedOperationException(
@@ -113,13 +134,33 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
         this.transportName = System.getProperty("jitllm.pipeline.transport", "nccl");
         this.transport = PipelineTransport.create(transportName, devices);
 
+        var policy = state.executionPolicy();
+        this.batched =
+                policy.phaseStrategy()
+                                == org.beehive.jitllm.runtime.policy.ExecutionPolicy.PhaseStrategy
+                                        .PREFILL_DECODE
+                        && policy.prefillBatchSize() > 1;
+        this.batchSize = batched ? policy.prefillBatchSize() : 1;
+        if (batched && weightType != DataType.Q4_0) {
+            throw new UnsupportedOperationException(
+                    "the pipeline split batches the prefill of Q4_0 layers only, not "
+                            + weightType);
+        }
+        if (batched && !NativePrefillSupport.nativeProjections(policy)) {
+            throw new UnsupportedOperationException(
+                    "the pipeline split's batched prefill runs its projections through cuBLAS: add"
+                            + " --with-native-libraries on CUDA devices with tensor cores");
+        }
+
         this.stages = new Stage[devices.length];
         this.plans = new TornadoExecutionPlan[devices.length];
+        this.prefillGraphs = batched ? new int[devices.length][] : null;
+        this.decodeGraphs = batched ? new int[devices.length][] : null;
         int last = devices.length - 1;
         for (int s = 0; s < devices.length; s++) {
             int first = bounds[s];
             int end = bounds[s + 1];
-            LlamaState stageState = stageState(state, config, end - first);
+            LlamaState stageState = stageState(state, config, end - first, batchSize);
             if (s == 0) {
                 // The token loop writes the embedding row into the session's state.
                 stageState.workspace.embeddingX = state.workspace.embeddingX;
@@ -127,54 +168,31 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
 
             List<ImmutableTaskGraph> graphs = new ArrayList<>();
             GridScheduler scheduler = new GridScheduler();
-            if (s == 0) {
-                var activation = new Activation("activationUpdate", stageState, weights, config);
-                graphs.add(activation.getImmutableTaskGraph());
-                activation.updateGridScheduler(scheduler);
+            if (batched) {
+                addBatchedStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        stageState,
+                        weights,
+                        config,
+                        schedulerType,
+                        graphs,
+                        scheduler);
             } else {
-                graphs.add(transport.receiveGraph(s, stageState.workspace.wrapX, s - 1).snapshot());
-            }
-
-            AbstractTransformerLayerTaskGraphs<?, ?> layers =
-                    weightType == DataType.Q4_0
-                            ? new LlamaQ4_0FFNLayers(
-                                    "layers",
-                                    stageState,
-                                    weights,
-                                    config,
-                                    schedulerType,
-                                    first,
-                                    end)
-                            : new LlamaQ8_0FFNLayers(
-                                    "layers",
-                                    stageState,
-                                    weights,
-                                    config,
-                                    schedulerType,
-                                    first,
-                                    end);
-            graphs.addAll(layers.getFFNLayerImmutableTaskGraphs());
-            layers.updateGridScheduler(scheduler);
-
-            if (s < last) {
-                TaskGraph send =
-                        transport.sendGraph(
-                                s,
-                                layers.getLastFFNLayerTaskGraphID(),
-                                stageState.workspace.wrapX,
-                                s + 1);
-                graphs.add(send.snapshot());
-            } else {
-                var logits =
-                        new LogitsQ8_0Layer(
-                                "logits",
-                                stageState,
-                                weights,
-                                config,
-                                layers.getLastFFNLayerTaskGraphID(),
-                                schedulerType);
-                graphs.add(logits.getImmutableTaskGraph());
-                logits.updateGridScheduler(scheduler);
+                addSingleTokenStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        stageState,
+                        weights,
+                        config,
+                        schedulerType,
+                        weightType,
+                        graphs,
+                        scheduler);
             }
             transport.updateGridScheduler(s, scheduler);
 
@@ -182,7 +200,7 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
                     new TornadoExecutionPlan(graphs.toArray(new ImmutableTaskGraph[0]))
                             .withDevice(devices[s])
                             .withGridScheduler(scheduler);
-            if (CUDA_GRAPHS) {
+            if (CUDA_GRAPHS && !batched) {
                 plan.withCUDAGraph();
             }
             plan.withStagedTransfers();
@@ -194,14 +212,168 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
     }
 
     /**
+     * One stage of the single-token plan: [embedding | receive], its layers, [send | logits]. A
+     * step runs the whole plan.
+     */
+    private void addSingleTokenStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            LlamaState stageState,
+            LlamaTornadoWeights weights,
+            LlamaConfiguration config,
+            SchedulerType schedulerType,
+            DataType weightType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0) {
+            var activation = new Activation("activationUpdate", stageState, weights, config);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("handoff_in");
+            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+
+        AbstractTransformerLayerTaskGraphs<?, ?> layers =
+                weightType == DataType.Q4_0
+                        ? new LlamaQ4_0FFNLayers(
+                                "layers", stageState, weights, config, schedulerType, first, end)
+                        : new LlamaQ8_0FFNLayers(
+                                "layers", stageState, weights, config, schedulerType, first, end);
+        graphs.addAll(layers.getFFNLayerImmutableTaskGraphs());
+        layers.updateGridScheduler(scheduler);
+
+        if (s < last) {
+            TaskGraph send = new TaskGraph("handoff_out");
+            transport.addSend(
+                    send,
+                    s,
+                    layers.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new LogitsQ8_0Layer(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            layers.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+    }
+
+    // @formatter:off
+    /**
+     * One stage of the batched plan: two programs in one plan, so they share the stage's weights
+     * and key/value cache on its device.
+     *
+     * <pre>
+     *   prefill: [prefillActivation | receive chunk], batchPrefillLayer_[first, end), [send chunk]
+     *   decode:  [decodeActivation  | receive x   ], layer_[first, end),             [send x | logits]
+     * </pre>
+     *
+     * <p>A later stage's {@code decodeActivation} only receives the hidden state; its first decode
+     * layer takes the cache from the stage's last prefill layer.
+     */
+    // @formatter:on
+    private void addBatchedStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            LlamaState stageState,
+            LlamaTornadoWeights weights,
+            LlamaConfiguration config,
+            SchedulerType schedulerType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0) {
+            var activation = new BatchPrefillQ8DeviceActivation(stageState, config, batchSize);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+            // The host stages each chunk's raw embedding rows in the session's state.
+            state.workspace.embeddingQ8Batch = stageState.workspace.embeddingQ8Batch;
+        } else {
+            TaskGraph receive = new TaskGraph("prefillActivation");
+            transport.addReceive(receive, s, stageState.workspace.wrapXBatch, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var prefill =
+                new LlamaQ4_0LayersBatchPrefillNative(
+                        stageState, weights, config, batchSize, first, end);
+        graphs.addAll(prefill.getLayerImmutableTaskGraphs());
+        prefill.updateGridScheduler(scheduler);
+        String lastPrefill = prefill.getLastLayerTaskGraphID();
+        if (s < last) {
+            TaskGraph send = new TaskGraph("prefillHandoff");
+            transport.addSend(send, s, lastPrefill, stageState.workspace.wrapXBatch, s + 1);
+            graphs.add(send.snapshot());
+        }
+        prefillGraphs[s] = IntStream.range(0, graphs.size()).toArray();
+
+        int decodeStart = graphs.size();
+        if (s == 0) {
+            var activation = new BatchDecodeActivation(stageState, config, lastPrefill, true);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            // Only the hidden state: the first decode layer takes this stage's cache straight
+            // from its last prefill layer.
+            TaskGraph receive = new TaskGraph("decodeActivation");
+            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var decode =
+                new LlamaQ4_0FFNLayersDecode(
+                        "decode", stageState, weights, config, schedulerType, first, end);
+        graphs.addAll(decode.getFFNLayerImmutableTaskGraphs());
+        decode.updateGridScheduler(scheduler);
+        if (s < last) {
+            TaskGraph send = new TaskGraph("decodeHandoff");
+            transport.addSend(
+                    send,
+                    s,
+                    decode.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new LogitsQ8_0LayerDecode(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            decode.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+        decodeGraphs[s] = IntStream.range(decodeStart, graphs.size()).toArray();
+    }
+
+    /**
      * A state for one stage: its own buffers and a key/value cache for its layers only, with the
      * session's storage options and execution policy.
      */
-    private static LlamaState stageState(State session, LlamaConfiguration config, int layers) {
+    private static LlamaState stageState(
+            State session, LlamaConfiguration config, int layers, int prefillBatchSize) {
         LlamaState stage =
                 State.withStorageOptions(
                         session.storageOptions(),
-                        () -> State.withKeyValueLayers(layers, () -> new LlamaState(config, 1)));
+                        () ->
+                                State.withPrefillBatchSize(
+                                        prefillBatchSize,
+                                        () ->
+                                                State.withKeyValueLayers(
+                                                        layers, () -> new LlamaState(config, 1))));
         stage.resolveExecutionPolicy(session.executionPolicy());
         return stage;
     }
@@ -284,6 +456,14 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
                     .append(stage.endLayer())
                     .append(')');
         }
+        if (batched) {
+            return PlanDiagnostics.describe(
+                    state,
+                    "batch-prefill-decode " + split,
+                    batchSize,
+                    "cuBLAS FP16 GEMM (Q4_0 weights decoded to FP16 per projection)",
+                    "JIT kernels");
+        }
         return PlanDiagnostics.describe(
                 state, split.toString(), 1, "JIT kernels (no tensor-core MMA)", "JIT kernels");
     }
@@ -299,8 +479,36 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
         for (Stage stage : stages) {
             stage.state().workspace.wrapX.clear();
             stage.state().resetPositionHolder();
+            if (batched) {
+                // No active rows: the warm-up prefill writes nothing to the cache.
+                var workspace = stage.state().workspace;
+                workspace.wrapXBatch.clear();
+                workspace.batchStartPosHolder.init(0);
+                workspace.batchStartPosHolder.set(2, stage.state().kvSlot);
+            }
         }
-        transport.execute(plans);
+        if (batched) {
+            transport.execute(plans, prefillGraphs, CUDA_GRAPHS);
+            transport.execute(plans, decodeGraphs, CUDA_GRAPHS);
+        } else {
+            transport.execute(plans);
+        }
+    }
+
+    @Override
+    public void tornadoVMForwardBatchPrefill() {
+        if (!batched) {
+            throw new IllegalStateException("this pipeline plan was built without batched prefill");
+        }
+        // The host staged the chunk's start position, active rows and slot in the session state.
+        IntArray chunk = state.workspace.batchStartPosHolder;
+        for (Stage stage : stages) {
+            IntArray holder = stage.state().workspace.batchStartPosHolder;
+            for (int i = 0; i < holder.getSize() && i < chunk.getSize(); i++) {
+                holder.set(i, chunk.get(i));
+            }
+        }
+        transport.execute(plans, prefillGraphs, CUDA_GRAPHS);
     }
 
     @Override
@@ -313,7 +521,11 @@ public final class TornadoVMMasterPlanPipeline implements TornadoVMMasterPlan {
             workspace.tempLogits.clear();
             workspace.wrapLogits.clear();
         }
-        transport.execute(plans);
+        if (batched) {
+            transport.execute(plans, decodeGraphs, CUDA_GRAPHS);
+        } else {
+            transport.execute(plans);
+        }
         if (DEBUG) {
             FloatArray logits = stages[stages.length - 1].state().workspace.wrapLogits;
             double sum = 0;

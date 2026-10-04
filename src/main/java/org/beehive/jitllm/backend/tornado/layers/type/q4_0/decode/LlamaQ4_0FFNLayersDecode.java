@@ -27,15 +27,29 @@ public class LlamaQ4_0FFNLayersDecode extends LlamaQ4_0FFNLayers {
         super(taskGraph, state, weights, config, schedulerType);
     }
 
+    /**
+     * The layers {@code [firstLayer, endLayer)} only: one stage of a model split across devices.
+     */
+    public LlamaQ4_0FFNLayersDecode(
+            String taskGraph,
+            LlamaState state,
+            LlamaTornadoWeights weights,
+            LlamaConfiguration config,
+            SchedulerType schedulerType,
+            int firstLayer,
+            int endLayer) {
+        super(taskGraph, state, weights, config, schedulerType, firstLayer, endLayer);
+    }
+
     @Override
     protected String predecessorGraphName(int layerIndex) {
-        return (layerIndex == 0) ? "decodeActivation" : "layer_" + (layerIndex - 1);
+        return (layerIndex == firstLayer) ? "decodeActivation" : "layer_" + (layerIndex - 1);
     }
 
     // @formatter:off
     @Override
     protected TaskGraph configureLayerDataTransfers(TaskGraph layer, int layerIndex) {
-        if (layerIndex == 0) {
+        if (layerIndex == firstLayer) {
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION,
                     state.workspace.positionHolder,
@@ -53,8 +67,8 @@ public class LlamaQ4_0FFNLayersDecode extends LlamaQ4_0FFNLayers {
                     state.workspace.wrapHb,
                     weights.freq_cis_realFlat.asFloatArray(),
                     weights.freq_cis_imagFlat.asFloatArray());
-            layer.consumeFromDevice("decodeActivation", keyCache(), valueCache());
-            layer.consumeFromDevice("decodeActivation", state.workspace.wrapBlockTable);
+            layer.consumeFromDevice(cacheSource(), keyCache(), valueCache());
+            layer.consumeFromDevice(cacheSource(), state.workspace.wrapBlockTable);
             if (attentionSplits() > 0) {
                 layer.transferToDevice(
                         DataTransferMode.FIRST_EXECUTION, state.workspace.wrapAttSplit);
@@ -85,6 +99,18 @@ public class LlamaQ4_0FFNLayersDecode extends LlamaQ4_0FFNLayers {
     }
 
     // @formatter:on
+
+    /**
+     * The graph the first layer takes the key/value cache and block table from. On the whole model
+     * it is the decode activation, which relays them from the last prefill layer. A later pipeline
+     * stage starts with a graph that receives the hidden state from the previous stage, and its
+     * first layer takes them straight from the stage's own last prefill layer instead.
+     */
+    private String cacheSource() {
+        return firstLayer == 0
+                ? "decodeActivation"
+                : "batchPrefillLayer_" + (endLayer(config.numberOfLayers()) - 1);
+    }
 
     /** The matching prefill graph has uploaded this layer's weights and always runs first. */
     @Override

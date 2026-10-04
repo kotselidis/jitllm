@@ -11,7 +11,7 @@ import uk.ac.manchester.tornado.nccl.NcclCommunicator;
 import uk.ac.manchester.tornado.nccl.NcclPlanGroup;
 
 /**
- * Sends the hidden state device to device with NCCL. Stage {@code s} is NCCL rank {@code s}.
+ * Sends activations device to device with NCCL. Stage {@code s} is NCCL rank {@code s}.
  *
  * <p>The stages run together through an {@link NcclPlanGroup}, one thread per stage: a stage's
  * receive waits on its GPU for the previous stage's send, so running the plans one after the other
@@ -31,17 +31,14 @@ public final class NcclTransport implements PipelineTransport {
     }
 
     @Override
-    public TaskGraph sendGraph(int stage, String producer, FloatArray x, int toStage) {
-        return new TaskGraph("handoff_out")
-                .consumeFromDevice(producer, x)
+    public void addSend(TaskGraph graph, int stage, String producer, FloatArray x, int toStage) {
+        graph.consumeFromDevice(producer, x)
                 .libraryTask("send", Nccl::send, communicator, x, toStage);
     }
 
     @Override
-    public TaskGraph receiveGraph(int stage, FloatArray x, int fromStage) {
-        return new TaskGraph("handoff_in")
-                .libraryTask("recv", Nccl::recv, communicator, x, fromStage)
-                .persistOnDevice(x);
+    public void addReceive(TaskGraph graph, int stage, FloatArray x, int fromStage) {
+        graph.libraryTask("recv", Nccl::recv, communicator, x, fromStage).persistOnDevice(x);
     }
 
     @Override
@@ -49,15 +46,29 @@ public final class NcclTransport implements PipelineTransport {
         // Library tasks only: nothing to schedule.
     }
 
-    @Override
-    public void execute(TornadoExecutionPlan[] plans) {
+    private NcclPlanGroup group(TornadoExecutionPlan[] plans) {
         if (group == null) {
             group = new NcclPlanGroup(plans);
             if (STEP_TIMEOUT_SECONDS > 0) {
                 group.withStepTimeout(Duration.ofSeconds(STEP_TIMEOUT_SECONDS));
             }
         }
-        group.execute();
+        return group;
+    }
+
+    @Override
+    public void execute(TornadoExecutionPlan[] plans) {
+        group(plans).execute();
+    }
+
+    @Override
+    public void execute(TornadoExecutionPlan[] plans, int[][] graphs, boolean cudaGraphs) {
+        group(plans)
+                .execute(
+                        (rank, plan) -> {
+                            PipelineTransport.executeGraphs(plan, graphs[rank], cudaGraphs);
+                            return null;
+                        });
     }
 
     @Override

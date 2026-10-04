@@ -1013,9 +1013,7 @@ public final class TokenGenerationLoop {
                         : Integer.MAX_VALUE;
 
         if (batched) {
-            var plan =
-                    (org.beehive.jitllm.backend.tornado.TornadoVMMasterPlanBatchPrefillDecode)
-                            tornadoVMPlan;
+            var plan = (org.beehive.jitllm.backend.tornado.BatchPrefillDecodePlan) tornadoVMPlan;
             // This branch prefilled all N whenever the seed was the prompt's own first token, then
             // decoded starting from the last prompt token again. The model therefore saw that
             // token twice: once in the key/value cache at position N-1, and once more as the
@@ -1112,8 +1110,7 @@ public final class TokenGenerationLoop {
                                     state,
                                     currentToken,
                                     pos,
-                                    (org.beehive.jitllm.backend.tornado
-                                                    .TornadoVMMasterPlanBatchPrefillDecode)
+                                    (org.beehive.jitllm.backend.tornado.BatchPrefillDecodePlan)
                                             tornadoVMPlan)
                             : org.beehive.jitllm.backend.tornado.TornadoForwardPass.forward(
                                     model, state, currentToken, pos, tornadoVMPlan);
