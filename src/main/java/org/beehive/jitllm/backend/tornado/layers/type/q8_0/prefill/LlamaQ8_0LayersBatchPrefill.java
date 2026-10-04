@@ -368,7 +368,9 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         } else {
             layer.task(
                     "batch_attention",
-                    TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionPaged,
+                    simdgroupAttention()
+                            ? TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionSimdPaged
+                            : TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionPaged,
                     context,
                     state.workspace.batchStartPosHolder,
                     state.workspace.wrapQBatch,
@@ -600,6 +602,10 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         int optLocal = findOptimalLocalSize(headSz);
         WorkerGrid attnWorker =
                 WorkerGridFactory.genericWorker(batchSize * nHeads * optLocal, optLocal);
+        if (simdgroupAttention()) {
+            int threads = 32 * TransformerPagedKvBatchPrefillKernels.FLASH_SIMDGROUPS;
+            attnWorker = WorkerGridFactory.genericWorker(batchSize * nHeads * threads, threads);
+        }
         WorkerGrid matVecDimWorker =
                 WorkerGridFactory.genericWorker(
                         batchSize * dim * LOCAL_WORK_GROUP_SIZE, LOCAL_WORK_GROUP_SIZE);
@@ -632,6 +638,20 @@ public class LlamaQ8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
             scheduler.addWorkerGrid(p + "batch_ffn_gate_up", matVecHidWorker);
             scheduler.addWorkerGrid(p + "batch_ffn_down", matVecDimWorker);
         }
+    }
+
+    /**
+     * Whether attention runs as simdgroups ({@link
+     * TransformerPagedKvBatchPrefillKernels#batchedFlashAttentionSimdPaged}): over the FP32 cache,
+     * where 32-wide simdgroup reductions are supported (Metal), for head sizes that are a multiple
+     * of 32 up to 128. Read by both the task and its grid.
+     */
+    private boolean simdgroupAttention() {
+        return !useFp16KVCache()
+                && org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService
+                        .isSubgroupShuffle32Supported()
+                && config.headSize() % 32 == 0
+                && config.headSize() <= 128;
     }
 
     private static int findOptimalLocalSize(int size) {

@@ -316,6 +316,129 @@ public class TransformerPagedKvBatchPrefillKernels {
         }
     }
 
+    /** Simdgroups per (query row, head) in {@link #batchedFlashAttentionSimdPaged}. */
+    public static final int FLASH_SIMDGROUPS = 8;
+
+    /**
+     * Batched-prefill twin of {@code
+     * TransformerPagedKvKernels.processHeadsFlashAttentionSimdPaged}: one threadgroup of {@link
+     * #FLASH_SIMDGROUPS} 32-lane simdgroups per (batch row, head), each simdgroup walking the row's
+     * causal positions {@code g, g + G, ...} with an online softmax of its own, lanes owning head
+     * dimensions, partial results merged once in threadgroup memory. Same arguments and layout as
+     * {@link #batchedFlashAttentionPaged}. Worker: {@code batch * nHeads} groups of {@code 32 *
+     * FLASH_SIMDGROUPS} threads. Needs {@code headSize % 32 == 0} and {@code headSize <= 128}.
+     */
+    public static void batchedFlashAttentionSimdPaged(
+            KernelContext context,
+            IntArray batchStartPosHolder,
+            FloatArray wrapQBatch,
+            FloatArray wrapKeyCache,
+            FloatArray wrapValueCache,
+            FloatArray wrapXbBatch,
+            int nHeads,
+            int headSize,
+            int kvDim,
+            int kvMul,
+            int layerIndex,
+            IntArray blockTable,
+            int blockCfg,
+            int blockStride,
+            int dim) {
+        int tid = context.localIdx;
+        int groupId = context.groupIdx;
+        int batchIdx = groupId / nHeads;
+        int h = groupId % nHeads;
+        if (batchIdx >= batchStartPosHolder.get(1)) {
+            return; // padding row: no real query, and its KV range is not valid
+        }
+        int sg = tid >> 5;
+        int lane = tid & 31;
+
+        float[] sMax = context.allocateFloatLocalArray(FLASH_SIMDGROUPS);
+        float[] sSum = context.allocateFloatLocalArray(FLASH_SIMDGROUPS);
+        float[] sAcc = context.allocateFloatLocalArray(FLASH_SIMDGROUPS * headSize);
+
+        int pos = batchStartPosHolder.get(0) + batchIdx;
+        int slot = batchStartPosHolder.get(2);
+        int layerOff = KvBlockAddress.layerOffset(layerIndex, kvDim, blockCfg);
+        int kvHeadOffset = (h / kvMul) * headSize;
+        int qBase = batchIdx * dim + h * headSize;
+        float scale = 1.0f / TornadoMath.sqrt(headSize);
+
+        int d0 = lane;
+        int d1 = lane + 32;
+        int d2 = lane + 64;
+        int d3 = lane + 96;
+        float q0 = wrapQBatch.get(qBase + d0) * scale;
+        float q1 = d1 < headSize ? wrapQBatch.get(qBase + d1) * scale : 0.0f;
+        float q2 = d2 < headSize ? wrapQBatch.get(qBase + d2) * scale : 0.0f;
+        float q3 = d3 < headSize ? wrapQBatch.get(qBase + d3) * scale : 0.0f;
+
+        float maxScore = Float.NEGATIVE_INFINITY;
+        float sumExp = 0.0f;
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float a3 = 0.0f;
+        for (int t = sg; t <= pos; t += FLASH_SIMDGROUPS) {
+            int base =
+                    KvBlockAddress.offset(
+                                    blockTable, slot, t, layerOff, kvDim, blockCfg, blockStride)
+                            + kvHeadOffset;
+            float partial = q0 * wrapKeyCache.get(base + d0);
+            if (d1 < headSize) {
+                partial += q1 * wrapKeyCache.get(base + d1);
+            }
+            if (d2 < headSize) {
+                partial += q2 * wrapKeyCache.get(base + d2) + q3 * wrapKeyCache.get(base + d3);
+            }
+            float score = context.simdSum(partial);
+            float newMax = TornadoMath.max(maxScore, score);
+            float correction = TornadoMath.exp(maxScore - newMax);
+            float weight = TornadoMath.exp(score - newMax);
+            sumExp = sumExp * correction + weight;
+            a0 = a0 * correction + weight * wrapValueCache.get(base + d0);
+            if (d1 < headSize) {
+                a1 = a1 * correction + weight * wrapValueCache.get(base + d1);
+            }
+            if (d2 < headSize) {
+                a2 = a2 * correction + weight * wrapValueCache.get(base + d2);
+                a3 = a3 * correction + weight * wrapValueCache.get(base + d3);
+            }
+            maxScore = newMax;
+        }
+
+        if (lane == 0) {
+            sMax[sg] = maxScore;
+            sSum[sg] = sumExp;
+        }
+        int accBase = sg * headSize;
+        sAcc[accBase + d0] = a0;
+        if (d1 < headSize) {
+            sAcc[accBase + d1] = a1;
+        }
+        if (d2 < headSize) {
+            sAcc[accBase + d2] = a2;
+            sAcc[accBase + d3] = a3;
+        }
+        context.localBarrier();
+
+        for (int d = tid; d < headSize; d += context.localGroupSizeX) {
+            float globalMax = Float.NEGATIVE_INFINITY;
+            for (int g = 0; g < FLASH_SIMDGROUPS; g++) {
+                globalMax = TornadoMath.max(globalMax, sMax[g]);
+            }
+            float total = 0.0f;
+            float out = 0.0f;
+            for (int g = 0; g < FLASH_SIMDGROUPS; g++) {
+                float w = TornadoMath.exp(sMax[g] - globalMax);
+                total += sSum[g] * w;
+                out += sAcc[g * headSize + d] * w;
+            }
+            wrapXbBatch.set(qBase + d, out / total);
+        }
+    }
+
     public static void batchedFlashAttentionPaged(
             KernelContext context,
             IntArray batchStartPosHolder,
