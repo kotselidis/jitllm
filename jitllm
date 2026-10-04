@@ -172,6 +172,9 @@ class LlamaRunner:
         if args.cuda_graphs:
             cmd.append("-Djitllm.cudaGraphs=true")
 
+        if args.split_kv_attention:
+            cmd.append("-Djitllm.attention.splitKv=true")
+
         if args.fp32_kv_cache:
             cmd.append("-Djitllm.kvcache.fp32=true")
 
@@ -742,6 +745,9 @@ def create_parser(command=None) -> argparse.ArgumentParser:
              "For numerical reference, and where FP16 is unsupported (the run says so)")
     advanced_group.add_argument("--cuda-graphs", dest="cuda_graphs", action="store_true",
                                 help="Capture and replay CUDA graphs (CUDA backend only)")
+    advanced_group.add_argument("--split-kv-attention", dest="split_kv_attention", action="store_true",
+                                help="Split each attention head's positions across several workgroups "
+                                     "(flash-decoding; CUDA with an FP16 KV cache)")
     advanced_group.add_argument("--opencl-flags", default="-cl-denorms-are-zero -cl-no-signed-zeros -cl-finite-math-only",
                                 metavar="FLAGS", help="OpenCL compiler flags")
     advanced_group.add_argument("--max-wait-events", type=int, default=32000, metavar="N",
