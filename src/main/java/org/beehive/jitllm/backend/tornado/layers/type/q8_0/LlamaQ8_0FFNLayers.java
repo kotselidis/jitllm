@@ -327,6 +327,11 @@ public class LlamaQ8_0FFNLayers
 
         WorkerGrid parallelAttentionWorker =
                 WorkerGridFactory.createAttentionWorker(config.numberOfHeads(), config.headSize());
+        if (simdgroupAttention()) {
+            int threads = 32 * TransformerPagedKvKernels.FLASH_SIMDGROUPS;
+            parallelAttentionWorker =
+                    WorkerGridFactory.genericWorker(config.numberOfHeads() * threads, threads);
+        }
 
         // === Per-Layer Grid Assignments (ordered by TaskGraph flow) ===
         for (int i = 0; i < config.numberOfLayers(); i++) {
@@ -418,6 +423,19 @@ public class LlamaQ8_0FFNLayers
                 : state.workspace.wrapValueCache;
     }
 
+    /**
+     * Whether decode attention runs as simdgroups over the FP32 cache ({@link
+     * TransformerPagedKvKernels#processHeadsFlashAttentionSimdPaged}): where 32-wide simdgroup
+     * reductions are supported (Metal), for head sizes that are a multiple of 32 up to 128. Read by
+     * both the task and its grid.
+     */
+    protected boolean simdgroupAttention() {
+        return !useFp16KVCache()
+                && SchedulerDetectionService.isSubgroupShuffle32Supported()
+                && config.headSize() % 32 == 0
+                && config.headSize() <= 128;
+    }
+
     /** Attention is dtype-independent — a Q4_0 sibling reuses this unchanged. */
     protected TaskGraph configureAttention(TaskGraph unifiedLayer, int layerIndex) {
         if (useFp16KVCache()) {
@@ -442,6 +460,25 @@ public class LlamaQ8_0FFNLayers
         }
         // Metal takes the workgroup-per-head flash kernel too, as Qwen3 does there: the
         // thread-per-head fallback below keeps one lane of each group busy and grows with position.
+        if (simdgroupAttention()) {
+            return unifiedLayer.task(
+                    "attention",
+                    TransformerPagedKvKernels::processHeadsFlashAttentionSimdPaged,
+                    context,
+                    state.workspace.wrapQ,
+                    state.workspace.wrapKeyCache,
+                    state.workspace.wrapValueCache,
+                    state.workspace.wrapXb,
+                    config.numberOfHeads(),
+                    config.headSize(),
+                    config.kvDim(),
+                    config.kvMul(),
+                    state.workspace.positionHolder,
+                    layerIndex,
+                    state.workspace.wrapBlockTable,
+                    state.kvBlockCfg,
+                    state.kvBlockStride);
+        }
         if (schedulerType == SchedulerType.NVIDIA || SchedulerDetectionService.isMetalBackend()) {
             return unifiedLayer.task(
                     "attention",

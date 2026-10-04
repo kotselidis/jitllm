@@ -307,6 +307,129 @@ public class TransformerPagedKvKernels {
         }
     }
 
+    /** Simdgroups per head in {@link #processHeadsFlashAttentionSimdPaged}. */
+    public static final int FLASH_SIMDGROUPS = 8;
+
+    /**
+     * Decode attention over the paged FP32 cache with one threadgroup of {@link #FLASH_SIMDGROUPS}
+     * 32-lane simdgroups per head. Simdgroup {@code g} walks positions {@code g, g + G, ...} with
+     * an online softmax of its own; lane {@code l} owns dimensions {@code l, l + 32, ...} of the
+     * head, so a position's K and V rows are read by the 32 lanes together and the score is one
+     * {@code simdSum}. Nothing is computed twice and there is no barrier until the simdgroups'
+     * partial results are merged in threadgroup memory at the end. Worker: {@code nHeads} groups of
+     * {@code 32 * FLASH_SIMDGROUPS} threads. Needs {@code headSize % 32 == 0} and {@code headSize
+     * <= 128}.
+     */
+    public static void processHeadsFlashAttentionSimdPaged(
+            KernelContext context,
+            FloatArray q,
+            FloatArray key_cache,
+            FloatArray value_cache,
+            FloatArray xb,
+            int nHeads,
+            int headSize,
+            int kvDim,
+            int kvMul,
+            IntArray positionHolder,
+            int layer,
+            IntArray blockTable,
+            int blockCfg,
+            int blockStride) {
+        int tid = context.localIdx;
+        int h = context.groupIdx;
+        if (h >= nHeads) {
+            return;
+        }
+        int sg = tid >> 5;
+        int lane = tid & 31;
+
+        float[] sMax = context.allocateFloatLocalArray(FLASH_SIMDGROUPS);
+        float[] sSum = context.allocateFloatLocalArray(FLASH_SIMDGROUPS);
+        float[] sAcc = context.allocateFloatLocalArray(FLASH_SIMDGROUPS * headSize);
+
+        int pos = positionHolder.get(0);
+        int slot = positionHolder.get(1);
+        int layerOff = KvBlockAddress.layerOffset(layer, kvDim, blockCfg);
+        int kvHeadOffset = (h / kvMul) * headSize;
+        int qBase = h * headSize;
+        float scale = 1.0f / TornadoMath.sqrt(headSize);
+
+        // Up to four dimensions per lane (headSize <= 128); lanes past headSize hold zeros.
+        int d0 = lane;
+        int d1 = lane + 32;
+        int d2 = lane + 64;
+        int d3 = lane + 96;
+        float q0 = q.get(qBase + d0) * scale;
+        float q1 = d1 < headSize ? q.get(qBase + d1) * scale : 0.0f;
+        float q2 = d2 < headSize ? q.get(qBase + d2) * scale : 0.0f;
+        float q3 = d3 < headSize ? q.get(qBase + d3) * scale : 0.0f;
+
+        float maxScore = Float.NEGATIVE_INFINITY;
+        float sumExp = 0.0f;
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+        float a2 = 0.0f;
+        float a3 = 0.0f;
+        for (int t = sg; t <= pos; t += FLASH_SIMDGROUPS) {
+            int base =
+                    KvBlockAddress.offset(
+                                    blockTable, slot, t, layerOff, kvDim, blockCfg, blockStride)
+                            + kvHeadOffset;
+            float partial = q0 * key_cache.get(base + d0);
+            if (d1 < headSize) {
+                partial += q1 * key_cache.get(base + d1);
+            }
+            if (d2 < headSize) {
+                partial += q2 * key_cache.get(base + d2) + q3 * key_cache.get(base + d3);
+            }
+            float score = context.simdSum(partial);
+            float newMax = TornadoMath.max(maxScore, score);
+            float correction = TornadoMath.exp(maxScore - newMax);
+            float weight = TornadoMath.exp(score - newMax);
+            sumExp = sumExp * correction + weight;
+            a0 = a0 * correction + weight * value_cache.get(base + d0);
+            if (d1 < headSize) {
+                a1 = a1 * correction + weight * value_cache.get(base + d1);
+            }
+            if (d2 < headSize) {
+                a2 = a2 * correction + weight * value_cache.get(base + d2);
+                a3 = a3 * correction + weight * value_cache.get(base + d3);
+            }
+            maxScore = newMax;
+        }
+
+        if (lane == 0) {
+            sMax[sg] = maxScore;
+            sSum[sg] = sumExp;
+        }
+        int accBase = sg * headSize;
+        sAcc[accBase + d0] = a0;
+        if (d1 < headSize) {
+            sAcc[accBase + d1] = a1;
+        }
+        if (d2 < headSize) {
+            sAcc[accBase + d2] = a2;
+            sAcc[accBase + d3] = a3;
+        }
+        context.localBarrier();
+
+        for (int d = tid; d < headSize; d += context.localGroupSizeX) {
+            float globalMax = Float.NEGATIVE_INFINITY;
+            for (int g = 0; g < FLASH_SIMDGROUPS; g++) {
+                globalMax = TornadoMath.max(globalMax, sMax[g]);
+            }
+            float total = 0.0f;
+            float out = 0.0f;
+            for (int g = 0; g < FLASH_SIMDGROUPS; g++) {
+                // A simdgroup that saw no position holds -inf: its weight is exp(-inf) = 0.
+                float w = TornadoMath.exp(sMax[g] - globalMax);
+                total += sSum[g] * w;
+                out += sAcc[g * headSize + d] * w;
+            }
+            xb.set(qBase + d, out / total);
+        }
+    }
+
     public static void processHeadsFlashAttentionFP16Paged(
             KernelContext context,
             FloatArray q,
