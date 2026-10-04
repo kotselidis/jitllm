@@ -191,15 +191,23 @@ public class LlamaQ8_0FFNLayers
 
         // Fully fused: RMS apply + Gate/Up projections + SiLU + GLU (Q8 dequantization)
         if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
-            // Simdgroup-reduced, reusing the RMS scale ffn_rms_reduce already computed
+            // Normalize once into wrapXb (free again: attn_output_proj has consumed it), then a
+            // simdgroup-reduced gate/up over the normalized input. Re-normalizing per row, as the
+            // fused kernel below does, costs more loads than the weights themselves on Metal.
+            unifiedLayer.task(
+                    "ffn_rms_apply",
+                    TransformerComputeKernelsLayered::reductionOneBlock2WithLayer,
+                    context,
+                    state.workspace.wrapXb,
+                    state.workspace.wrapX,
+                    weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
+                    state.workspace.tempFFN);
             unifiedLayer.task(
                     "rms_ffn_gate_up",
-                    TransformerComputeKernelsLayered::fusedRmsScaledFFNGateUpQ8_0Simd32,
+                    TransformerComputeKernelsLayered::ffnGateUpSwiGLUQ8_0Simd32,
                     context,
-                    state.workspace.wrapX, // raw input (FP32)
+                    state.workspace.wrapXb, // normalized input (FP32)
                     state.workspace.wrapHb, // output
-                    weights.rms_ffn_weightLayered[layerIndex].asFloatArray(), // RMS weights
-                    state.workspace.tempFFN, // RMS scale in [0]
                     weights.w1Layered[layerIndex].asByteArray(), // W1 (Q8)
                     weights.w3Layered[layerIndex].asByteArray(), // W3 (Q8)
                     config.dim(), // input dimension
@@ -339,6 +347,7 @@ public class LlamaQ8_0FFNLayers
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".ffn_rms_reduce", rmsReduceWorker);
             // Fused RMS + Gate/Up Projections
+            tornadoForwardScheduler.addWorkerGrid("layer_" + i + ".ffn_rms_apply", rmsNormWorker);
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".rms_ffn_gate_up", configHiddenDimRowMajorWorker);
             // Down Projection
