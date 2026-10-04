@@ -114,14 +114,25 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
         return !"false"
                         .equalsIgnoreCase(
                                 System.getProperty("jitllm.qwen35.packedIntegerDot", "true"))
-                && weights.wclsByteArray.dataType()
-                        == org.beehive.jitllm.runtime.tensor.DataType.Q6_K
+                && (weights.wclsByteArray.dataType()
+                                == org.beehive.jitllm.runtime.tensor.DataType.Q6_K
+                        || packedQ8_0Vocabulary(weights))
                 && state.workspace.wrapXbQuants != null
                 && org.beehive.jitllm.backend.tornado.device.TornadoDevices.current()
                         .capabilities()
                         .supports(
                                 org.beehive.jitllm.runtime.backend.DeviceCapability
                                         .PACKED_INTEGER_DOT);
+    }
+
+    /**
+     * A Q8_0 output projection read with the packed-integer kernel. Only where the family's own
+     * layers already run their Q8_0 projections that way (qwen35), so a family whose layers read
+     * Q8_0 in floating point keeps logits computed the same way as before.
+     */
+    private boolean packedQ8_0Vocabulary(TornadoWeights weights) {
+        return weights.wclsByteArray.dataType() == org.beehive.jitllm.runtime.tensor.DataType.Q8_0
+                && state instanceof org.beehive.jitllm.inference.state.Qwen35State;
     }
 
     /** The vocabulary projection task, chosen by what the output projection actually holds. */
@@ -152,6 +163,21 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
                     state.workspace.wrapXbQuants,
                     state.workspace.wrapXbScales,
                     state.workspace.wrapXbSums);
+            if (packedQ8_0Vocabulary(weights)) {
+                logits.task(
+                        "vocab_proj",
+                        org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ8_0DP4A
+                                ::matrixVectorGenericQ8_0DP4A,
+                        context,
+                        state.workspace.wrapXbQuants,
+                        state.workspace.wrapXbScales,
+                        state.workspace.wrapLogits,
+                        w.asByteArray(),
+                        config.dim(),
+                        config.vocabularySize(),
+                        localSize);
+                return;
+            }
             logits.task(
                     "vocab_proj",
                     org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ6_K
