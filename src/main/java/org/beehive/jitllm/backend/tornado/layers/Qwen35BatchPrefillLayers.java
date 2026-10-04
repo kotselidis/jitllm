@@ -96,6 +96,15 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
     private final Qwen35TornadoWeights weights;
     private final Qwen35Configuration config;
     private final int batchSize;
+
+    /** The layers this prefill builds, {@code [firstLayer, endLayer)}: one pipeline stage's. */
+    private final int firstLayer;
+
+    private final int endLayer;
+
+    /** Q8_0 projections decoded for cuBLAS, as "graph.task" and element count, for their grids. */
+    private final java.util.Map<String, Integer> q8DequantTasks = new java.util.LinkedHashMap<>();
+
     private final KernelContext context = new KernelContext();
 
     private final List<ImmutableTaskGraph> graphs;
@@ -492,16 +501,106 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             Qwen35TornadoWeights weights,
             Qwen35Configuration config,
             int batchSize) {
+        this(state, weights, config, batchSize, 0, config.numberOfLayers());
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)} only: one stage of a model split across devices.
+     * The first layer of the range takes the role layer 0 has otherwise; the key/value and
+     * recurrent state keep their whole-model layout and absolute indices.
+     */
+    public Qwen35BatchPrefillLayers(
+            Qwen35State state,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            int batchSize,
+            int firstLayer,
+            int endLayer) {
+        if (firstLayer < 0 || endLayer > config.numberOfLayers() || firstLayer >= endLayer) {
+            throw new IllegalArgumentException(
+                    "layer range ["
+                            + firstLayer
+                            + ", "
+                            + endLayer
+                            + ") outside the model's "
+                            + config.numberOfLayers()
+                            + " layers");
+        }
         this.state = state;
         this.weights = weights;
         this.config = config;
         this.batchSize = batchSize;
+        this.firstLayer = firstLayer;
+        this.endLayer = endLayer;
+        allocateQ8Scratch();
         this.graphs =
-                IntStream.range(0, config.numberOfLayers())
+                IntStream.range(firstLayer, endLayer)
                         .mapToObj(this::buildLayer)
                         .map(TaskGraph::snapshot)
                         .toList();
-        this.lastLayerTaskGraphID = "batchLayer_" + (config.numberOfLayers() - 1);
+        this.lastLayerTaskGraphID = "batchLayer_" + (endLayer - 1);
+    }
+
+    // @formatter:off
+    /**
+     * The FP32 scratch Q8_0 projections are decoded into, when any projection in this range is
+     * Q8_0: sized for the largest of them, a whole FFN matrix ({@code hiddenDim * dim}) on the 27B,
+     * 356 MB. Every projection decodes into it in turn, so one is enough.
+     */
+    // @formatter:on
+    private void allocateQ8Scratch() {
+        boolean anyQ8 = false;
+        for (int layer = firstLayer; layer < endLayer && !anyQ8; layer++) {
+            for (var tensors :
+                    new org.beehive.jitllm.backend.tornado.tensor.TornadoTensor[][] {
+                        weights.wqLayered,
+                        weights.wkLayered,
+                        weights.wvLayered,
+                        weights.woLayered,
+                        weights.w1Layered,
+                        weights.w2Layered,
+                        weights.w3Layered,
+                        weights.ssmQkv,
+                        weights.ssmGate,
+                        weights.ssmAlpha,
+                        weights.ssmBeta,
+                        weights.ssmOut
+                    }) {
+                if (tensors != null
+                        && layer < tensors.length
+                        && tensors[layer] != null
+                        && tensors[layer].dataType() == DataType.Q8_0) {
+                    anyQ8 = true;
+                    break;
+                }
+            }
+        }
+        if (!anyQ8) {
+            return;
+        }
+        if (!org.beehive.jitllm.backend.tornado.NativePrefillSupport.nativeProjections(
+                state.executionPolicy())) {
+            throw new UnsupportedOperationException(
+                    "the qwen35 batched prefill runs Q8_0 projections through cuBLAS: add"
+                            + " --with-native-libraries on a CUDA device with tensor cores");
+        }
+        long widest =
+                java.util.stream.LongStream.of(
+                                (long) config.queryGateDim() * config.dim(),
+                                (long) config.kvDim() * config.dim(),
+                                (long) config.dim() * config.attentionOutputInputDim(),
+                                (long) config.hiddenDim() * config.dim(),
+                                (long) config.deltaNetConvDim() * config.dim(),
+                                (long) config.deltaNetValueDim() * config.dim(),
+                                (long) config.dim() * config.deltaNetValueDim())
+                        .max()
+                        .getAsLong();
+        FloatArray current = state.workspace.wrapDequantScratchF32;
+        if (current == null || current.getSize() < widest) {
+            state.workspace.wrapDequantScratchF32 =
+                    org.beehive.jitllm.backend.tornado.workspace.TornadoWorkspaces.floats(
+                            Math.toIntExact(widest));
+        }
     }
 
     @Override
@@ -563,6 +662,10 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             int d,
             boolean residual) {
         requireWholeBlocks(layer, task, role, w.dataType(), n);
+        if (w.dataType() == DataType.Q8_0) {
+            q8Projection(graph, layer, task, w, xBatch, outBatch, n, d, residual);
+            return;
+        }
         switch (w.dataType()) {
             case F32 -> {
                 if (residual) {
@@ -724,6 +827,58 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         }
     }
 
+    /** Layers whose SwiGLU follows two Q8_0 cuBLAS projections, for its grid. */
+    private final java.util.Set<String> q8SwigluLayers = new java.util.LinkedHashSet<>();
+
+    // @formatter:off
+    /**
+     * A Q8_0 projection of the whole chunk: the weight decoded to FP32 in the shared scratch, then
+     * one cuBLAS TF32 GEMM. {@code out[rows][d] (+)= x[rows][n] · Wᵀ} with W the {@code [d][n]}
+     * row-major weight; in cuBLAS's column-major terms {@code C = op_T(W) · X}, the weight as A. A
+     * residual projection accumulates ({@code beta = 1}) into its output.
+     */
+    // @formatter:on
+    private void q8Projection(
+            TaskGraph graph,
+            int layer,
+            String task,
+            TornadoTensor w,
+            FloatArray xBatch,
+            FloatArray outBatch,
+            int n,
+            int d,
+            boolean residual) {
+        FloatArray scratch = state.workspace.wrapDequantScratchF32;
+        if (scratch == null) {
+            throw new IllegalStateException("no FP32 scratch for the Q8_0 projection " + task);
+        }
+        q8DequantTasks.put("batchLayer_" + layer + "." + task + "_dequant", n * d);
+        graph.task(
+                task + "_dequant",
+                org.beehive.jitllm.backend.tornado.kernels.NativeProjectionKernels
+                        ::dequantizeQ8_0ToFP32,
+                context,
+                w.asByteArray(),
+                scratch,
+                n * d);
+        graph.libraryTask(
+                task,
+                uk.ac.manchester.tornado.cublas.CuBlas::cublasSgemmTF32,
+                1,
+                0,
+                d,
+                batchSize,
+                n,
+                1.0f,
+                scratch,
+                n,
+                xBatch,
+                n,
+                residual ? 1.0f : 0.0f,
+                outBatch,
+                d);
+    }
+
     private UnsupportedOperationException unsupported(
             int layer, String task, String role, DataType type, String article) {
         return new UnsupportedOperationException(
@@ -782,6 +937,38 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 List.of("ffn_gate", "ffn_up"),
                 gate,
                 up);
+        if (gate.dataType() == DataType.Q8_0) {
+            // Gate and up as two cuBLAS projections into their own buffers, then SwiGLU.
+            q8Projection(
+                    graph,
+                    layer,
+                    "ffn_gate_proj",
+                    gate,
+                    xBatch,
+                    state.workspace.wrapGateBatch,
+                    config.dim(),
+                    config.hiddenDim(),
+                    false);
+            q8Projection(
+                    graph,
+                    layer,
+                    "ffn_up_proj",
+                    up,
+                    xBatch,
+                    state.workspace.wrapUpBatch,
+                    config.dim(),
+                    config.hiddenDim(),
+                    false);
+            q8SwigluLayers.add("batchLayer_" + layer + ".");
+            graph.task(
+                    "ffn_swiglu",
+                    Qwen35MMAKernels::swiGLUBatch,
+                    context,
+                    state.workspace.wrapGateBatch,
+                    state.workspace.wrapUpBatch,
+                    state.workspace.wrapHbBatch);
+            return;
+        }
         if (gate.dataType() != DataType.Q4_0) {
             throw unsupported(
                     layer, "ffn_gate_up", "ffn_gate|ffn_up", gate.dataType(), "a batched");
@@ -888,7 +1075,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         TaskGraph layer = new TaskGraph("batchLayer_" + layerIndex);
 
         String predecessor =
-                layerIndex == 0 ? "prefillActivation" : "batchLayer_" + (layerIndex - 1);
+                layerIndex == firstLayer ? "prefillActivation" : "batchLayer_" + (layerIndex - 1);
         layer.consumeFromDevice(predecessor, state.workspace.wrapXBatch);
         configureTransfers(layer, layerIndex, predecessor);
         transferLayerWeights(layer, layerIndex);
@@ -1776,7 +1963,11 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
      */
     // @formatter:on
     private void configureTransfers(TaskGraph layer, int layerIndex, String predecessor) {
-        if (layerIndex == 0) {
+        if (layerIndex == firstLayer) {
+            if (state.workspace.wrapDequantScratchF32 != null) {
+                layer.transferToDevice(
+                        DataTransferMode.FIRST_EXECUTION, state.workspace.wrapDequantScratchF32);
+            }
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION, state.workspace.batchStartPosHolder);
             layer.transferToDevice(
@@ -1888,6 +2079,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             }
             if (state.workspace.wrapDequantScratchFP16 != null) {
                 layer.consumeFromDevice(predecessor, state.workspace.wrapDequantScratchFP16);
+            }
+            if (state.workspace.wrapDequantScratchF32 != null) {
+                layer.consumeFromDevice(predecessor, state.workspace.wrapDequantScratchF32);
             }
         }
     }
@@ -2061,7 +2255,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 WorkerGridFactory.genericWorker(
                         batchSize * config.numberOfValueHeads(), ELEMENTWISE_LOCAL);
 
-        for (int layer = 0; layer < config.numberOfLayers(); layer++) {
+        for (int layer = firstLayer; layer < endLayer; layer++) {
             String prefix = "batchLayer_" + layer + ".";
             scheduler.addWorkerGrid(prefix + "attn_rms_reduce", rmsReduce);
             scheduler.addWorkerGrid(prefix + "ffn_rms_reduce", rmsReduce);
@@ -2081,6 +2275,8 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 if (!fusedSwigluLayers.contains(prefix)) {
                     scheduler.addWorkerGrid(prefix + "ffn_swiglu", swiglu);
                 }
+            } else if (q8SwigluLayers.contains(prefix)) {
+                scheduler.addWorkerGrid(prefix + "ffn_swiglu", swiglu);
             } else {
                 scheduler.addWorkerGrid(
                         prefix + "ffn_gate_up",
@@ -2165,6 +2361,14 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     }
                 }
             }
+        }
+        // The Q8_0 decodes that precede the cuBLAS projections: one lane per weight.
+        for (var entry : q8DequantTasks.entrySet()) {
+            scheduler.addWorkerGrid(
+                    entry.getKey(),
+                    WorkerGridFactory.genericWorker(
+                            (entry.getValue() + GEMM_LOCAL - 1) / GEMM_LOCAL * GEMM_LOCAL,
+                            GEMM_LOCAL));
         }
         // The dequantizations that precede the FP16 GEMMs: one lane per weight element.
         for (var entry : dequantTasks.entrySet()) {

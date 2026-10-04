@@ -232,6 +232,12 @@ public final class TornadoWorkspace {
     public HalfFloatArray wrapDequantScratchFP16;
 
     /**
+     * One projection's weights decoded to FP32, for a batched projection run by cuBLAS on a
+     * representation it cannot read (Q8_0). Allocated by the batch prefill that needs it.
+     */
+    public FloatArray wrapDequantScratchF32;
+
+    /**
      * The int8 pair's scratch: the chunk's activations quantized to int8 with a scale per 32 (one
      * buffer, requantized before each group of consumers in graph order), and one Q4_0 matrix
      * decoded to int8 in the B-operand word layout with its FP32 block scales.

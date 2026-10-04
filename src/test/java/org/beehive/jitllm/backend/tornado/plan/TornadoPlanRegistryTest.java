@@ -214,7 +214,7 @@ public class TornadoPlanRegistryTest {
                 qwen35.supportedModes());
         assertEquals(
                 "admitted on the representation its trunk projections share",
-                Set.of(DataType.Q4_0),
+                Set.of(DataType.Q4_0, DataType.Q8_0),
                 qwen35.supportedDataTypes());
         assertTrue(
                 "and reads five block layouts and F32 per tensor without materializing any",

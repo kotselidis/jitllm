@@ -82,6 +82,26 @@ public class NativeLibrarySupportTest {
     }
 
     @Test
+    public void qwen35Q8_0BatchedPrefillOnTensorCoresIsImplemented() {
+        assertEquals(
+                Optional.empty(),
+                check(
+                        "qwen35",
+                        DataType.Q8_0,
+                        ExecutionMode.BATCH_PREFILL_DECODE,
+                        BackendId.CUDA,
+                        true));
+        assertTrue(
+                check(
+                                "qwen35",
+                                DataType.Q4_0,
+                                ExecutionMode.BATCH_PREFILL_DECODE,
+                                BackendId.CUDA,
+                                true)
+                        .isPresent());
+    }
+
+    @Test
     public void everythingElseIsRefused() {
         assertTrue(
                 check(

@@ -132,9 +132,36 @@ public class Qwen35FFNLayers
             Qwen35Configuration config,
             SchedulerType schedulerType,
             String activationGraphName) {
+        this(
+                taskGraphName,
+                state,
+                weights,
+                config,
+                schedulerType,
+                activationGraphName,
+                0,
+                config.numberOfLayers());
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)} only: one stage of a model split across devices.
+     * The first layer of the range takes the role layer 0 has otherwise. The key/value and
+     * recurrent state keep their whole-model layout and absolute indices, so a stage's state holds
+     * room for every layer and uses its own.
+     */
+    public Qwen35FFNLayers(
+            String taskGraphName,
+            Qwen35State state,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            SchedulerType schedulerType,
+            String activationGraphName,
+            int firstLayer,
+            int endLayer) {
         super(taskGraphName, state, weights, config, schedulerType);
         this.qwen35State = state;
         this.activationGraphName = activationGraphName;
+        restrictToLayers(firstLayer, endLayer);
         setupFFNLayers();
     }
 
@@ -650,13 +677,13 @@ public class Qwen35FFNLayers
      * Whether {@code layerIndex} is the first layer of its graph, and so owns the graph's inputs.
      */
     protected final boolean firstLayerOfGraph(int layerIndex) {
-        return layerIndex == 0
+        return layerIndex == firstLayer
                 || !layerGraphName(layerIndex - 1).equals(layerGraphName(layerIndex));
     }
 
     /** Whether {@code layerIndex} is the last layer of its graph, and so publishes its outputs. */
     protected final boolean lastLayerOfGraph(int layerIndex) {
-        return layerIndex == config.numberOfLayers() - 1
+        return layerIndex == endLayer(config.numberOfLayers()) - 1
                 || !layerGraphName(layerIndex + 1).equals(layerGraphName(layerIndex));
     }
 
@@ -690,7 +717,7 @@ public class Qwen35FFNLayers
         // store of wrapX is an ordinary dependency between tasks and consuming it would be wrong.
         if (firstLayerOfGraph(layerIndex)) {
             String predecessor =
-                    layerIndex == 0 ? activationGraphName : layerGraphName(layerIndex - 1);
+                    layerIndex == firstLayer ? activationGraphName : layerGraphName(layerIndex - 1);
             layer.consumeFromDevice(predecessor, qwen35State.workspace.wrapX);
             configureLayerDataTransfers(layer, layerIndex);
         }
@@ -1657,7 +1684,7 @@ public class Qwen35FFNLayers
 
     @Override
     protected TaskGraph configureLayerDataTransfers(TaskGraph layer, int layerIndex) {
-        if (layerIndex == 0) {
+        if (layerIndex == firstLayer) {
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION,
                     qwen35State.workspace.positionHolder,
@@ -1808,7 +1835,7 @@ public class Qwen35FFNLayers
         // value head for a split kernel, the elementwise default for the lane-per-column one.
         WorkerGrid deltaRule = deltaRuleWorker(deltaRuleGeometry(), config);
 
-        for (int layer = 0; layer < config.numberOfLayers(); layer++) {
+        for (int layer = firstLayer; layer < endLayer(config.numberOfLayers()); layer++) {
             // The same graph and the same task qualification the tasks were built with; a
             // grouped family puts two layers in one graph and distinguishes them by task prefix.
             String prefix = layerGraphName(layer) + "." + layerTaskPrefix(layer);

@@ -291,7 +291,8 @@ A model too large for one GPU can be split by layers across several, like llama.
 `--split-mode layer`. Each GPU holds a contiguous range of layers with their weights and
 key/value cache, and only the hidden state moves between GPUs, once per token. For one
 request at a time this adds memory, not speed. Llama-family models with Q4_0 or Q8_0 layers
-are supported.
+are supported, and Qwen3.5-family models (`qwen35`, e.g. Qwen3.8-27B) with Q4_0 or Q8_0 layers;
+their stage boundaries fall on multiples of four layers.
 
 ```bash
 ./jitllm run --gpu --cuda --devices 0:0,0:1 --tensor-split 41,39 --gpu-memory 21GB \
@@ -312,6 +313,8 @@ For Q4_0 models the prompt can be prefilled in chunks on every device as well: a
 `--batch-prefill-size 256 --with-native-libraries` (each device runs its layers on the whole
 chunk with cuBLAS, then hands the chunk's hidden states to the next one). On the two A10s this
 takes a 680-token prompt for the 70B from about 65 s to 4.5 s before the first answer token.
+Qwen3.8-27B Q8_0 (29 GB) splits the same way; its batched prefill decodes the Q8_0 weights for
+cuBLAS and also needs `--with-native-libraries`.
 
 -----------
 

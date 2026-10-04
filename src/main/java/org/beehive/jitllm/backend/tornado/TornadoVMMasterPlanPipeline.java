@@ -6,6 +6,10 @@ import java.util.List;
 import java.util.stream.IntStream;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.layers.Activation;
+import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchDecodeActivation;
+import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchPrefillLayers;
+import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayers;
+import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersBatchDecode;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.LlamaQ4_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.decode.LlamaQ4_0FFNLayersDecode;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.prefill.LlamaQ4_0LayersBatchPrefillNative;
@@ -18,11 +22,14 @@ import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefil
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.inference.state.LlamaState;
+import org.beehive.jitllm.inference.state.Qwen35State;
 import org.beehive.jitllm.inference.state.State;
 import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
+import org.beehive.jitllm.inference.weights.tornado.Qwen35TornadoWeights;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.model.ModelType;
 import org.beehive.jitllm.model.llama.LlamaConfiguration;
+import org.beehive.jitllm.model.qwen35.Qwen35Configuration;
 import org.beehive.jitllm.runtime.metrics.MetricsSink;
 import org.beehive.jitllm.runtime.tensor.DataType;
 import uk.ac.manchester.tornado.api.GridScheduler;
@@ -82,7 +89,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
     private record Stage(
             int firstLayer,
             int endLayer,
-            LlamaState state,
+            State state,
             TornadoDevice device,
             TornadoExecutionPlan plan) {}
 
@@ -107,9 +114,13 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
     private final int[][] decodeGraphs;
 
     public TornadoVMMasterPlanPipeline(State state, Model model, MetricsSink sink) {
-        if (!(state instanceof LlamaState) || !(model.weights() instanceof LlamaTornadoWeights)) {
+        boolean llama =
+                state instanceof LlamaState && model.weights() instanceof LlamaTornadoWeights;
+        boolean qwen35 =
+                state instanceof Qwen35State && model.weights() instanceof Qwen35TornadoWeights;
+        if (!llama && !qwen35) {
             throw new UnsupportedOperationException(
-                    "the pipeline split supports Llama-family models only, not "
+                    "the pipeline split supports Llama-family and qwen35 models only, not "
                             + model.getModelType());
         }
         DataType weightType = model.weights().dataType();
@@ -121,8 +132,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             throw new UnsupportedOperationException("the pipeline split does not support Mistral");
         }
         this.state = state;
-        var config = (LlamaConfiguration) model.configuration();
-        var weights = (LlamaTornadoWeights) model.weights();
+        org.beehive.jitllm.model.Configuration config = model.configuration();
         SchedulerType schedulerType = SchedulerDetectionService.determineSchedulerType(model);
 
         TornadoDevice[] devices = parseDevices(System.getProperty(DEVICES_PROPERTY));
@@ -131,6 +141,10 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                         config.numberOfLayers(),
                         devices.length,
                         System.getProperty("jitllm.pipeline.split"));
+        if (qwen35) {
+            // The qwen35 decode graphs group layers in fours by their absolute index.
+            bounds = alignBounds(bounds, QWEN35_LAYER_GROUP);
+        }
         this.transportName = System.getProperty("jitllm.pipeline.transport", "nccl");
         this.transport = PipelineTransport.create(transportName, devices);
 
@@ -141,12 +155,14 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                                         .PREFILL_DECODE
                         && policy.prefillBatchSize() > 1;
         this.batchSize = batched ? policy.prefillBatchSize() : 1;
-        if (batched && weightType != DataType.Q4_0) {
+        if (batched && llama && weightType != DataType.Q4_0) {
             throw new UnsupportedOperationException(
-                    "the pipeline split batches the prefill of Q4_0 layers only, not "
+                    "the pipeline split batches the prefill of Llama Q4_0 layers only, not "
                             + weightType);
         }
-        if (batched && !NativePrefillSupport.nativeProjections(policy)) {
+        // Llama's batched prefill always runs through cuBLAS; qwen35's needs it for Q8_0 only,
+        // and its prefill layers refuse that case themselves.
+        if (batched && llama && !NativePrefillSupport.nativeProjections(policy)) {
             throw new UnsupportedOperationException(
                     "the pipeline split's batched prefill runs its projections through cuBLAS: add"
                             + " --with-native-libraries on CUDA devices with tensor cores");
@@ -160,7 +176,10 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
         for (int s = 0; s < devices.length; s++) {
             int first = bounds[s];
             int end = bounds[s + 1];
-            LlamaState stageState = stageState(state, config, end - first, batchSize);
+            State stageState =
+                    llama
+                            ? stageState(state, (LlamaConfiguration) config, end - first, batchSize)
+                            : qwen35StageState(state, config, batchSize);
             if (s == 0) {
                 // The token loop writes the embedding row into the session's state.
                 stageState.workspace.embeddingX = state.workspace.embeddingX;
@@ -168,29 +187,53 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
 
             List<ImmutableTaskGraph> graphs = new ArrayList<>();
             GridScheduler scheduler = new GridScheduler();
-            if (batched) {
+            if (llama && batched) {
                 addBatchedStage(
                         s,
                         last,
                         first,
                         end,
-                        stageState,
-                        weights,
-                        config,
+                        (LlamaState) stageState,
+                        (LlamaTornadoWeights) model.weights(),
+                        (LlamaConfiguration) config,
                         schedulerType,
                         graphs,
                         scheduler);
-            } else {
+            } else if (llama) {
                 addSingleTokenStage(
                         s,
                         last,
                         first,
                         end,
-                        stageState,
-                        weights,
-                        config,
+                        (LlamaState) stageState,
+                        (LlamaTornadoWeights) model.weights(),
+                        (LlamaConfiguration) config,
                         schedulerType,
                         weightType,
+                        graphs,
+                        scheduler);
+            } else if (batched) {
+                addQwen35BatchedStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        (Qwen35State) stageState,
+                        (Qwen35TornadoWeights) model.weights(),
+                        (Qwen35Configuration) config,
+                        schedulerType,
+                        graphs,
+                        scheduler);
+            } else {
+                addQwen35SingleTokenStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        (Qwen35State) stageState,
+                        (Qwen35TornadoWeights) model.weights(),
+                        (Qwen35Configuration) config,
+                        schedulerType,
                         graphs,
                         scheduler);
             }
@@ -347,6 +390,208 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
         } else {
             var logits =
                     new LogitsQ8_0LayerDecode(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            decode.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+        decodeGraphs[s] = IntStream.range(decodeStart, graphs.size()).toArray();
+    }
+
+    /** Layers a qwen35 decode graph groups; stage boundaries fall on multiples of it. */
+    private static final int QWEN35_LAYER_GROUP = 4;
+
+    /**
+     * {@code bounds} with every inner boundary moved to the nearest multiple of {@code group},
+     * keeping at least one group per stage.
+     */
+    static int[] alignBounds(int[] bounds, int group) {
+        int stages = bounds.length - 1;
+        int layers = bounds[stages];
+        int[] aligned = bounds.clone();
+        for (int s = 1; s < stages; s++) {
+            int b = Math.round(bounds[s] / (float) group) * group;
+            b = Math.max(b, aligned[s - 1] + group);
+            b = Math.min(b, layers - (stages - s) * group);
+            if (b <= aligned[s - 1] || b >= layers) {
+                throw new IllegalArgumentException(
+                        layers
+                                + " layers cannot be split into "
+                                + stages
+                                + " stages on multiples of "
+                                + group);
+            }
+            aligned[s] = b;
+        }
+        return aligned;
+    }
+
+    /**
+     * A state for one qwen35 stage. Its key/value and recurrent state keep the whole model's layout
+     * and the layers index them absolutely, so the stage holds room for every layer — a few hundred
+     * megabytes on the 27B — and uses its own.
+     */
+    private static Qwen35State qwen35StageState(
+            State session, org.beehive.jitllm.model.Configuration config, int prefillBatchSize) {
+        Qwen35State stage =
+                State.withStorageOptions(
+                        session.storageOptions(),
+                        () ->
+                                State.withPrefillBatchSize(
+                                        prefillBatchSize, () -> new Qwen35State(config, 1)));
+        stage.resolveExecutionPolicy(session.executionPolicy());
+        return stage;
+    }
+
+    /**
+     * One qwen35 stage of the single-token plan: [embedding | receive], its layers, [send |
+     * logits]. The first layer consumes the hidden state from the graph named {@code
+     * activationUpdate}, which is the receive graph on a later stage.
+     */
+    private void addQwen35SingleTokenStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            Qwen35State stageState,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            SchedulerType schedulerType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0) {
+            var activation = new Activation("activationUpdate", stageState, weights, config);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("activationUpdate");
+            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var layers =
+                new Qwen35FFNLayers(
+                        "qwen35FFN",
+                        stageState,
+                        weights,
+                        config,
+                        schedulerType,
+                        "activationUpdate",
+                        first,
+                        end);
+        graphs.addAll(layers.getFFNLayerImmutableTaskGraphs());
+        layers.updateGridScheduler(scheduler);
+        if (s < last) {
+            TaskGraph send = new TaskGraph("handoff_out");
+            transport.addSend(
+                    send,
+                    s,
+                    layers.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new LogitsQ8_0Layer(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            layers.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+    }
+
+    // @formatter:off
+    /**
+     * One qwen35 stage of the batched plan, prefill and decode programs in one plan:
+     *
+     * <pre>
+     *   prefill: [prefillActivation | receive chunk], batchLayer_[first, end), [send chunk]
+     *   decode:  [decodeActivation  | receive x   ], layer_[first, end),     [send x | logits]
+     * </pre>
+     *
+     * <p>A later stage's decode layers take the caches and recurrent state straight from the
+     * stage's last prefill layer.
+     */
+    // @formatter:on
+    private void addQwen35BatchedStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            Qwen35State stageState,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            SchedulerType schedulerType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0) {
+            if (weights.getTokenEmbeddingTable().dataType() == DataType.Q8_0) {
+                var activation = new BatchPrefillQ8DeviceActivation(stageState, config, batchSize);
+                graphs.add(activation.getImmutableTaskGraph());
+                activation.updateGridScheduler(scheduler);
+                // The host stages each chunk's raw embedding rows in the session's state.
+                state.workspace.embeddingQ8Batch = stageState.workspace.embeddingQ8Batch;
+            } else {
+                // The host decodes the chunk into the session's batch carrier; share it.
+                stageState.workspace.wrapXBatch = state.workspace.wrapXBatch;
+                var activation =
+                        new org.beehive.jitllm.backend.tornado.plan.components.activation
+                                .BatchPrefillActivation(stageState, config, batchSize, true);
+                graphs.add(activation.getImmutableTaskGraph());
+                activation.updateGridScheduler(scheduler);
+            }
+        } else {
+            TaskGraph receive = new TaskGraph("prefillActivation");
+            transport.addReceive(receive, s, stageState.workspace.wrapXBatch, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var prefill =
+                new Qwen35BatchPrefillLayers(stageState, weights, config, batchSize, first, end);
+        graphs.addAll(prefill.getLayerImmutableTaskGraphs());
+        prefill.updateGridScheduler(scheduler);
+        String lastPrefill = prefill.getLastLayerTaskGraphID();
+        if (s < last) {
+            TaskGraph send = new TaskGraph("prefillHandoff");
+            transport.addSend(send, s, lastPrefill, stageState.workspace.wrapXBatch, s + 1);
+            graphs.add(send.snapshot());
+        }
+        prefillGraphs[s] = IntStream.range(0, graphs.size()).toArray();
+
+        int decodeStart = graphs.size();
+        if (s == 0) {
+            var activation =
+                    new Qwen35BatchDecodeActivation(stageState, weights, config, lastPrefill);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("decodeActivation");
+            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var decode =
+                new Qwen35FFNLayersBatchDecode(
+                        "decode", stageState, weights, config, schedulerType, first, end);
+        graphs.addAll(decode.getFFNLayerImmutableTaskGraphs());
+        decode.updateGridScheduler(scheduler);
+        if (s < last) {
+            TaskGraph send = new TaskGraph("decodeHandoff");
+            transport.addSend(
+                    send,
+                    s,
+                    decode.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new LogitsQ8_0Layer(
                             "logits",
                             stageState,
                             weights,
@@ -543,9 +788,16 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
 
     @Override
     public void resetSequenceState() {
-        // Llama keeps no recurrent state; the key/value cache is overwritten position by position.
-        for (Stage stage : stages) {
-            stage.state().resetSequenceState();
+        // Zero each stage's recurrent state on the host and on its device. Graph 1 is every
+        // stage's first layer graph (graph 0 is its activation or receive graph), which binds the
+        // buffers. Llama keeps none: its key/value cache is overwritten position by position.
+        for (int s = 0; s < stages.length; s++) {
+            State stageState = stages[s].state();
+            stageState.resetSequenceState();
+            Object[] recurrent = stageState.recurrentDeviceBuffers();
+            if (recurrent.length > 0) {
+                plans[s].withGraph(1).transferToDevice(recurrent);
+            }
         }
     }
 

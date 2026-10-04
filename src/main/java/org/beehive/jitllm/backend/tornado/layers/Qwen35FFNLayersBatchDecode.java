@@ -43,6 +43,40 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
     }
 
     /**
+     * The layers {@code [firstLayer, endLayer)} only: one stage of a model split across devices.
+     * Graphs group layers by their absolute index, so a stage must start on a group boundary.
+     */
+    public Qwen35FFNLayersBatchDecode(
+            String taskGraphName,
+            Qwen35State state,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            SchedulerType schedulerType,
+            int firstLayer,
+            int endLayer) {
+        super(
+                taskGraphName,
+                state,
+                weights,
+                config,
+                schedulerType,
+                "decodeActivation",
+                requireGroupStart(firstLayer),
+                endLayer);
+    }
+
+    private static int requireGroupStart(int firstLayer) {
+        if (firstLayer % LAYERS_PER_GRAPH != 0) {
+            throw new IllegalArgumentException(
+                    "a qwen35 decode stage must start on a multiple of "
+                            + LAYERS_PER_GRAPH
+                            + " layers, not at layer "
+                            + firstLayer);
+        }
+        return firstLayer;
+    }
+
+    /**
      * Adjacent layers to a graph.
      *
      * <p>Four: decode submissions fall to a quarter without building one graph for the whole trunk.
@@ -66,9 +100,9 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
     // @formatter:on
     @Override
     protected void setupFFNLayers() {
-        int layers = config.numberOfLayers();
+        int layers = endLayer(config.numberOfLayers());
         List<ImmutableTaskGraph> graphs = new ArrayList<>();
-        for (int first = 0; first < layers; first += LAYERS_PER_GRAPH) {
+        for (int first = firstLayer; first < layers; first += LAYERS_PER_GRAPH) {
             TaskGraph graph = new TaskGraph(layerGraphName(first));
             int last = Math.min(first + LAYERS_PER_GRAPH, layers) - 1;
             for (int layer = first; layer <= last; layer++) {
@@ -109,7 +143,7 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
 
     @Override
     protected TaskGraph configureLayerDataTransfers(TaskGraph layer, int layerIndex) {
-        if (layerIndex != 0) {
+        if (layerIndex != firstLayer) {
             return super.configureLayerDataTransfers(layer, layerIndex);
         }
         Qwen35State state = (Qwen35State) this.state;
@@ -142,10 +176,23 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
                 state.workspace.wrapSsmV,
                 state.workspace.wrapSsmOut);
         // What prefill left behind: the caches, the table that addresses them, and the recurrence.
-        layer.consumeFromDevice("decodeActivation", keyStore(), valueStore());
-        layer.consumeFromDevice("decodeActivation", state.workspace.wrapBlockTable);
+        String source = cacheSource();
+        layer.consumeFromDevice(source, keyStore(), valueStore());
+        layer.consumeFromDevice(source, state.workspace.wrapBlockTable);
         layer.consumeFromDevice(
-                "decodeActivation", state.workspace.wrapConvState, state.workspace.wrapDeltaState);
+                source, state.workspace.wrapConvState, state.workspace.wrapDeltaState);
         return layer;
+    }
+
+    /**
+     * The graph the first layer takes the caches and recurrent state from. On the whole model it is
+     * the decode activation, which relays them from the last prefill layer. A later pipeline stage
+     * starts with a graph that only receives the hidden state, so its first layer takes them
+     * straight from the stage's own last prefill layer.
+     */
+    private String cacheSource() {
+        return firstLayer == 0
+                ? "decodeActivation"
+                : "batchLayer_" + (endLayer(config.numberOfLayers()) - 1);
     }
 }
