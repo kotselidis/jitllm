@@ -27,4 +27,27 @@ public interface BatchPrefillDecodePlan extends TornadoVMMasterPlan {
     default void tornadoVMForwardBatchPrefillFallback() {
         throw new UnsupportedOperationException("this plan has no fallback prefill graphs");
     }
+
+    /**
+     * Whether this plan runs a prompt's chunks overlapped, a later one starting before an earlier
+     * one has finished: a pipeline, whose first device takes the next chunk while the next device
+     * still works on the previous one.
+     */
+    default boolean overlapsPrefillChunks() {
+        return false;
+    }
+
+    /**
+     * Runs {@code chunks} prefill chunks in order, overlapped where {@link #overlapsPrefillChunks}.
+     * {@code stageChunk.accept(c)} stages chunk {@code c} in the session state, as for {@link
+     * #tornadoVMForwardBatchPrefill}; it is called in chunk order, each call after the previous
+     * chunk's staging has been consumed, and possibly on another thread.
+     */
+    default void tornadoVMForwardBatchPrefillChunks(
+            int chunks, java.util.function.IntConsumer stageChunk) {
+        for (int c = 0; c < chunks; c++) {
+            stageChunk.accept(c);
+            tornadoVMForwardBatchPrefill();
+        }
+    }
 }

@@ -72,6 +72,20 @@ public final class NcclTransport implements PipelineTransport {
     }
 
     @Override
+    public void executeChunks(TornadoExecutionPlan[] plans, int chunks, ChunkStep step) {
+        // Each stage's thread walks the chunks on its own; a receive waits on the device for the
+        // matching send, so stage s takes chunk c + 1 while stage s + 1 still runs chunk c.
+        group(plans)
+                .execute(
+                        (rank, plan) -> {
+                            for (int c = 0; c < chunks; c++) {
+                                step.run(rank, c, plan);
+                            }
+                            return null;
+                        });
+    }
+
+    @Override
     public void close(Runnable closePlans) {
         // Group, then plans, then communicator: a communicator destroyed under plans that still
         // use it hangs in ncclCommDestroy.

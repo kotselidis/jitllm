@@ -56,9 +56,6 @@ public final class TornadoBatchPrefillPass {
             int startPos,
             int chunkSize,
             BatchPrefillDecodePlan plan) {
-        final Configuration config = model.configuration();
-        final TornadoWeights weights = (TornadoWeights) model.weights();
-
         // Which prefill family takes this chunk.
         //
         // cuDNN's causal mask aligns query i to key i, which is the right mask only when the
@@ -76,6 +73,63 @@ public final class TornadoBatchPrefillPass {
         // The plan only builds that family when the primary uses cuDNN attention; where it does
         // not, the primary already handles every chunk itself.
         boolean useFallbackFamily = startPos != 0 && plan.hasBatchPrefillFallback();
+        stage(model, state, tokens, startPos, chunkSize);
+        if (useFallbackFamily) {
+            plan.tornadoVMForwardBatchPrefillFallback();
+        } else {
+            plan.tornadoVMForwardBatchPrefill();
+        }
+    }
+
+    /**
+     * Prefills {@code count} tokens from position {@code startPos} in chunks of {@code batch}. A
+     * plan that overlaps chunks ({@link BatchPrefillDecodePlan#overlapsPrefillChunks}) is handed
+     * them all at once and stages each through {@link #stage} as it gets to it; any other plan
+     * takes them one {@link #batchPrefill} at a time.
+     */
+    public static void batchPrefillAll(
+            Model model,
+            State state,
+            int[] tokens,
+            int startPos,
+            int count,
+            int batch,
+            BatchPrefillDecodePlan plan) {
+        int chunks = (count + batch - 1) / batch;
+        if (chunks > 1 && plan.overlapsPrefillChunks() && !plan.hasBatchPrefillFallback()) {
+            plan.tornadoVMForwardBatchPrefillChunks(
+                    chunks,
+                    c -> {
+                        int off = c * batch;
+                        int size = Math.min(batch, count - off);
+                        stage(
+                                model,
+                                state,
+                                java.util.Arrays.copyOfRange(tokens, off, off + size),
+                                startPos + off,
+                                size);
+                    });
+            return;
+        }
+        for (int off = 0; off < count; off += batch) {
+            int size = Math.min(batch, count - off);
+            batchPrefill(
+                    model,
+                    state,
+                    java.util.Arrays.copyOfRange(tokens, off, off + size),
+                    startPos + off,
+                    size,
+                    plan);
+        }
+    }
+
+    /**
+     * Stages one chunk in the session state: its start position, active rows and KV slot in {@code
+     * batchStartPosHolder}, and its token embeddings in the device batch carrier.
+     */
+    private static void stage(Model model, State state, int[] tokens, int startPos, int chunkSize) {
+        final Configuration config = model.configuration();
+        final TornadoWeights weights = (TornadoWeights) model.weights();
 
         state.workspace.batchStartPosHolder.set(0, startPos);
         // The kernels launch a fixed batchSize rows; this tells them how many are real, so the
@@ -205,12 +259,6 @@ public final class TornadoBatchPrefillPass {
                     "staging: per-layer rows for {0} tokens in {1} ms",
                     chunkSize,
                     (System.nanoTime() - stageStart) / 1e6);
-        }
-
-        if (useFallbackFamily) {
-            plan.tornadoVMForwardBatchPrefillFallback();
-        } else {
-            plan.tornadoVMForwardBatchPrefill();
         }
     }
 

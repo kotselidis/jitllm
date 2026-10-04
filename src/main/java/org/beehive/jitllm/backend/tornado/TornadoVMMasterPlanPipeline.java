@@ -764,6 +764,77 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
     }
 
     @Override
+    public boolean overlapsPrefillChunks() {
+        return batched && stages.length > 1;
+    }
+
+    // @formatter:off
+    /**
+     * The chunks run overlapped: every stage's thread walks them in order, the first staging each
+     * chunk itself before running it, so the first device takes chunk {@code c + 1} while the next
+     * still runs chunk {@code c}. Each stage keeps its own key/value and recurrent state, and the
+     * first stage's carrier is free again once its run of a chunk has returned — the send has
+     * completed by then — so nothing two chunks share is in use by both.
+     *
+     * <p>A later stage reads a chunk's start position, active rows and slot from what the first
+     * stage published when it staged that chunk, never from the session state, which by then may
+     * hold a later chunk. A failure while staging or running on the first stage is passed to every
+     * chunk the others still wait for.
+     */
+    // @formatter:on
+    @Override
+    public void tornadoVMForwardBatchPrefillChunks(
+            int chunks, java.util.function.IntConsumer stageChunk) {
+        if (!batched) {
+            throw new IllegalStateException("this pipeline plan was built without batched prefill");
+        }
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.CompletableFuture<int[]>[] staged =
+                new java.util.concurrent.CompletableFuture[chunks];
+        for (int c = 0; c < chunks; c++) {
+            staged[c] = new java.util.concurrent.CompletableFuture<>();
+        }
+        IntArray session = state.workspace.batchStartPosHolder;
+        transport.executeChunks(
+                plans,
+                chunks,
+                (stage, c, plan) -> {
+                    int[] chunk;
+                    if (stage == 0) {
+                        try {
+                            stageChunk.accept(c);
+                        } catch (RuntimeException | Error e) {
+                            for (var future : staged) {
+                                future.completeExceptionally(e);
+                            }
+                            throw e;
+                        }
+                        chunk = new int[session.getSize()];
+                        for (int i = 0; i < chunk.length; i++) {
+                            chunk[i] = session.get(i);
+                        }
+                        staged[c].complete(chunk);
+                    } else {
+                        chunk = staged[c].join();
+                    }
+                    IntArray holder = stages[stage].state().workspace.batchStartPosHolder;
+                    for (int i = 0; i < holder.getSize() && i < chunk.length; i++) {
+                        holder.set(i, chunk[i]);
+                    }
+                    try {
+                        PipelineTransport.executeGraphs(plan, prefillGraphs[stage], CUDA_GRAPHS);
+                    } catch (RuntimeException | Error e) {
+                        if (stage == 0) {
+                            for (var future : staged) {
+                                future.completeExceptionally(e);
+                            }
+                        }
+                        throw e;
+                    }
+                });
+    }
+
+    @Override
     public FloatArray tornadoVMForwardDecode(int position) {
         for (Stage stage : stages) {
             var workspace = stage.state().workspace;

@@ -458,13 +458,14 @@ public class JitllmBench {
                 hostForward.forward(model, state, toks[start + i], start + i);
             }
         } else if (batch > 1) {
-            var bp = (BatchPrefillDecodePlan) plan;
-            for (int off = 0; off < count; off += batch) {
-                int chunkSize = Math.min(batch, count - off);
-                int[] chunk = Arrays.copyOfRange(toks, start + off, start + off + chunkSize);
-                org.beehive.jitllm.backend.tornado.TornadoBatchPrefillPass.batchPrefill(
-                        model, state, chunk, start + off, chunkSize, bp);
-            }
+            org.beehive.jitllm.backend.tornado.TornadoBatchPrefillPass.batchPrefillAll(
+                    model,
+                    state,
+                    Arrays.copyOfRange(toks, start, start + count),
+                    start,
+                    count,
+                    batch,
+                    (BatchPrefillDecodePlan) plan);
         } else {
             for (int i = 0; i < count; i++) {
                 org.beehive.jitllm.backend.tornado.TornadoForwardPass.forward(

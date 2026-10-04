@@ -89,6 +89,16 @@ final class HostTransport implements PipelineTransport {
     }
 
     @Override
+    public void executeChunks(TornadoExecutionPlan[] plans, int chunks, ChunkStep step) {
+        // One thread: chunk by chunk, every stage in turn.
+        for (int c = 0; c < chunks; c++) {
+            for (int s = 0; s < plans.length; s++) {
+                step.run(s, c, plans[s]);
+            }
+        }
+    }
+
+    @Override
     public void close(Runnable closePlans) {
         closePlans.run();
     }

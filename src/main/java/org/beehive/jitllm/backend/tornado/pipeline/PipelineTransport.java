@@ -46,6 +46,19 @@ public interface PipelineTransport extends AutoCloseable {
      */
     void execute(TornadoExecutionPlan[] plans, int[][] graphs, boolean cudaGraphs);
 
+    /** Stage {@code stage}'s share of chunk {@code chunk} in {@link #executeChunks}. */
+    @FunctionalInterface
+    interface ChunkStep {
+        void run(int stage, int chunk, TornadoExecutionPlan plan);
+    }
+
+    /**
+     * Runs {@code chunks} chunks through every stage: each stage runs its share of chunk 0, then of
+     * chunk 1, and so on. With stages that run concurrently, a stage starts the next chunk as soon
+     * as it has handed the previous one on, so successive chunks overlap across the stages.
+     */
+    void executeChunks(TornadoExecutionPlan[] plans, int chunks, ChunkStep step);
+
     /**
      * Releases the transport. {@code closePlans} runs at the point where the plans must be closed:
      * after anything that drives them and before anything they captured, such as a communicator.

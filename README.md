@@ -311,10 +311,13 @@ Llama-3.3-70B Q4_0 (40 GB) runs this way on two 24 GB NVIDIA A10s at about 10 to
 
 For Q4_0 models the prompt can be prefilled in chunks on every device as well: add
 `--batch-prefill-size 256 --with-native-libraries` (each device runs its layers on the whole
-chunk with cuBLAS, then hands the chunk's hidden states to the next one). On the two A10s this
-takes a 680-token prompt for the 70B from about 65 s to 4.5 s before the first answer token.
-Qwen3.8-27B Q8_0 (29 GB) splits the same way; its batched prefill decodes the Q8_0 weights for
-cuBLAS and also needs `--with-native-libraries`.
+chunk with cuBLAS, then hands the chunk's hidden states to the next one). The chunks overlap:
+the first device starts the next chunk while the next device still works on the previous one.
+On the two A10s this takes a 680-token prompt for the 70B from about 65 s to 3.1 s before the
+first answer token.
+Qwen3.8-27B Q8_0 (29 GB) splits the same way with `--batch-prefill-size 256` alone: its
+projections run as int8 tensor-core GEMMs straight on the Q8_0 weights, the arithmetic of
+llama.cpp's MMQ, at about 750 prompt tokens/s on the two A10s.
 
 -----------
 
