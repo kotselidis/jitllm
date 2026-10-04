@@ -130,20 +130,35 @@ public class LlamaQ8_0FFNLayers
                 state.workspace.temp);
 
         // QKV Projection (fused with Q8 dequantization)
-        unifiedLayer.task(
-                "qkv_projection",
-                TransformerComputeKernelsLayered::fusedQKVMatmulQ8,
-                context,
-                state.workspace.wrapXb, // input (FP32)
-                state.workspace.wrapQ, // output Q
-                state.workspace.wrapK, // output K
-                state.workspace.wrapV, // output V
-                weights.wqLayered[layerIndex].asByteArray(), // Wq (Q8)
-                weights.wkLayered[layerIndex].asByteArray(), // Wk (Q8)
-                weights.wvLayered[layerIndex].asByteArray(), // Wv (Q8)
-                config.dim(), // dim
-                config.kvDim(), // kvDim
-                LOCAL_WORK_GROUP_SIZE_ALLOC);
+        if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
+            unifiedLayer.task(
+                    "qkv_projection",
+                    TransformerComputeKernelsLayered::fusedQKVMatmulQ8Simd32,
+                    context,
+                    state.workspace.wrapXb,
+                    state.workspace.wrapQ,
+                    state.workspace.wrapK,
+                    state.workspace.wrapV,
+                    weights.wqLayered[layerIndex].asByteArray(),
+                    weights.wkLayered[layerIndex].asByteArray(),
+                    weights.wvLayered[layerIndex].asByteArray(),
+                    config.dim(),
+                    config.kvDim());
+        } else
+            unifiedLayer.task(
+                    "qkv_projection",
+                    TransformerComputeKernelsLayered::fusedQKVMatmulQ8,
+                    context,
+                    state.workspace.wrapXb, // input (FP32)
+                    state.workspace.wrapQ, // output Q
+                    state.workspace.wrapK, // output K
+                    state.workspace.wrapV, // output V
+                    weights.wqLayered[layerIndex].asByteArray(), // Wq (Q8)
+                    weights.wkLayered[layerIndex].asByteArray(), // Wk (Q8)
+                    weights.wvLayered[layerIndex].asByteArray(), // Wv (Q8)
+                    config.dim(), // dim
+                    config.kvDim(), // kvDim
+                    LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         // RoPE + KV Cache
         // Precomputed RoPE tables: the frequencies come from the model's own rope_theta (and
@@ -156,16 +171,27 @@ public class LlamaQ8_0FFNLayers
         configureAttention(unifiedLayer, layerIndex);
 
         // Output Projection (Wo) with residual (Q8 dequantization)
-        unifiedLayer.task(
-                "attn_output_proj",
-                TransformerComputeKernelsLayered::matrixVectorGenericWithResidualQ8_0Byte,
-                context,
-                state.workspace.wrapXb,
-                state.workspace.wrapX,
-                weights.woLayered[layerIndex].asByteArray(),
-                config.dim(),
-                config.dim(),
-                LOCAL_WORK_GROUP_SIZE_ALLOC);
+        if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
+            unifiedLayer.task(
+                    "attn_output_proj",
+                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualQ8_0ByteSimd32,
+                    context,
+                    state.workspace.wrapXb,
+                    state.workspace.wrapX,
+                    weights.woLayered[layerIndex].asByteArray(),
+                    config.dim(),
+                    config.dim());
+        } else
+            unifiedLayer.task(
+                    "attn_output_proj",
+                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualQ8_0Byte,
+                    context,
+                    state.workspace.wrapXb,
+                    state.workspace.wrapX,
+                    weights.woLayered[layerIndex].asByteArray(),
+                    config.dim(),
+                    config.dim(),
+                    LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         // === FFN Block ===
         // RMS Normalization
@@ -228,16 +254,27 @@ public class LlamaQ8_0FFNLayers
         }
 
         // Down projection (W2) with residual (Q8 dequantization)
-        unifiedLayer.task(
-                "ffn_down_proj",
-                TransformerComputeKernelsLayered::matrixVectorGenericWithResidualQ8_0Byte,
-                context,
-                state.workspace.wrapHb,
-                state.workspace.wrapX,
-                weights.w2Layered[layerIndex].asByteArray(),
-                config.hiddenDim(),
-                config.dim(),
-                LOCAL_WORK_GROUP_SIZE_ALLOC);
+        if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
+            unifiedLayer.task(
+                    "ffn_down_proj",
+                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualQ8_0ByteSimd32,
+                    context,
+                    state.workspace.wrapHb,
+                    state.workspace.wrapX,
+                    weights.w2Layered[layerIndex].asByteArray(),
+                    config.hiddenDim(),
+                    config.dim());
+        } else
+            unifiedLayer.task(
+                    "ffn_down_proj",
+                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualQ8_0Byte,
+                    context,
+                    state.workspace.wrapHb,
+                    state.workspace.wrapX,
+                    weights.w2Layered[layerIndex].asByteArray(),
+                    config.hiddenDim(),
+                    config.dim(),
+                    LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         // Keep activation X on device for next layer
         unifiedLayer.persistOnDevice(state.workspace.wrapX);

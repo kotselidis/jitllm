@@ -2202,42 +2202,87 @@ public class TransformerComputeKernelsLayered {
     }
 
     /**
-     * Warp-shuffle variant of {@link #matrixVectorGenericWithResidualQ8_0Byte}: one 32-lane warp
-     * per output row, reduced via {@code simdShuffleDown} instead of a shared-memory tree. Q8_0
-     * byte layout (34-byte blocks: 2-byte half scale + 32 int8 quants).
+     * One Q8_0 row of {@code w} times {@code x} for a 32-lane simdgroup: lane {@code l} takes four
+     * consecutive quants at {@code 4l, 4l + 128, ...}, so the simdgroup reads four whole blocks per
+     * step and loads each block's scale from one cache line. Reduced with {@code simdShuffleDown};
+     * the sum is valid in lane 0. Needs {@code n % 32 == 0}.
+     */
+    private static float dotQ8_0RowSimd32(
+            KernelContext context, FloatArray x, ByteArray w, int n, int row, int lane) {
+        final int Q8_0_BLOCK_BYTES = 34; // 2-byte scale + 32 int8 quants
+        int rowBlockOffset = row * (n / 32);
+        float sum = 0.0f;
+        for (int j = lane * 4; j < n; j += 128) {
+            int blockByteOffset = (rowBlockOffset + (j >> 5)) * Q8_0_BLOCK_BYTES;
+            int quants = blockByteOffset + 2 + (j & 31);
+            sum +=
+                    w.getHalfFloat(blockByteOffset).getFloat32()
+                            * (w.get(quants) * x.get(j)
+                                    + w.get(quants + 1) * x.get(j + 1)
+                                    + w.get(quants + 2) * x.get(j + 2)
+                                    + w.get(quants + 3) * x.get(j + 3));
+        }
+        sum += context.simdShuffleDown(sum, 16);
+        sum += context.simdShuffleDown(sum, 8);
+        sum += context.simdShuffleDown(sum, 4);
+        sum += context.simdShuffleDown(sum, 2);
+        sum += context.simdShuffleDown(sum, 1);
+        return sum;
+    }
+
+    /**
+     * Simdgroup variant of {@link #matrixVectorGenericWithResidualQ8_0Byte}: one 32-lane simdgroup
+     * per output row ({@link #dotQ8_0RowSimd32}) instead of a shared-memory tree. Worker: {@code d}
+     * groups of 32 threads. Needs {@code n % 32 == 0}.
      */
     public static void matrixVectorGenericWithResidualQ8_0ByteSimd32(
             KernelContext context, FloatArray x, FloatArray hb, ByteArray w, int n, int d) {
         int rowId = context.groupIdx;
-        int localId = context.localIdx;
-
+        int lane = context.localIdx;
         if (rowId >= d) {
             return;
         }
-
-        final int blockSize = 32;
-        final int Q8_0_BLOCK_BYTES = 34; // 2-byte scale + 32 int8 quants
-        int blocksPerRow = (n + blockSize - 1) / blockSize;
-        int rowBlockOffset = rowId * blocksPerRow;
-
-        float partialSum = 0.0f;
-        for (int j = localId; j < n; j += 32) {
-            int blockIdx = j / blockSize;
-            int withinBlockIdx = j - blockIdx * blockSize;
-            int blockByteOffset = (rowBlockOffset + blockIdx) * Q8_0_BLOCK_BYTES;
-            float scaleFloat = w.getHalfFloat(blockByteOffset).getFloat32();
-            byte quant = w.get(blockByteOffset + 2 + withinBlockIdx);
-            partialSum += ((float) quant * scaleFloat) * x.get(j);
+        float sum = dotQ8_0RowSimd32(context, x, w, n, rowId, lane);
+        if (lane == 0) {
+            hb.set(rowId, hb.get(rowId) + sum);
         }
+    }
 
-        partialSum += context.simdShuffleDown(partialSum, 16);
-        partialSum += context.simdShuffleDown(partialSum, 8);
-        partialSum += context.simdShuffleDown(partialSum, 4);
-        partialSum += context.simdShuffleDown(partialSum, 2);
-        partialSum += context.simdShuffleDown(partialSum, 1);
-
-        if (localId == 0) {
-            hb.set(rowId, hb.get(rowId) + partialSum);
+    /**
+     * Simdgroup variant of {@link #fusedQKVMatmulQ8}: one 32-lane simdgroup per row of the stacked
+     * {@code [Wq; Wk; Wv]} ({@link #dotQ8_0RowSimd32}). Worker: {@code dim + 2 * kvDim} groups of
+     * 32 threads. Needs {@code dim % 32 == 0}.
+     */
+    public static void fusedQKVMatmulQ8Simd32(
+            KernelContext context,
+            FloatArray x,
+            FloatArray q,
+            FloatArray k,
+            FloatArray v,
+            ByteArray wq,
+            ByteArray wk,
+            ByteArray wv,
+            int dim,
+            int kvDim) {
+        int rowId = context.groupIdx;
+        int lane = context.localIdx;
+        if (rowId < dim) {
+            float sum = dotQ8_0RowSimd32(context, x, wq, dim, rowId, lane);
+            if (lane == 0) {
+                q.set(rowId, sum);
+            }
+        } else if (rowId < dim + kvDim) {
+            int r = rowId - dim;
+            float sum = dotQ8_0RowSimd32(context, x, wk, dim, r, lane);
+            if (lane == 0) {
+                k.set(r, sum);
+            }
+        } else if (rowId < dim + 2 * kvDim) {
+            int r = rowId - dim - kvDim;
+            float sum = dotQ8_0RowSimd32(context, x, wv, dim, r, lane);
+            if (lane == 0) {
+                v.set(r, sum);
+            }
         }
     }
 
@@ -2867,31 +2912,10 @@ public class TransformerComputeKernelsLayered {
             int dim0) {
         int rowId = context.groupIdx;
         int lane = context.localIdx;
-
         if (rowId >= dim0) {
             return;
         }
-
-        final int Q8_0_BLOCK_BYTES = 34; // 2-byte scale + 32 int8 quants
-        int rowBlockOffset = rowId * (dim1 / 32);
-        float sum = 0.0f;
-        for (int j = lane * 4; j < dim1; j += 128) {
-            int blockByteOffset = (rowBlockOffset + (j >> 5)) * Q8_0_BLOCK_BYTES;
-            int quants = blockByteOffset + 2 + (j & 31);
-            sum +=
-                    q.getHalfFloat(blockByteOffset).getFloat32()
-                            * (q.get(quants) * x.get(j)
-                                    + q.get(quants + 1) * x.get(j + 1)
-                                    + q.get(quants + 2) * x.get(j + 2)
-                                    + q.get(quants + 3) * x.get(j + 3));
-        }
-
-        sum += context.simdShuffleDown(sum, 16);
-        sum += context.simdShuffleDown(sum, 8);
-        sum += context.simdShuffleDown(sum, 4);
-        sum += context.simdShuffleDown(sum, 2);
-        sum += context.simdShuffleDown(sum, 1);
-
+        float sum = dotQ8_0RowSimd32(context, x, q, dim1, rowId, lane);
         if (lane == 0) {
             output.set(rowId, sum);
         }
