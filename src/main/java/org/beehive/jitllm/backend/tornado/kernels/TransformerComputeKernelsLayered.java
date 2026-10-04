@@ -2202,6 +2202,45 @@ public class TransformerComputeKernelsLayered {
     }
 
     /**
+     * RMS normalization in one launch: {@code out[i] = weights[i] * (x[i] / sqrt(mean(x^2) + eps))}
+     * by a single threadgroup, which sums squares with {@code simdSum}, combines the simdgroups'
+     * sums through threadgroup memory, and applies the scale. Replaces a multi-group reduce, a
+     * single-thread finalize and an apply kernel. Worker: one group of up to 1024 threads, a
+     * multiple of 32.
+     */
+    public static void rmsNormSimdSingleGroup(
+            KernelContext context,
+            FloatArray out,
+            FloatArray x,
+            FloatArray weights,
+            int size,
+            float eps) {
+        int tid = context.localIdx;
+        int threads = context.localGroupSizeX;
+        float[] partial = context.allocateFloatLocalArray(32);
+
+        float ss = 0.0f;
+        for (int i = tid; i < size; i += threads) {
+            float v = x.get(i);
+            ss += v * v;
+        }
+        ss = context.simdSum(ss);
+        if ((tid & 31) == 0) {
+            partial[tid >> 5] = ss;
+        }
+        context.localBarrier();
+
+        float total = 0.0f;
+        for (int g = 0; g < (threads >> 5); g++) {
+            total += partial[g];
+        }
+        float scale = 1.0f / TornadoMath.sqrt(total / size + eps);
+        for (int i = tid; i < size; i += threads) {
+            out.set(i, weights.get(i) * (scale * x.get(i)));
+        }
+    }
+
+    /**
      * One Q8_0 row of {@code w} times {@code x} for a 32-lane simdgroup: lane {@code l} takes four
      * consecutive quants at {@code 4l, 4l + 128, ...}, so the simdgroup reads four whole blocks per
      * step and loads each block's scale from one cache line. Reduced with {@code simdShuffleDown};

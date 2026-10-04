@@ -100,34 +100,46 @@ public class LlamaQ8_0FFNLayers
 
         // === Attention Block ===
         // RMS Normalization
-        unifiedLayer.task(
-                "attn_rms_reduce",
-                rmsReduceKernel(),
-                context,
-                state.workspace.temp,
-                state.workspace.wrapX,
-                config.dim(),
-                config.rmsNormEps(),
-                state.localSize);
-
-        if (shouldUseFinalNormalization()) {
+        if (singleGroupRms()) {
             unifiedLayer.task(
-                    "attn_rms_finalize",
-                    TransformerComputeKernelsLayered::reductionFinalNormalization,
+                    "attn_rms",
+                    TransformerComputeKernelsLayered::rmsNormSimdSingleGroup,
                     context,
-                    state.workspace.temp,
+                    state.workspace.wrapXb,
+                    state.workspace.wrapX,
+                    weights.rms_att_weightLayered[layerIndex].asFloatArray(),
                     config.dim(),
                     config.rmsNormEps());
-        }
+        } else {
+            unifiedLayer.task(
+                    "attn_rms_reduce",
+                    rmsReduceKernel(),
+                    context,
+                    state.workspace.temp,
+                    state.workspace.wrapX,
+                    config.dim(),
+                    config.rmsNormEps(),
+                    state.localSize);
 
-        unifiedLayer.task(
-                "attn_rms_apply",
-                TransformerComputeKernelsLayered::reductionOneBlock2WithLayer,
-                context,
-                state.workspace.wrapXb,
-                state.workspace.wrapX,
-                weights.rms_att_weightLayered[layerIndex].asFloatArray(),
-                state.workspace.temp);
+            if (shouldUseFinalNormalization()) {
+                unifiedLayer.task(
+                        "attn_rms_finalize",
+                        TransformerComputeKernelsLayered::reductionFinalNormalization,
+                        context,
+                        state.workspace.temp,
+                        config.dim(),
+                        config.rmsNormEps());
+            }
+
+            unifiedLayer.task(
+                    "attn_rms_apply",
+                    TransformerComputeKernelsLayered::reductionOneBlock2WithLayer,
+                    context,
+                    state.workspace.wrapXb,
+                    state.workspace.wrapX,
+                    weights.rms_att_weightLayered[layerIndex].asFloatArray(),
+                    state.workspace.temp);
+        }
 
         // QKV Projection (fused with Q8 dequantization)
         if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
@@ -195,39 +207,45 @@ public class LlamaQ8_0FFNLayers
 
         // === FFN Block ===
         // RMS Normalization
-        unifiedLayer.task(
-                "ffn_rms_reduce",
-                rmsReduceKernel(),
-                context,
-                state.workspace.tempFFN,
-                state.workspace.wrapX,
-                config.dim(),
-                config.rmsNormEps(),
-                state.localSize);
-
-        if (shouldUseFinalNormalization()) {
+        if (singleGroupRms()) {
+            // Normalized into wrapXb (free again: attn_output_proj has consumed it) for the
+            // simdgroup gate/up below, which reads it instead of re-normalizing per row.
             unifiedLayer.task(
-                    "ffn_rms_finalize",
-                    TransformerComputeKernelsLayered::reductionFinalNormalization,
-                    context,
-                    state.workspace.tempFFN,
-                    config.dim(),
-                    config.rmsNormEps());
-        }
-
-        // Fully fused: RMS apply + Gate/Up projections + SiLU + GLU (Q8 dequantization)
-        if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
-            // Normalize once into wrapXb (free again: attn_output_proj has consumed it), then a
-            // simdgroup-reduced gate/up over the normalized input. Re-normalizing per row, as the
-            // fused kernel below does, costs more loads than the weights themselves on Metal.
-            unifiedLayer.task(
-                    "ffn_rms_apply",
-                    TransformerComputeKernelsLayered::reductionOneBlock2WithLayer,
+                    "ffn_rms",
+                    TransformerComputeKernelsLayered::rmsNormSimdSingleGroup,
                     context,
                     state.workspace.wrapXb,
                     state.workspace.wrapX,
                     weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
-                    state.workspace.tempFFN);
+                    config.dim(),
+                    config.rmsNormEps());
+        } else {
+            unifiedLayer.task(
+                    "ffn_rms_reduce",
+                    rmsReduceKernel(),
+                    context,
+                    state.workspace.tempFFN,
+                    state.workspace.wrapX,
+                    config.dim(),
+                    config.rmsNormEps(),
+                    state.localSize);
+
+            if (shouldUseFinalNormalization()) {
+                unifiedLayer.task(
+                        "ffn_rms_finalize",
+                        TransformerComputeKernelsLayered::reductionFinalNormalization,
+                        context,
+                        state.workspace.tempFFN,
+                        config.dim(),
+                        config.rmsNormEps());
+            }
+        }
+
+        // Fully fused: RMS apply + Gate/Up projections + SiLU + GLU (Q8 dequantization)
+        if (SchedulerDetectionService.isSubgroupShuffle32Supported()) {
+            // Simdgroup-reduced gate/up over the input ffn_rms normalized into wrapXb.
+            // Re-normalizing per row, as the fused kernel below does, costs more loads than the
+            // weights themselves on Metal.
             unifiedLayer.task(
                     "rms_ffn_gate_up",
                     TransformerComputeKernelsLayered::ffnGateUpSwiGLUQ8_0Simd32,
@@ -342,6 +360,8 @@ public class LlamaQ8_0FFNLayers
     public GridScheduler updateGridScheduler(GridScheduler tornadoForwardScheduler) {
         // === Worker Grid Definitions ===
         WorkerGrid rmsNormWorker = WorkerGridFactory.createRmsNormWorker(config.dim(), 256);
+        WorkerGrid singleGroupRmsWorker =
+                WorkerGridFactory.genericWorker(SINGLE_GROUP_RMS_THREADS, SINGLE_GROUP_RMS_THREADS);
         // Race-free single-workgroup reduction on the NVIDIA path; see rmsReduceKernel().
         WorkerGrid rmsReduceWorker = rmsReduceWorker(rmsNormWorker);
 
@@ -389,7 +409,12 @@ public class LlamaQ8_0FFNLayers
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".ffn_rms_reduce", rmsReduceWorker);
             // Fused RMS + Gate/Up Projections
-            tornadoForwardScheduler.addWorkerGrid("layer_" + i + ".ffn_rms_apply", rmsNormWorker);
+            if (singleGroupRms()) {
+                tornadoForwardScheduler.addWorkerGrid(
+                        "layer_" + i + ".attn_rms", singleGroupRmsWorker);
+                tornadoForwardScheduler.addWorkerGrid(
+                        "layer_" + i + ".ffn_rms", singleGroupRmsWorker);
+            }
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".rms_ffn_gate_up", configHiddenDimRowMajorWorker);
             // Down Projection
@@ -471,6 +496,20 @@ public class LlamaQ8_0FFNLayers
                 && SchedulerDetectionService.isSubgroupShuffle32Supported()
                 && config.headSize() % 32 == 0
                 && config.headSize() <= 128;
+    }
+
+    /** Threads of the one threadgroup {@link #singleGroupRms()} normalizes with. */
+    private static final int SINGLE_GROUP_RMS_THREADS = 256;
+
+    /**
+     * Whether each RMS norm is one launch ({@link
+     * TransformerComputeKernelsLayered#rmsNormSimdSingleGroup}: reduce, scale and apply in a single
+     * threadgroup) instead of reduce, finalize and apply: where 32-wide simdgroup reductions are
+     * supported (Metal). The gate/up projection then reads the normalized FFN input from {@code
+     * wrapXb}.
+     */
+    protected boolean singleGroupRms() {
+        return SchedulerDetectionService.isSubgroupShuffle32Supported();
     }
 
     /** Attention is dtype-independent — a Q4_0 sibling reuses this unchanged. */
