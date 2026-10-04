@@ -246,7 +246,12 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                     dim);
             layer.task(
                     "batch_attention",
-                    TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionFP16OutKVFP16Paged,
+                    // The tiled variant the FP16 layers take under the same policy flag.
+                    state.executionPolicy().packedHalf2Attention()
+                            ? TransformerPagedKvBatchPrefillKernels
+                                    ::batchedFlashAttentionFP16OutKVFP16PackedTilePaged
+                            : TransformerPagedKvBatchPrefillKernels
+                                    ::batchedFlashAttentionFP16OutKVFP16Paged,
                     context,
                     state.workspace.batchStartPosHolder,
                     state.workspace.qkvResultBatch,
