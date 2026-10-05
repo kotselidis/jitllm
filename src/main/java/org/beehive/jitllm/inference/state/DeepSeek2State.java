@@ -1,5 +1,10 @@
 package org.beehive.jitllm.inference.state;
 
+import java.util.function.Supplier;
+import org.beehive.jitllm.backend.tornado.workspace.TornadoWorkspaces;
+import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
+
 import org.beehive.jitllm.model.Configuration;
 import org.beehive.jitllm.model.deepseek2.DeepSeek2Configuration;
 import org.beehive.jitllm.tensor.standard.ArrayFloatTensor;
@@ -54,6 +59,106 @@ public final class DeepSeek2State extends State {
         this.expertHidden = ArrayFloatTensor.allocate(width);
         this.expertHiddenUp = ArrayFloatTensor.allocate(width);
         this.expertOut = ArrayFloatTensor.allocate(c.dim());
+        if (Boolean.parseBoolean(System.getProperty("use.tornadovm", "false"))
+                && prefillBatchWidth > 1) {
+            allocateBatchWorkspace(c);
+        }
+    }
+
+    // ── Batched prefill ───────────────────────────────────────────────────────
+
+    /** {@code attn_kv_a_mqa}'s output padded to whole 128-column GEMM tiles. */
+    public static final int KV_A_PADDED = 640;
+
+    /** The chunk width rounded up to whole 128-row GEMM tiles. */
+    public int paddedBatch;
+
+    /** The context rounded up to whole 128-column GEMM tiles: the score GEMM's width. */
+    public int paddedPositions;
+
+    public FloatArray queryLatentBatch;
+    public FloatArray compressedKvBatch;
+    public FloatArray queryBatch;
+    public HalfFloatArray queryF16Batch;
+    public FloatArray absorbedBatch;
+    public HalfFloatArray absorbedF16Batch;
+    public HalfFloatArray keysF16;
+    public HalfFloatArray latentTF16;
+    public FloatArray scoresBatch;
+    public HalfFloatArray probsF16Batch;
+    public FloatArray latentBatch;
+    public HalfFloatArray latentF16Batch;
+    public FloatArray attnOutBatch;
+    public FloatArray gateBatch;
+    public FloatArray hiddenBatch;
+
+    // @formatter:off
+    /**
+     * The chunk's buffers: the projections' outputs, the attention's (token, head) rows, the int8
+     * GEMMs' quantized activation, and the routed and shared experts' activations.
+     */
+    // @formatter:on
+    private void allocateBatchWorkspace(DeepSeek2Configuration c) {
+        int p = (prefillBatchWidth + 127) & ~127;
+        this.paddedBatch = p;
+        this.paddedPositions = (c.contextLength() + 127) & ~127;
+        int heads = c.numberOfHeads();
+        int keyWidth = c.keyWidth();
+        int rank = c.kvLoraRank();
+        int dim = c.dim();
+        int rows = p * heads;
+
+        workspace.wrapNormedBatch = TornadoWorkspaces.floats(p * dim);
+        queryLatentBatch = TornadoWorkspaces.floats(p * c.qLoraRank());
+        compressedKvBatch = TornadoWorkspaces.floats(p * KV_A_PADDED);
+        queryBatch = TornadoWorkspaces.floats(p * c.queryDim());
+        queryF16Batch = TornadoWorkspaces.halfFloats(p * c.queryDim());
+        absorbedBatch = TornadoWorkspaces.floats(rows * keyWidth);
+        absorbedF16Batch = TornadoWorkspaces.halfFloats(rows * keyWidth);
+        keysF16 = TornadoWorkspaces.halfFloats(paddedPositions * keyWidth);
+        latentTF16 = TornadoWorkspaces.halfFloats(rank * paddedPositions);
+        scoresBatch = TornadoWorkspaces.floats(rows * paddedPositions);
+        probsF16Batch = TornadoWorkspaces.halfFloats(rows * paddedPositions);
+        latentBatch = TornadoWorkspaces.floats(rows * rank);
+        latentF16Batch = TornadoWorkspaces.halfFloats(rows * rank);
+        attnOutBatch = TornadoWorkspaces.floats(p * c.attentionOutputInputDim());
+        gateBatch = TornadoWorkspaces.floats(p * c.hiddenDim());
+        hiddenBatch = TornadoWorkspaces.floats(p * c.hiddenDim());
+
+        int widest =
+                Math.max(
+                        Math.max(dim, c.hiddenDim()),
+                        Math.max(c.attentionOutputInputDim(), c.qLoraRank()));
+        workspace.wrapQ8ActBatch = TornadoWorkspaces.bytes(p * widest);
+        workspace.wrapQ8ActScales = TornadoWorkspaces.floats(p * widest / 32);
+        workspace.wrapQ8SplitPartial = TornadoWorkspaces.floats(8 * p * dim);
+
+        int experts = Math.max(1, c.expertCount());
+        int assignments = p * Math.max(1, c.expertsUsed());
+        int hidden = Math.max(32, c.expertHiddenDim());
+        int shared = Math.max(32, c.sharedHiddenDim());
+        workspace.wrapMoeLogitsBatch = TornadoWorkspaces.floats(p * experts);
+        workspace.wrapMoeIdsBatch = TornadoWorkspaces.ints(assignments);
+        workspace.wrapMoeWeightsBatch = TornadoWorkspaces.floats(assignments);
+        workspace.wrapMoeSharedGateBatch = TornadoWorkspaces.floats(p);
+        workspace.wrapMoeSortedToken = TornadoWorkspaces.ints(assignments);
+        workspace.wrapMoePosition = TornadoWorkspaces.ints(assignments);
+        workspace.wrapMoeTiles =
+                TornadoWorkspaces.ints(
+                        1
+                                + 3
+                                        * org.beehive.jitllm.backend.tornado.kernels
+                                                .Qwen35MoeBatchKernels.maxTiles(
+                                                assignments, experts));
+        workspace.wrapMoeHiddenBatch = TornadoWorkspaces.floats(assignments * hidden);
+        workspace.wrapMoeHiddenQ8 = TornadoWorkspaces.bytes(assignments * hidden);
+        workspace.wrapMoeHiddenScales = TornadoWorkspaces.floats(assignments * hidden / 32);
+        workspace.wrapMoeOutBatch = TornadoWorkspaces.floats(assignments * dim);
+        workspace.wrapMoeSharedGateUp = TornadoWorkspaces.floats(p * shared);
+        workspace.wrapMoeSharedHidden = TornadoWorkspaces.floats(p * shared);
+        workspace.wrapMoeSharedQ8 = TornadoWorkspaces.bytes(p * shared);
+        workspace.wrapMoeSharedScales = TornadoWorkspaces.floats(p * shared / 32);
+        workspace.wrapMoeSharedOut = TornadoWorkspaces.floats(p * dim);
     }
 
     @Override
@@ -85,9 +190,114 @@ public final class DeepSeek2State extends State {
         int layers = config.numberOfLayers();
         fields.keyCache = new FloatTensor[layers];
         fields.valueCache = new FloatTensor[layers];
+        boolean device = Boolean.parseBoolean(System.getProperty("use.tornadovm", "false"));
         for (int l = 0; l < layers; l++) {
-            fields.keyCache[l] = allocateKeyValue(config.contextLength(), config.keyWidth());
+            // The host cache only where the host runs; a device session keeps its own below.
+            fields.keyCache[l] =
+                    allocateKeyValue(device ? 1 : config.contextLength(), config.keyWidth());
+        }
+        if (device) {
+            allocateDeviceWorkspace(config);
         }
         return fields;
+    }
+
+    // ── Pipeline stages ───────────────────────────────────────────────────────
+
+    private static final ThreadLocal<int[]> LAYER_RANGE = new ThreadLocal<>();
+
+    /**
+     * Builds a state whose device cache holds only layers {@code [first, end)}: one stage of a model
+     * split across devices. The layers address it through {@link #cacheLayerOffset}.
+     */
+    public static <T> T withLayerRange(int first, int end, Supplier<T> build) {
+        int[] previous = LAYER_RANGE.get();
+        LAYER_RANGE.set(new int[] {first, end});
+        try {
+            return build.get();
+        } finally {
+            LAYER_RANGE.set(previous);
+        }
+    }
+
+    /** The first layer this state's device cache holds. */
+    public int cacheFirstLayer;
+
+    /** Where layer {@code l}'s rows start in the device cache: {@code [layer][position][keyWidth]}. */
+    public int cacheLayerOffset(int l) {
+        return (l - cacheFirstLayer) * cacheLayerStride;
+    }
+
+    private int cacheLayerStride;
+
+    // @formatter:off
+    /**
+     * The device arrays of the single-token plan.
+     *
+     * <p>The cache is one row of {@link DeepSeek2Configuration#keyWidth()} per position and layer —
+     * the normalized latent and the rotated key — and is the only key/value store: the value is the
+     * row's latent half. {@code wrapValueCache} is a placeholder the shared graphs can name.
+     */
+    // @formatter:on
+    private void allocateDeviceWorkspace(DeepSeek2Configuration config) {
+        int[] range = LAYER_RANGE.get();
+        int first = range == null ? 0 : range[0];
+        int end = range == null ? config.numberOfLayers() : range[1];
+        this.cacheFirstLayer = first;
+        this.cacheLayerStride = config.contextLength() * config.keyWidth();
+        int dim = config.dim();
+
+        TornadoWorkspaces.activationQ8_0(workspace, dim);
+        workspace.wrapX = TornadoWorkspaces.floats(dim);
+        workspace.wrapXb = TornadoWorkspaces.floats(Math.max(dim, config.attentionOutputInputDim()));
+        workspace.wrapXb2 = TornadoWorkspaces.floats(dim);
+        int widest =
+                Math.max(
+                        Math.max(dim, config.hiddenDim()),
+                        Math.max(config.attentionOutputInputDim(), config.qLoraRank()));
+        workspace.wrapXbQuants = TornadoWorkspaces.ints(widest / 4);
+        workspace.wrapXbScales = TornadoWorkspaces.floats(widest / 32);
+        workspace.wrapXbSums = TornadoWorkspaces.ints(widest / 32);
+        workspace.wrapHb = TornadoWorkspaces.floats(config.hiddenDim());
+        workspace.wrapLogits = TornadoWorkspaces.floats(config.vocabularySize());
+
+        workspace.wrapQueryLatent = TornadoWorkspaces.floats(config.qLoraRank());
+        workspace.wrapQ = TornadoWorkspaces.floats(config.queryDim());
+        workspace.wrapCompressedKv = TornadoWorkspaces.floats(config.compressedKeyValueDim());
+        workspace.wrapAbsorbedQuery = TornadoWorkspaces.floats(config.absorbedQueryDim());
+        workspace.wrapLatentOut = TornadoWorkspaces.floats(config.latentOutputDim());
+        workspace.wrapAtt =
+                TornadoWorkspaces.floats(config.numberOfHeads() * config.contextLength());
+        workspace.wrapAttSplit =
+                TornadoWorkspaces.floats(
+                        config.numberOfHeads()
+                                * DeepSeek2Configuration.DECODE_ATTENTION_SPLITS
+                                * (config.kvLoraRank() + 2));
+        int cacheElements = Math.max(1, (end - first) * cacheLayerStride);
+        if (storageOptions().usesFp16KeyValueCache()) {
+            workspace.wrapKeyCacheFP16 = TornadoWorkspaces.halfFloats(cacheElements);
+            workspace.wrapValueCacheFP16 = TornadoWorkspaces.halfFloats(1);
+        } else {
+            workspace.wrapKeyCache = TornadoWorkspaces.floats(cacheElements);
+            workspace.wrapValueCache = TornadoWorkspaces.floats(1);
+        }
+
+        int experts = config.expertCount();
+        int used = config.expertsUsed();
+        workspace.wrapRouterLogits = TornadoWorkspaces.floats(Math.max(1, experts));
+        workspace.wrapSelectedExperts = TornadoWorkspaces.ints(Math.max(1, used));
+        workspace.wrapRoutingWeights = TornadoWorkspaces.floats(Math.max(1, used));
+        workspace.wrapSharedGate = TornadoWorkspaces.floats(1);
+        int moeHidden = Math.max(32, config.routedHiddenDim() + config.sharedHiddenDim());
+        workspace.wrapMoeHidden = TornadoWorkspaces.floats(moeHidden);
+        workspace.wrapMoeHiddenQuants = TornadoWorkspaces.ints(moeHidden / 4);
+        workspace.wrapMoeHiddenQScales = TornadoWorkspaces.floats(moeHidden / 32);
+        workspace.wrapMoeHiddenQSums = TornadoWorkspaces.ints(moeHidden / 32);
+
+        // [0] = position, [1] = table-local KV slot.
+        workspace.positionHolder = TornadoWorkspaces.ints(2);
+        workspace.temp = TornadoWorkspaces.floats(1 + ((dim + localSize - 1) / localSize));
+        workspace.tempFFN = TornadoWorkspaces.floats(1 + ((dim + localSize - 1) / localSize));
+        workspace.tempLogits = TornadoWorkspaces.floats(1 + ((dim + localSize - 1) / localSize));
     }
 }

@@ -122,6 +122,9 @@ public record DeepSeek2Configuration(
         return (float) (1.0 / Math.sqrt(queryHeadDim()));
     }
 
+    /** Slices the decode attention cuts each head's window into. */
+    public static final int DECODE_ATTENTION_SPLITS = 16;
+
     public boolean isDenseLayer(int l) {
         return l < leadingDenseBlocks;
     }

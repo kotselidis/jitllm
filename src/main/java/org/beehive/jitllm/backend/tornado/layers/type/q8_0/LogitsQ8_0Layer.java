@@ -151,12 +151,13 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
 
     /**
      * A Q8_0 output projection read with the packed-integer kernel. Only where the family's own
-     * layers already run their Q8_0 projections that way (qwen35), so a family whose layers read
-     * Q8_0 in floating point keeps logits computed the same way as before.
+     * layers already run their Q8_0 projections that way (qwen35, deepseek2), so a family whose
+     * layers read Q8_0 in floating point keeps logits computed the same way as before.
      */
     private boolean packedQ8_0Vocabulary(TornadoWeights weights) {
         return weights.wclsByteArray.dataType() == org.beehive.jitllm.runtime.tensor.DataType.Q8_0
-                && state instanceof org.beehive.jitllm.inference.state.Qwen35State;
+                && (state instanceof org.beehive.jitllm.inference.state.Qwen35State
+                        || state instanceof org.beehive.jitllm.inference.state.DeepSeek2State);
     }
 
     /** The vocabulary projection task, chosen by what the output projection actually holds. */

@@ -87,6 +87,17 @@ public final class Fp16KeyValueSupport {
                 // checked above) the single-workgroup FP16 kernel does.
                 return Optional.empty();
             }
+            case "deepseek2" -> {
+                // The latent cache is written and read in FP16 by the decode and batched-prefill
+                // kernels, which are CUDA's: they reduce with warp shuffles.
+                if (!BackendId.CUDA.equals(c.backend())) {
+                    return Optional.of("the deepseek2 layers are written for the CUDA backend");
+                }
+                if (c.weights() != DataType.Q8_0) {
+                    return Optional.of("the deepseek2 " + c.weights() + " layers keep an FP32 cache");
+                }
+                return Optional.empty();
+            }
             case "gemma4" -> {
                 // The quantized layers' FP16 writers and grouped attention, in both of this
                 // family's modes: the shuffle-reduced grouped kernel on CUDA, its shared-memory

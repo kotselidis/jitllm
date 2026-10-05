@@ -22,15 +22,18 @@ import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchDecode
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillQ8DeviceActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
+import org.beehive.jitllm.inference.state.DeepSeek2State;
 import org.beehive.jitllm.inference.state.Gemma4State;
 import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.state.Qwen35State;
 import org.beehive.jitllm.inference.state.State;
+import org.beehive.jitllm.inference.weights.tornado.DeepSeek2TornadoWeights;
 import org.beehive.jitllm.inference.weights.tornado.Gemma4TornadoWeights;
 import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
 import org.beehive.jitllm.inference.weights.tornado.Qwen35TornadoWeights;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.model.ModelType;
+import org.beehive.jitllm.model.deepseek2.DeepSeek2Configuration;
 import org.beehive.jitllm.model.gemma4.Gemma4Configuration;
 import org.beehive.jitllm.model.llama.LlamaConfiguration;
 import org.beehive.jitllm.model.qwen35.Qwen35Configuration;
@@ -128,9 +131,13 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                 state instanceof Qwen35State && model.weights() instanceof Qwen35TornadoWeights;
         boolean gemma4 =
                 state instanceof Gemma4State && model.weights() instanceof Gemma4TornadoWeights;
-        if (!llama && !qwen35 && !gemma4) {
+        boolean deepseek2 =
+                state instanceof DeepSeek2State
+                        && model.weights() instanceof DeepSeek2TornadoWeights;
+        if (!llama && !qwen35 && !gemma4 && !deepseek2) {
             throw new UnsupportedOperationException(
-                    "the pipeline split supports Llama-family, qwen35 and gemma4 models only, not "
+                    "the pipeline split supports Llama-family, qwen35, gemma4 and deepseek2 models"
+                            + " only, not "
                             + model.getModelType());
         }
         DataType weightType = model.weights().dataType();
@@ -191,7 +198,10 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                             ? stageState(state, (LlamaConfiguration) config, end - first, batchSize)
                             : gemma4
                                     ? gemma4StageState(state, config, first, end, batchSize)
-                                    : qwen35StageState(state, config, batchSize);
+                                    : deepseek2
+                                            ? deepSeek2StageState(
+                                                    state, config, first, end, batchSize)
+                                            : qwen35StageState(state, config, batchSize);
             if (s == 0) {
                 // The token loop writes the embedding row into the session's state.
                 stageState.workspace.embeddingX = state.workspace.embeddingX;
@@ -222,6 +232,30 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                         (LlamaConfiguration) config,
                         schedulerType,
                         weightType,
+                        graphs,
+                        scheduler);
+            } else if (deepseek2 && batched) {
+                addDeepSeek2BatchedStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        (DeepSeek2State) stageState,
+                        (DeepSeek2TornadoWeights) model.weights(),
+                        (DeepSeek2Configuration) config,
+                        schedulerType,
+                        graphs,
+                        scheduler);
+            } else if (deepseek2) {
+                addDeepSeek2SingleTokenStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        (DeepSeek2State) stageState,
+                        (DeepSeek2TornadoWeights) model.weights(),
+                        (DeepSeek2Configuration) config,
+                        schedulerType,
                         graphs,
                         scheduler);
             } else if (gemma4 && batched) {
@@ -520,6 +554,175 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
         var layers =
                 new org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersGrouped(
                         "qwen35FFN",
+                        stageState,
+                        weights,
+                        config,
+                        schedulerType,
+                        "activationUpdate",
+                        first,
+                        end);
+        graphs.addAll(layers.getFFNLayerImmutableTaskGraphs());
+        layers.updateGridScheduler(scheduler);
+        if (s < last) {
+            TaskGraph send = new TaskGraph("handoff_out");
+            transport.addTokenSend(
+                    send,
+                    s,
+                    layers.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new LogitsQ8_0Layer(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            layers.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+    }
+
+    /** A state for one deepseek2 stage, its device cache holding the stage's layers only. */
+    private static DeepSeek2State deepSeek2StageState(
+            State session,
+            org.beehive.jitllm.model.Configuration config,
+            int first,
+            int end,
+            int prefillBatchSize) {
+        DeepSeek2State stage =
+                State.withStorageOptions(
+                        session.storageOptions(),
+                        () ->
+                                State.withPrefillBatchSize(
+                                        prefillBatchSize,
+                                        () ->
+                                                DeepSeek2State.withLayerRange(
+                                                        first,
+                                                        end,
+                                                        () -> new DeepSeek2State(config, 1))));
+        stage.resolveExecutionPolicy(session.executionPolicy());
+        return stage;
+    }
+
+    /**
+     * One deepseek2 stage of the batched plan, prefill and decode programs in one plan. The decode
+     * layers take the cache and the weights from the stage's prefill graphs.
+     */
+    private void addDeepSeek2BatchedStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            DeepSeek2State stageState,
+            DeepSeek2TornadoWeights weights,
+            DeepSeek2Configuration config,
+            SchedulerType schedulerType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0) {
+            var activation = new BatchPrefillQ8DeviceActivation(stageState, config, batchSize);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+            state.workspace.embeddingQ8Batch = stageState.workspace.embeddingQ8Batch;
+        } else {
+            TaskGraph receive = new TaskGraph("prefillActivation");
+            transport.addReceive(receive, s, stageState.workspace.wrapXBatch, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var prefill =
+                new org.beehive.jitllm.backend.tornado.layers.DeepSeek2BatchPrefillLayers(
+                        stageState, weights, config, batchSize, first, end);
+        graphs.addAll(prefill.getLayerImmutableTaskGraphs());
+        prefill.updateGridScheduler(scheduler);
+        if (s == 0) {
+            prefillProjections = prefill.describeProjections();
+        }
+        String lastPrefill = prefill.getLastLayerTaskGraphID();
+        if (s < last) {
+            TaskGraph send = new TaskGraph("prefillHandoff");
+            transport.addSend(send, s, lastPrefill, stageState.workspace.wrapXBatch, s + 1);
+            graphs.add(send.snapshot());
+        }
+        prefillGraphs[s] = IntStream.range(0, graphs.size()).toArray();
+
+        int decodeStart = graphs.size();
+        if (s == 0) {
+            var activation = new Activation("decodeActivation", stageState, weights, config);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("decodeActivation");
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var decode =
+                new org.beehive.jitllm.backend.tornado.layers.DeepSeek2Layers(
+                        "deepseek2",
+                        stageState,
+                        weights,
+                        config,
+                        schedulerType,
+                        "decodeActivation",
+                        first,
+                        end,
+                        prefill);
+        graphs.addAll(decode.getFFNLayerImmutableTaskGraphs());
+        decode.updateGridScheduler(scheduler);
+        if (s < last) {
+            TaskGraph send = new TaskGraph("decodeHandoff");
+            transport.addTokenSend(
+                    send,
+                    s,
+                    decode.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new LogitsQ8_0Layer(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            decode.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+        decodeGraphs[s] = IntStream.range(decodeStart, graphs.size()).toArray();
+    }
+
+    /**
+     * One deepseek2 stage of the single-token plan: [embedding | receive], its layers, [send |
+     * logits].
+     */
+    private void addDeepSeek2SingleTokenStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            DeepSeek2State stageState,
+            DeepSeek2TornadoWeights weights,
+            DeepSeek2Configuration config,
+            SchedulerType schedulerType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0) {
+            var activation = new Activation("activationUpdate", stageState, weights, config);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("activationUpdate");
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var layers =
+                new org.beehive.jitllm.backend.tornado.layers.DeepSeek2Layers(
+                        "deepseek2",
                         stageState,
                         weights,
                         config,
