@@ -325,6 +325,13 @@ grouped by expert and every expert's rows run as one int8 tensor-core GEMM over 
 the two A10s, with `--batch-prefill-size 256 --cuda-graphs -Djitllm.deviceSample=true`, a
 680-token prompt is prefilled at about 2,300 tokens/s and the answer generated at 90–100 tokens/s.
 
+Gemma 4 models without per-layer embeddings (`gemma4`, e.g. gemma-4-31B-it, 32.6 GB in Q8_0 and
+17.3 GB in Q4_0) split the same way. With `--batch-prefill-size 256` the prompt's projections run
+as int8 tensor-core GEMMs straight on the Q8_0 or Q4_0 weights, and its attention on the tensor
+cores over the half-precision key/value cache. On the two A10s, with `--cuda-graphs`, a 680-token
+prompt is prefilled at about 750 tokens/s (Q8_0) and 700 tokens/s (Q4_0), and the answer
+generated at about 13 and 19.5 tokens/s.
+
 -----------
 
 ## Run configuration at startup
