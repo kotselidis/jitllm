@@ -380,7 +380,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     mode,
                     partial,
                     splits,
-                    state.workspace.batchStartPosHolder);
+                    state.workspace.batchStartPosHolder,
+                    n,
+                    0);
             if (splits > 1) {
                 // The splits' partial sums added in order, then stored or added to the residual.
                 splitReduceTasks.put(qualified + "_reduce", batchSize * n);
@@ -2298,7 +2300,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 Qwen35Int8Kernels.EPILOGUE_STORE,
                 ws.wrapMoeSharedGateUp,
                 1,
-                ws.batchStartPosHolder);
+                ws.batchStartPosHolder,
+                shared,
+                0);
         layer.task(
                 "moe_shared_up",
                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -2314,7 +2318,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 Qwen35Int8Kernels.EPILOGUE_SWIGLU,
                 ws.wrapMoeSharedHidden,
                 1,
-                ws.batchStartPosHolder);
+                ws.batchStartPosHolder,
+                shared,
+                0);
         layer.task(
                 "moe_shared_q8",
                 Qwen35Int8Kernels::quantizeActivationsQ8Warp,
@@ -2338,7 +2344,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 Qwen35Int8Kernels.EPILOGUE_STORE,
                 ws.wrapMoeSharedOut,
                 1,
-                ws.batchStartPosHolder);
+                ws.batchStartPosHolder,
+                dim,
+                0);
         layer.task(
                 "moe_combine",
                 Qwen35MoeBatchKernels::combine,

@@ -134,7 +134,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 out,
                                 1,
-                                rowsOf(m))
+                                rowsOf(m),
+                                n,
+                                0)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, out, q8, dA);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("q8g.q", lanes(m * k, 256));
@@ -218,7 +220,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 stored,
                                 1,
-                                rowsOf(m))
+                                rowsOf(m),
+                                n,
+                                0)
                         .task(
                                 "r",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -234,7 +238,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 Qwen35Int8Kernels.EPILOGUE_RESIDUAL,
                                 residual,
                                 1,
-                                rowsOf(m))
+                                rowsOf(m),
+                                n,
+                                0)
                         .task(
                                 "g",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -250,7 +256,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 Qwen35Int8Kernels.EPILOGUE_SWIGLU,
                                 swiglu,
                                 1,
-                                rowsOf(m))
+                                rowsOf(m),
+                                n,
+                                0)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, stored, residual, swiglu);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("q8e.q", lanes(m * k, 256));
@@ -390,7 +398,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 whole,
                                 1,
-                                rowsOf(m))
+                                rowsOf(m),
+                                n,
+                                0)
                         .task(
                                 "s",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -406,7 +416,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 partial,
                                 splits,
-                                rowsOf(m))
+                                rowsOf(m),
+                                n,
+                                0)
                         .task(
                                 "sr",
                                 Qwen35Int8Kernels::reduceSplitsQ8_0,
@@ -433,7 +445,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 Qwen35Int8Kernels.EPILOGUE_RESIDUAL,
                                 partial,
                                 splits,
-                                rowsOf(m))
+                                rowsOf(m),
+                                n,
+                                0)
                         .task(
                                 "rr",
                                 Qwen35Int8Kernels::reduceSplitsQ8_0,

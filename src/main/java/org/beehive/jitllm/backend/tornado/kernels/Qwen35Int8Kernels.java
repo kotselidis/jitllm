@@ -651,7 +651,9 @@ public final class Qwen35Int8Kernels {
      * <p>{@code epilogue}: {@link #EPILOGUE_STORE} writes {@code out}, {@link #EPILOGUE_RESIDUAL}
      * adds into it, {@link #EPILOGUE_SWIGLU} writes {@code out = silu(gate) * product} ({@code
      * gate} is not read otherwise). Only the first {@code rowsHolder[1]} rows are computed: a
-     * chunk's padding rows are left as they were. Requires M % 128 == 0, N % 128 == 0, K % 64 == 0.
+     * chunk's padding rows are left as they were. Row {@code r} of the result is written at {@code
+     * out[r * ldo + colOffset]}, so several GEMMs can fill one packed row; {@code ldo} is {@code n}
+     * and {@code colOffset} zero for a plain one, and a split GEMM must be plain. Requires M % 128 == 0, N % 128 == 0, K % 64 == 0.
      * Worker: WorkerGrid2D((M/128) * 512, N/128 * splits), local {@link #Q8_GEMM_THREADS}.
      */
     // @formatter:on
@@ -668,7 +670,9 @@ public final class Qwen35Int8Kernels {
             int epilogue,
             FloatArray partial,
             int splits,
-            IntArray rowsHolder) {
+            IntArray rowsHolder,
+            int ldo,
+            int colOffset) {
         int tid = ctx.localIdx;
         int warpId = tid >> 5;
         int lane = tid & 31;
@@ -829,7 +833,11 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        r0 * n + col,
+                        r0,
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 0],
                         epilogue,
                         splits);
@@ -838,7 +846,11 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        r0 * n + col + 1,
+                        r0,
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 1],
                         epilogue,
                         splits);
@@ -847,7 +859,11 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        (r0 + 8) * n + col,
+                        (r0 + 8),
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 2],
                         epilogue,
                         splits);
@@ -856,7 +872,11 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        (r0 + 8) * n + col + 1,
+                        (r0 + 8),
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 3],
                         epilogue,
                         splits);
@@ -865,7 +885,11 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        (r0 + 16) * n + col,
+                        (r0 + 16),
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 4],
                         epilogue,
                         splits);
@@ -874,7 +898,11 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        (r0 + 16) * n + col + 1,
+                        (r0 + 16),
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 5],
                         epilogue,
                         splits);
@@ -883,7 +911,11 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        (r0 + 24) * n + col,
+                        (r0 + 24),
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 6],
                         epilogue,
                         splits);
@@ -892,7 +924,302 @@ public final class Qwen35Int8Kernels {
                         gate,
                         partial,
                         splitBase,
-                        (r0 + 24) * n + col + 1,
+                        (r0 + 24),
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 7],
+                        epilogue,
+                        splits);
+            }
+        }
+    }
+
+    // @formatter:off
+    /**
+     * {@link #gemmInt8Q8_0} over Q4_0 weights where they lie: the same tiles, rounds, fragments and
+     * epilogues, each 16-bit pair of staged quants decoded from a pair of packed bytes — the low
+     * nibbles for the first sixteen quants of a block, the high for the rest — and recentred to
+     * signed bytes, so the products are exact. Same requirements and worker.
+     */
+    // @formatter:on
+    public static void gemmInt8Q4_0(
+            KernelContext ctx,
+            ByteArray a8,
+            FloatArray dA,
+            ByteArray w,
+            FloatArray out,
+            FloatArray gate,
+            int m,
+            int n,
+            int k,
+            int epilogue,
+            FloatArray partial,
+            int splits,
+            IntArray rowsHolder,
+            int ldo,
+            int colOffset) {
+        int tid = ctx.localIdx;
+        int warpId = tid >> 5;
+        int lane = tid & 31;
+        int warpM = warpId / Q8_WARPS_N;
+        int warpN = warpId - warpM * Q8_WARPS_N;
+        int blockRow = I8_BM * ctx.groupIdx;
+        int colTile = ctx.groupIdy / splits;
+        int split = ctx.groupIdy - colTile * splits;
+        int blockCol = I8_BN * colTile;
+        // A chunk's real rows are rowsHolder[1]; a block wholly past them has nothing to do.
+        if (blockRow < m && blockRow < rowsHolder.get(1) && blockCol < n) {
+            int kBlocks = k / Q8_BLOCK;
+            int rounds = k / I8_BK;
+            // This block's share of the rounds; with one split, all of them.
+            int roundsPerSplit = (rounds + splits - 1) / splits;
+            int roundBegin = split * roundsPerSplit;
+            int roundEnd = Math.min(rounds, roundBegin + roundsPerSplit);
+
+            int[] aTile = ctx.allocateIntLocalArray(2 * 2 * TILE_WORDS);
+            int[] bTile = ctx.allocateIntLocalArray(2 * 2 * TILE_WORDS);
+            float[] sA = ctx.allocateFloatLocalArray(2 * 2 * I8_BM);
+            float[] sW = ctx.allocateFloatLocalArray(2 * 2 * I8_BN);
+
+            float[] acc = new float[32];
+            for (int i = 0; i < 32; i++) {
+                acc[i] = 0.0f;
+            }
+            int rowInWarp = lane >> 2;
+            int colInWarp = (lane & 3) << 1;
+            int r0 = blockRow + warpM * I8_WM + rowInWarp;
+            int c0 = blockCol + warpN * Q8_WN + colInWarp;
+
+            int rowBytes = kBlocks * Q4_0_BLOCK_BYTES;
+            // This lane's four weight words of a round: lanes of a warp on consecutive kRows of
+            // two column pairs, so each load is part of a run of 32 contiguous bytes. Word 0 is
+            // column pair colPair of the round's first block, word 1 the pair 32 further on (64
+            // columns, 512 words), words 2 and 3 the same in the second block.
+            int kRow = tid & 15;
+            int colPair = (tid >> 4) & 31;
+            int slot = ((colPair >> 2) << 6) + (kRow << 2) + (colPair & 3);
+            // A Q4_0 block's quants k and k + 1 sit in the low nibbles of bytes k, k + 1 for k < 16
+            // and in the high nibbles of bytes k - 16, k - 15 above.
+            int nibbleShift = (kRow >> 3) << 2;
+            int laneOffset = (blockCol + (colPair << 1)) * rowBytes + 2 + ((kRow & 7) << 1);
+            int halfStride = 64 * rowBytes;
+            if (roundBegin < roundEnd) {
+                stageActivationsQ8_0(
+                        ctx, aTile, sA, a8, dA, roundBegin, 0, blockRow, k, kBlocks, tid);
+                stageWeightsQ4_0(
+                        bTile,
+                        sW,
+                        w,
+                        roundBegin,
+                        0,
+                        blockCol,
+                        rowBytes,
+                        laneOffset,
+                        halfStride,
+                        slot,
+                        tid,
+                        nibbleShift);
+                ctx.asyncCopyCommit();
+                ctx.asyncCopyWaitGroup(0);
+                ctx.localBarrier();
+            }
+
+            for (int round = roundBegin; round < roundEnd; round++) {
+                int buf = (round - roundBegin) & 1;
+                int bufNext = 1 - buf;
+                boolean hasNext = round + 1 < roundEnd;
+                // The next round's weight words, loaded now and stored after this round's MMAs,
+                // so the loads are in flight while the tensor cores work.
+                int next = (round + 1) * 2 * Q4_0_BLOCK_BYTES + laneOffset;
+                int b1 = Q4_0_BLOCK_BYTES;
+                int l0 = 0, h0 = 0, l1 = 0, h1 = 0, l2 = 0, h2 = 0, l3 = 0, h3 = 0;
+                float scaleNext = 0.0f;
+                if (hasNext) {
+                    stageActivationsQ8_0(
+                            ctx, aTile, sA, a8, dA, round + 1, bufNext, blockRow, k, kBlocks, tid);
+                    ctx.asyncCopyCommit();
+                    l0 = q4Pair(w, next, nibbleShift);
+                    h0 = q4Pair(w, next + rowBytes, nibbleShift);
+                    l1 = q4Pair(w, next + halfStride, nibbleShift);
+                    h1 = q4Pair(w, next + halfStride + rowBytes, nibbleShift);
+                    l2 = q4Pair(w, next + b1, nibbleShift);
+                    h2 = q4Pair(w, next + b1 + rowBytes, nibbleShift);
+                    l3 = q4Pair(w, next + b1 + halfStride, nibbleShift);
+                    h3 = q4Pair(w, next + b1 + halfStride + rowBytes, nibbleShift);
+                    if (tid >= 256) {
+                        scaleNext =
+                                w.getHalfFloat(
+                                                (blockCol + (tid & 127)) * rowBytes
+                                                        + ((round + 1) * 2 + ((tid >> 7) & 1))
+                                                                * Q4_0_BLOCK_BYTES)
+                                        .getFloat32();
+                    }
+                }
+                int aBuf = buf * 2 * TILE_WORDS;
+                int sBuf = buf * 2 * I8_BM;
+                for (int b = 0; b < 2; b++) {
+                    int aOff = ((aBuf + b * TILE_WORDS) << 2) + warpM * 1024;
+                    byte[] a0 = ctx.mmaLoadAInt8(aTile, 32, aOff);
+                    byte[] a1 = ctx.mmaLoadAInt8(aTile, 32, aOff + 512);
+                    int sRow = sBuf + b * I8_BM + warpM * I8_WM + rowInWarp;
+                    float dA0 = sA[sRow];
+                    float dA1 = sA[sRow + 8];
+                    float dA2 = sA[sRow + 16];
+                    float dA3 = sA[sRow + 24];
+                    int bOff = ((aBuf + b * TILE_WORDS) << 2) + warpN * 1024;
+                    int sCol = sBuf + b * I8_BN + warpN * Q8_WN + colInWarp;
+                    // Two column steps at a time: their four MMAs issue before either's results
+                    // are scaled, so the scaling of one waits behind the other's MMAs rather than
+                    // stalling on its own.
+                    for (int jj = 0; jj < 4; jj += 2) {
+                        byte[] fb0 = ctx.mmaLoadBInt8(bTile, 32, bOff + jj * 256);
+                        byte[] fb1 = ctx.mmaLoadBInt8(bTile, 32, bOff + jj * 256 + 256);
+                        int[] d0 = ctx.mmaInt8(a0, fb0, ctx.mmaFragmentInt(0), MMAShape.M16N8K32);
+                        int[] d1 = ctx.mmaInt8(a1, fb0, ctx.mmaFragmentInt(0), MMAShape.M16N8K32);
+                        int[] e0 = ctx.mmaInt8(a0, fb1, ctx.mmaFragmentInt(0), MMAShape.M16N8K32);
+                        int[] e1 = ctx.mmaInt8(a1, fb1, ctx.mmaFragmentInt(0), MMAShape.M16N8K32);
+                        float dW0 = sW[sCol + (jj << 3)];
+                        float dW1 = sW[sCol + (jj << 3) + 1];
+                        float eW0 = sW[sCol + (jj << 3) + 8];
+                        float eW1 = sW[sCol + (jj << 3) + 9];
+                        acc[jj * 8 + 0] += (float) d0[0] * dA0 * dW0;
+                        acc[jj * 8 + 1] += (float) d0[1] * dA0 * dW1;
+                        acc[jj * 8 + 2] += (float) d0[2] * dA1 * dW0;
+                        acc[jj * 8 + 3] += (float) d0[3] * dA1 * dW1;
+                        acc[jj * 8 + 4] += (float) d1[0] * dA2 * dW0;
+                        acc[jj * 8 + 5] += (float) d1[1] * dA2 * dW1;
+                        acc[jj * 8 + 6] += (float) d1[2] * dA3 * dW0;
+                        acc[jj * 8 + 7] += (float) d1[3] * dA3 * dW1;
+                        acc[jj * 8 + 8] += (float) e0[0] * dA0 * eW0;
+                        acc[jj * 8 + 9] += (float) e0[1] * dA0 * eW1;
+                        acc[jj * 8 + 10] += (float) e0[2] * dA1 * eW0;
+                        acc[jj * 8 + 11] += (float) e0[3] * dA1 * eW1;
+                        acc[jj * 8 + 12] += (float) e1[0] * dA2 * eW0;
+                        acc[jj * 8 + 13] += (float) e1[1] * dA2 * eW1;
+                        acc[jj * 8 + 14] += (float) e1[2] * dA3 * eW0;
+                        acc[jj * 8 + 15] += (float) e1[3] * dA3 * eW1;
+                    }
+                }
+                if (hasNext) {
+                    int dst = bufNext * 2 * TILE_WORDS + slot;
+                    bTile[dst] = l0 | (h0 << 16);
+                    bTile[dst + 512] = l1 | (h1 << 16);
+                    bTile[dst + TILE_WORDS] = l2 | (h2 << 16);
+                    bTile[dst + TILE_WORDS + 512] = l3 | (h3 << 16);
+                    if (tid >= 256) {
+                        sW[bufNext * 2 * I8_BN + tid - 256] = scaleNext;
+                    }
+                    ctx.asyncCopyWaitGroup(0);
+                }
+                ctx.localBarrier();
+            }
+
+            int splitBase = split * m * n;
+            for (int j = 0; j < 4; j++) {
+                int col = c0 + (j << 3);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        r0,
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 0],
+                        epilogue,
+                        splits);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        r0,
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 1],
+                        epilogue,
+                        splits);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        (r0 + 8),
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 2],
+                        epilogue,
+                        splits);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        (r0 + 8),
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 3],
+                        epilogue,
+                        splits);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        (r0 + 16),
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 4],
+                        epilogue,
+                        splits);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        (r0 + 16),
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 5],
+                        epilogue,
+                        splits);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        (r0 + 24),
+                        col,
+                        n,
+                        ldo,
+                        colOffset,
+                        acc[j * 8 + 6],
+                        epilogue,
+                        splits);
+                storeQ8_0(
+                        out,
+                        gate,
+                        partial,
+                        splitBase,
+                        (r0 + 24),
+                        col + 1,
+                        n,
+                        ldo,
+                        colOffset,
                         acc[j * 8 + 7],
                         epilogue,
                         splits);
@@ -901,20 +1228,26 @@ public final class Qwen35Int8Kernels {
     }
 
     /**
-     * One output of {@link #gemmInt8Q8_0}, by its epilogue; with several splits, this split's
-     * partial sum instead, for {@link #reduceSplitsQ8_0} to finish.
+     * One output of {@link #gemmInt8Q8_0}, by its epilogue, at row {@code row * ldo + colOffset +
+     * col} of {@code out}; with several splits, this split's partial sum instead, for {@link
+     * #reduceSplitsQ8_0} to finish, which is always laid out {@code n} wide.
      */
     private static void storeQ8_0(
             FloatArray out,
             FloatArray gate,
             FloatArray partial,
             int splitBase,
-            int index,
+            int row,
+            int col,
+            int n,
+            int ldo,
+            int colOffset,
             float product,
             int epilogue,
             int splits) {
+        int index = row * ldo + colOffset + col;
         if (splits > 1) {
-            partial.set(splitBase + index, product);
+            partial.set(splitBase + row * n + col, product);
         } else if (epilogue == EPILOGUE_RESIDUAL) {
             out.set(index, out.get(index) + product);
         } else if (epilogue == EPILOGUE_SWIGLU) {
@@ -1024,6 +1357,49 @@ public final class Qwen35Int8Kernels {
                             .getFloat32();
         }
     }
+
+    /** {@link #stageWeightsQ8_0} over Q4_0 blocks: each pair decoded by {@link #q4Pair}. */
+    private static void stageWeightsQ4_0(
+            int[] bTile,
+            float[] sW,
+            ByteArray w,
+            int round,
+            int buf,
+            int blockCol,
+            int rowBytes,
+            int laneOffset,
+            int halfStride,
+            int slot,
+            int tid,
+            int nibbleShift) {
+        int base = round * 2 * Q4_0_BLOCK_BYTES + laneOffset;
+        int dst = buf * 2 * TILE_WORDS + slot;
+        for (int s = 0; s < 4; s++) {
+            int offset = base + (s >> 1) * Q4_0_BLOCK_BYTES + (s & 1) * halfStride;
+            bTile[dst + (s >> 1) * TILE_WORDS + (s & 1) * 512] =
+                    q4Pair(w, offset, nibbleShift) | (q4Pair(w, offset + rowBytes, nibbleShift) << 16);
+        }
+        if (tid >= 256) {
+            sW[buf * 2 * I8_BN + tid - 256] =
+                    w.getHalfFloat(
+                                    (blockCol + (tid & 127)) * rowBytes
+                                            + (round * 2 + ((tid >> 7) & 1)) * Q4_0_BLOCK_BYTES)
+                            .getFloat32();
+        }
+    }
+
+    /**
+     * Two consecutive Q4_0 quants as the 16-bit pair of signed bytes the weight tile holds: the
+     * nibbles at {@code shift} of the two bytes at {@code offset}, recentred by eight.
+     */
+    private static int q4Pair(ByteArray w, int offset, int shift) {
+        int v = halfBits(w, offset);
+        int q0 = ((v >> shift) & 0xF) - 8;
+        int q1 = ((v >> (8 + shift)) & 0xF) - 8;
+        return (q0 & 0xFF) | ((q1 & 0xFF) << 8);
+    }
+
+    private static final int Q4_0_BLOCK_BYTES = 18;
 
     /**
      * Issues round {@code round}'s copies into buffer {@code buf} (not committed) and stages its

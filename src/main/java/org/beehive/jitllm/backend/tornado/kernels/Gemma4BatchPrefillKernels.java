@@ -1244,4 +1244,53 @@ public final class Gemma4BatchPrefillKernels {
         int gid = context.globalIdx;
         x.set(gid, x.get(gid) * scaleTensor.get(0));
     }
+
+    // @formatter:off
+    /**
+     * Per-32-block int8 quantization of an FP16 chunk for the int8 GEMMs, a lane per element: the
+     * arithmetic of {@link Qwen35Int8Kernels#quantizeActivationsQ8Warp} on the widened halves. The
+     * 32 lanes of a block find its {@code amax} by a shuffle-max, each quantizes its own element,
+     * and lane zero writes the scale. Lanes at or past {@code total} read zero and store nothing.
+     * Worker: {@code total} lanes rounded up to the local size, local a multiple of 32.
+     */
+    // @formatter:on
+    public static void quantizeActivationsQ8WarpFP16(
+            KernelContext ctx, HalfFloatArray x, ByteArray q8, FloatArray scales, int total) {
+        int lane = ctx.globalIdx;
+        int sub = ctx.localIdx & 31;
+        float v0 = 0.0f;
+        if (lane < total) {
+            v0 = x.get(lane).getFloat32();
+        }
+        float amax = TornadoMath.abs(v0);
+        amax = TornadoMath.max(amax, ctx.simdShuffleDown(amax, 16));
+        amax = TornadoMath.max(amax, ctx.simdShuffleDown(amax, 8));
+        amax = TornadoMath.max(amax, ctx.simdShuffleDown(amax, 4));
+        amax = TornadoMath.max(amax, ctx.simdShuffleDown(amax, 2));
+        amax = TornadoMath.max(amax, ctx.simdShuffleDown(amax, 1));
+        amax = ctx.simdBroadcastFirst(amax);
+        float d = amax / 127.0f;
+        int qv = 0;
+        if (d > 0.0f) {
+            float v;
+            if (amax >= Qwen35Int8Kernels.RECIPROCAL_FINITE_AMAX) {
+                v = v0 * (127.0f / amax);
+            } else {
+                v = (v0 / amax) * 127.0f;
+            }
+            qv = (int) TornadoMath.floor(TornadoMath.abs(v) + 0.5f);
+            if (qv > 127) {
+                qv = 127;
+            }
+            if (v < 0.0f) {
+                qv = -qv;
+            }
+        }
+        if (lane < total) {
+            q8.set(lane, (byte) qv);
+            if (sub == 0) {
+                scales.set(lane >> 5, d);
+            }
+        }
+    }
 }

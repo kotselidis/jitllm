@@ -12,6 +12,8 @@ import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersBatchDecode;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.LlamaQ4_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.decode.LlamaQ4_0FFNLayersDecode;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.prefill.LlamaQ4_0LayersBatchPrefillNative;
+import org.beehive.jitllm.backend.tornado.layers.type.q8_0.Gemma4LogitsQ8_0Layer;
+import org.beehive.jitllm.backend.tornado.layers.type.q8_0.Gemma4Q8_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LlamaQ8_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LogitsQ8_0LayerDecode;
@@ -20,13 +22,16 @@ import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchDecode
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillQ8DeviceActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
+import org.beehive.jitllm.inference.state.Gemma4State;
 import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.state.Qwen35State;
 import org.beehive.jitllm.inference.state.State;
+import org.beehive.jitllm.inference.weights.tornado.Gemma4TornadoWeights;
 import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
 import org.beehive.jitllm.inference.weights.tornado.Qwen35TornadoWeights;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.model.ModelType;
+import org.beehive.jitllm.model.gemma4.Gemma4Configuration;
 import org.beehive.jitllm.model.llama.LlamaConfiguration;
 import org.beehive.jitllm.model.qwen35.Qwen35Configuration;
 import org.beehive.jitllm.runtime.metrics.MetricsSink;
@@ -121,9 +126,11 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                 state instanceof LlamaState && model.weights() instanceof LlamaTornadoWeights;
         boolean qwen35 =
                 state instanceof Qwen35State && model.weights() instanceof Qwen35TornadoWeights;
-        if (!llama && !qwen35) {
+        boolean gemma4 =
+                state instanceof Gemma4State && model.weights() instanceof Gemma4TornadoWeights;
+        if (!llama && !qwen35 && !gemma4) {
             throw new UnsupportedOperationException(
-                    "the pipeline split supports Llama-family and qwen35 models only, not "
+                    "the pipeline split supports Llama-family, qwen35 and gemma4 models only, not "
                             + model.getModelType());
         }
         DataType weightType = model.weights().dataType();
@@ -182,7 +189,9 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             State stageState =
                     llama
                             ? stageState(state, (LlamaConfiguration) config, end - first, batchSize)
-                            : qwen35StageState(state, config, batchSize);
+                            : gemma4
+                                    ? gemma4StageState(state, config, first, end, batchSize)
+                                    : qwen35StageState(state, config, batchSize);
             if (s == 0) {
                 // The token loop writes the embedding row into the session's state.
                 stageState.workspace.embeddingX = state.workspace.embeddingX;
@@ -213,6 +222,30 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                         (LlamaConfiguration) config,
                         schedulerType,
                         weightType,
+                        graphs,
+                        scheduler);
+            } else if (gemma4 && batched) {
+                addGemma4BatchedStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        (Gemma4State) stageState,
+                        (Gemma4TornadoWeights) model.weights(),
+                        (Gemma4Configuration) config,
+                        schedulerType,
+                        graphs,
+                        scheduler);
+            } else if (gemma4) {
+                addGemma4SingleTokenStage(
+                        s,
+                        last,
+                        first,
+                        end,
+                        (Gemma4State) stageState,
+                        (Gemma4TornadoWeights) model.weights(),
+                        (Gemma4Configuration) config,
+                        schedulerType,
                         graphs,
                         scheduler);
             } else if (batched) {
@@ -517,6 +550,194 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             graphs.add(logits.getImmutableTaskGraph());
             logits.updateGridScheduler(scheduler);
         }
+    }
+
+    /**
+     * A state for one gemma4 stage. Its key/value cache holds the stage's own layers only, at
+     * offsets the layers read from the state.
+     */
+    private static Gemma4State gemma4StageState(
+            State session,
+            org.beehive.jitllm.model.Configuration config,
+            int first,
+            int end,
+            int prefillBatchSize) {
+        Gemma4State stage =
+                State.withStorageOptions(
+                        session.storageOptions(),
+                        () ->
+                                State.withPrefillBatchSize(
+                                        prefillBatchSize,
+                                        () ->
+                                                Gemma4State.withLayerRange(
+                                                        first,
+                                                        end,
+                                                        () ->
+                                                                new Gemma4State(
+                                                                        (Gemma4Configuration)
+                                                                                config,
+                                                                        1))));
+        stage.resolveExecutionPolicy(session.executionPolicy());
+        return stage;
+    }
+
+    /**
+     * One gemma4 stage of the single-token plan: [embedding | receive], its layers, [send |
+     * logits].
+     */
+    private void addGemma4SingleTokenStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            Gemma4State stageState,
+            Gemma4TornadoWeights weights,
+            Gemma4Configuration config,
+            SchedulerType schedulerType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0) {
+            var activation = new Activation("activationUpdate", stageState, weights, config);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("activationUpdate");
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var layers =
+                new Gemma4Q8_0FFNLayers(
+                        "gemma4FFN",
+                        stageState,
+                        weights,
+                        config,
+                        schedulerType,
+                        false,
+                        first,
+                        end,
+                        s == 0 ? null : "activationUpdate");
+        graphs.addAll(layers.getFFNLayerImmutableTaskGraphs());
+        layers.updateGridScheduler(scheduler);
+        if (s < last) {
+            TaskGraph send = new TaskGraph("handoff_out");
+            transport.addTokenSend(
+                    send,
+                    s,
+                    layers.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new Gemma4LogitsQ8_0Layer(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            layers.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+    }
+
+    /**
+     * One gemma4 stage of the batched plan, prefill and decode programs in one plan. A later
+     * stage's decode layers take the key/value cache from the stage's last prefill layer.
+     */
+    private void addGemma4BatchedStage(
+            int s,
+            int last,
+            int first,
+            int end,
+            Gemma4State stageState,
+            Gemma4TornadoWeights weights,
+            Gemma4Configuration config,
+            SchedulerType schedulerType,
+            List<ImmutableTaskGraph> graphs,
+            GridScheduler scheduler) {
+        if (s == 0 && weights.getTokenEmbeddingTable().dataType() == DataType.Q8_0) {
+            // The host copies each token's raw row and the device decodes the chunk.
+            var activation = new BatchPrefillQ8DeviceActivation(stageState, config, batchSize);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+            state.workspace.embeddingQ8Batch = stageState.workspace.embeddingQ8Batch;
+        } else if (s == 0) {
+            // The host decodes the chunk into the session's batch carrier; share it.
+            stageState.workspace.wrapXBatch = state.workspace.wrapXBatch;
+            var activation =
+                    new org.beehive.jitllm.backend.tornado.plan.components.activation
+                            .BatchPrefillActivation(stageState, config, batchSize, true);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("prefillActivation");
+            transport.addReceive(receive, s, stageState.workspace.wrapXBatch, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var prefill =
+                new org.beehive.jitllm.backend.tornado.layers.Gemma4BatchPrefillLayers(
+                        stageState, weights, config, batchSize, first, end);
+        graphs.addAll(prefill.getLayerImmutableTaskGraphs());
+        prefill.updateGridScheduler(scheduler);
+        if (s == 0) {
+            prefillProjections = prefill.describeProjections();
+        }
+        String lastPrefill = prefill.getLastLayerTaskGraphID();
+        if (s < last) {
+            TaskGraph send = new TaskGraph("prefillHandoff");
+            transport.addSend(send, s, lastPrefill, stageState.workspace.wrapXBatch, s + 1);
+            graphs.add(send.snapshot());
+        }
+        prefillGraphs[s] = IntStream.range(0, graphs.size()).toArray();
+
+        int decodeStart = graphs.size();
+        if (s == 0) {
+            var activation =
+                    new org.beehive.jitllm.backend.tornado.plan.components.activation
+                            .Gemma4BatchDecodeActivation(stageState, weights, config, lastPrefill);
+            graphs.add(activation.getImmutableTaskGraph());
+            activation.updateGridScheduler(scheduler);
+        } else {
+            TaskGraph receive = new TaskGraph("decodeActivation");
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            graphs.add(receive.snapshot());
+        }
+        var decode =
+                new Gemma4Q8_0FFNLayers(
+                        "gemma4FFN",
+                        stageState,
+                        weights,
+                        config,
+                        schedulerType,
+                        true,
+                        first,
+                        end,
+                        s == 0 ? null : "decodeActivation");
+        graphs.addAll(decode.getFFNLayerImmutableTaskGraphs());
+        decode.updateGridScheduler(scheduler);
+        if (s < last) {
+            TaskGraph send = new TaskGraph("decodeHandoff");
+            transport.addTokenSend(
+                    send,
+                    s,
+                    decode.getLastFFNLayerTaskGraphID(),
+                    stageState.workspace.wrapX,
+                    s + 1);
+            graphs.add(send.snapshot());
+        } else {
+            var logits =
+                    new Gemma4LogitsQ8_0Layer(
+                            "logits",
+                            stageState,
+                            weights,
+                            config,
+                            decode.getLastFFNLayerTaskGraphID(),
+                            schedulerType);
+            graphs.add(logits.getImmutableTaskGraph());
+            logits.updateGridScheduler(scheduler);
+        }
+        decodeGraphs[s] = IntStream.range(decodeStart, graphs.size()).toArray();
     }
 
     // @formatter:off
