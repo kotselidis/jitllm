@@ -319,6 +319,12 @@ Qwen3.8-27B Q8_0 (29 GB) splits the same way with `--batch-prefill-size 256` alo
 projections run as int8 tensor-core GEMMs straight on the Q8_0 weights, the arithmetic of
 llama.cpp's MMQ, at about 750 prompt tokens/s on the two A10s.
 
+Mixture-of-experts models of this family (`qwen35moe`, e.g. Qwen3.6-35B-A3B, 37 GB in Q8_0) split
+the same way. Each token is routed to its top experts on the GPU; a prefill chunk's tokens are
+grouped by expert and every expert's rows run as one int8 tensor-core GEMM over its weights. On
+the two A10s, with `--batch-prefill-size 256 --cuda-graphs -Djitllm.deviceSample=true`, a
+680-token prompt is prefilled at about 2,300 tokens/s and the answer generated at 90–100 tokens/s.
+
 -----------
 
 ## Run configuration at startup
