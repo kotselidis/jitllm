@@ -23,11 +23,57 @@ public final class NcclTransport implements PipelineTransport {
     private static final long STEP_TIMEOUT_SECONDS =
             Long.getLong("jitllm.pipeline.stepTimeoutSeconds", 0);
 
+    // @formatter:off
+    /**
+     * Whether a generated token's hidden state goes through host memory rather than NCCL. On by
+     * default ({@code -Djitllm.pipeline.tokenTransport=nccl} turns it off).
+     *
+     * <p>A prefill chunk gains from NCCL: the stages run on their own threads and overlap
+     * successive chunks. A token gains nothing from that — the next stage can only start once the
+     * previous one is done — and pays for it in every step: waking the stage threads, their
+     * barrier, and a send that waits on the proxy, about a millisecond and a half a token on two
+     * A10s. Through host memory the token's few kilobytes cost two copies on the calling thread.
+     */
+    // @formatter:on
+    private static final boolean TOKENS_THROUGH_HOST =
+            !"nccl".equals(System.getProperty("jitllm.pipeline.tokenTransport", "host"));
+
     private final NcclCommunicator communicator;
+    private final HostTransport tokens;
     private NcclPlanGroup group;
 
     public NcclTransport(TornadoDevice[] devices) {
         this.communicator = NcclCommunicator.create(devices);
+        this.tokens = TOKENS_THROUGH_HOST ? new HostTransport(devices.length) : null;
+    }
+
+    @Override
+    public void addTokenSend(TaskGraph graph, int stage, String producer, FloatArray x, int toStage) {
+        if (tokens != null) {
+            tokens.addSend(graph, stage, producer, x, toStage);
+        } else {
+            addSend(graph, stage, producer, x, toStage);
+        }
+    }
+
+    @Override
+    public void addTokenReceive(TaskGraph graph, int stage, FloatArray x, int fromStage) {
+        if (tokens != null) {
+            tokens.addReceive(graph, stage, x, fromStage);
+        } else {
+            addReceive(graph, stage, x, fromStage);
+        }
+    }
+
+    @Override
+    public void executeToken(TornadoExecutionPlan[] plans, int[][] graphs, boolean cudaGraphs) {
+        if (tokens == null) {
+            PipelineTransport.super.executeToken(plans, graphs, cudaGraphs);
+        } else if (graphs == null) {
+            tokens.execute(plans);
+        } else {
+            tokens.execute(plans, graphs, cudaGraphs);
+        }
     }
 
     @Override
@@ -43,7 +89,10 @@ public final class NcclTransport implements PipelineTransport {
 
     @Override
     public void updateGridScheduler(int stage, GridScheduler scheduler) {
-        // Library tasks only: nothing to schedule.
+        // NCCL hand-offs are library tasks; the host ones for tokens have copy kernels.
+        if (tokens != null) {
+            tokens.updateGridScheduler(stage, scheduler);
+        }
     }
 
     private NcclPlanGroup group(TornadoExecutionPlan[] plans) {

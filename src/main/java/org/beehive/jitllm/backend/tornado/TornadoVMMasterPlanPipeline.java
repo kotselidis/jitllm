@@ -8,7 +8,6 @@ import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGra
 import org.beehive.jitllm.backend.tornado.layers.Activation;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchDecodeActivation;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchPrefillLayers;
-import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersBatchDecode;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.LlamaQ4_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.type.q4_0.decode.LlamaQ4_0FFNLayersDecode;
@@ -249,6 +248,14 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                             .withGridScheduler(scheduler);
             if (CUDA_GRAPHS && !batched) {
                 plan.withCUDAGraph();
+            } else if (CUDA_GRAPHS) {
+                // The decode program only: a graph's capture is decided when its bytecode is
+                // compiled, so it is enabled here, graph by graph, before precompilation. The
+                // prefill program keeps launching its kernels directly.
+                for (int graph : decodeGraphs[s]) {
+                    plan.withGraph(graph).withCUDAGraph();
+                }
+                plan.withAllGraphs();
             }
             plan.withStagedTransfers();
             plan.withPreCompilation();
@@ -280,7 +287,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             activation.updateGridScheduler(scheduler);
         } else {
             TaskGraph receive = new TaskGraph("handoff_in");
-            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
             graphs.add(receive.snapshot());
         }
 
@@ -295,7 +302,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
 
         if (s < last) {
             TaskGraph send = new TaskGraph("handoff_out");
-            transport.addSend(
+            transport.addTokenSend(
                     send,
                     s,
                     layers.getLastFFNLayerTaskGraphID(),
@@ -374,7 +381,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             // Only the hidden state: the first decode layer takes this stage's cache straight
             // from its last prefill layer.
             TaskGraph receive = new TaskGraph("decodeActivation");
-            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
             graphs.add(receive.snapshot());
         }
         var decode =
@@ -384,7 +391,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
         decode.updateGridScheduler(scheduler);
         if (s < last) {
             TaskGraph send = new TaskGraph("decodeHandoff");
-            transport.addSend(
+            transport.addTokenSend(
                     send,
                     s,
                     decode.getLastFFNLayerTaskGraphID(),
@@ -473,11 +480,12 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             activation.updateGridScheduler(scheduler);
         } else {
             TaskGraph receive = new TaskGraph("activationUpdate");
-            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
             graphs.add(receive.snapshot());
         }
+        // Several layers to a graph: each graph is a launch and a synchronization per token.
         var layers =
-                new Qwen35FFNLayers(
+                new org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersGrouped(
                         "qwen35FFN",
                         stageState,
                         weights,
@@ -490,7 +498,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
         layers.updateGridScheduler(scheduler);
         if (s < last) {
             TaskGraph send = new TaskGraph("handoff_out");
-            transport.addSend(
+            transport.addTokenSend(
                     send,
                     s,
                     layers.getLastFFNLayerTaskGraphID(),
@@ -579,7 +587,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             activation.updateGridScheduler(scheduler);
         } else {
             TaskGraph receive = new TaskGraph("decodeActivation");
-            transport.addReceive(receive, s, stageState.workspace.wrapX, s - 1);
+            transport.addTokenReceive(receive, s, stageState.workspace.wrapX, s - 1);
             graphs.add(receive.snapshot());
         }
         var decode =
@@ -589,7 +597,7 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
         decode.updateGridScheduler(scheduler);
         if (s < last) {
             TaskGraph send = new TaskGraph("decodeHandoff");
-            transport.addSend(
+            transport.addTokenSend(
                     send,
                     s,
                     decode.getLastFFNLayerTaskGraphID(),
@@ -741,9 +749,9 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
         }
         if (batched) {
             transport.execute(plans, prefillGraphs, CUDA_GRAPHS);
-            transport.execute(plans, decodeGraphs, CUDA_GRAPHS);
+            transport.executeToken(plans, decodeGraphs, CUDA_GRAPHS);
         } else {
-            transport.execute(plans);
+            transport.executeToken(plans, null, CUDA_GRAPHS);
         }
     }
 
@@ -845,10 +853,14 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             workspace.wrapLogits.clear();
         }
         if (batched) {
-            transport.execute(plans, decodeGraphs, CUDA_GRAPHS);
+            transport.executeToken(plans, decodeGraphs, CUDA_GRAPHS);
         } else {
-            transport.execute(plans);
+            transport.executeToken(plans, null, CUDA_GRAPHS);
         }
+        // A token sampled on the device is in the last stage's state; the loop reads the
+        // session's.
+        state.workspace.sampledToken.set(
+                0, stages[stages.length - 1].state().workspace.sampledToken.get(0));
         if (DEBUG) {
             FloatArray logits = stages[stages.length - 1].state().workspace.wrapLogits;
             double sum = 0;

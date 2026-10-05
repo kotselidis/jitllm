@@ -85,9 +85,33 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
         // tokens. A representation with no kernel is refused here rather than converted.
         addVocabularyProjection(logits, weights, config);
 
-        logits.transferToHost(DataTransferMode.EVERY_EXECUTION, state.workspace.wrapLogits);
+        if (deviceSample()) {
+            // Greedy argmax on the device: only the token id crosses to the host, not the
+            // vocabulary row, and the host scans nothing.
+            logits.transferToDevice(DataTransferMode.FIRST_EXECUTION, state.workspace.sampledToken);
+            logits.task(
+                    "argmax_sample",
+                    TransformerComputeKernels::argmaxLogits,
+                    context,
+                    state.workspace.wrapLogits,
+                    state.workspace.sampledToken,
+                    config.vocabularySize(),
+                    SAMPLE_LOCAL);
+            logits.transferToHost(DataTransferMode.EVERY_EXECUTION, state.workspace.sampledToken);
+        } else {
+            logits.transferToHost(DataTransferMode.EVERY_EXECUTION, state.workspace.wrapLogits);
+        }
         configureAdditionalPersists(logits);
         return logits;
+    }
+
+    /** Local size of the single-workgroup on-device argmax. */
+    private static final int SAMPLE_LOCAL = 256;
+
+    /** Whether this session samples greedily on the device. Asked at each use, not cached. */
+    private boolean deviceSample() {
+        return state.executionPolicy().samplingResidency()
+                == org.beehive.jitllm.runtime.policy.ExecutionPolicy.SamplingResidency.DEVICE;
     }
 
     // @formatter:off
@@ -287,6 +311,11 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
         tornadoForwardScheduler.addWorkerGrid("logits.vocab_proj", vocabWorker);
         tornadoForwardScheduler.addWorkerGrid("logits.rms_reduce", rmsReduceWorker(logitsRMS));
         tornadoForwardScheduler.addWorkerGrid("logits.mapContextLogits", logitsRMS);
+        if (deviceSample()) {
+            var argmaxWorker = new WorkerGrid1D(SAMPLE_LOCAL);
+            argmaxWorker.setLocalWork(SAMPLE_LOCAL, 1, 1);
+            tornadoForwardScheduler.addWorkerGrid("logits.argmax_sample", argmaxWorker);
+        }
         if (weights instanceof TornadoWeights tornadoWeights && packedVocabulary(tornadoWeights)) {
             tornadoForwardScheduler.addWorkerGrid(
                     "logits.vocab_quantize",

@@ -34,6 +34,33 @@ public interface PipelineTransport extends AutoCloseable {
      */
     void addReceive(TaskGraph graph, int stage, FloatArray x, int fromStage);
 
+    /**
+     * {@link #addSend} for a generated token's hidden state, which a transport may hand over
+     * differently from a prefill chunk's.
+     */
+    default void addTokenSend(
+            TaskGraph graph, int stage, String producer, FloatArray x, int toStage) {
+        addSend(graph, stage, producer, x, toStage);
+    }
+
+    /** {@link #addReceive} for a generated token's hidden state. */
+    default void addTokenReceive(TaskGraph graph, int stage, FloatArray x, int fromStage) {
+        addReceive(graph, stage, x, fromStage);
+    }
+
+    /**
+     * Runs one generated token's step: every stage's plan whole when {@code graphs} is null,
+     * otherwise graphs {@code graphs[s]} of stage {@code s}, through whichever hand-off {@link
+     * #addTokenSend} built.
+     */
+    default void executeToken(TornadoExecutionPlan[] plans, int[][] graphs, boolean cudaGraphs) {
+        if (graphs == null) {
+            execute(plans);
+        } else {
+            execute(plans, graphs, cudaGraphs);
+        }
+    }
+
     /** Adds the worker grids of the hand-off tasks this transport added to stage {@code stage}. */
     void updateGridScheduler(int stage, GridScheduler scheduler);
 

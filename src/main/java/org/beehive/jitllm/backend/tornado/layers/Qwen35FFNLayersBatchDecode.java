@@ -66,24 +66,16 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
     }
 
     private static int requireGroupStart(int firstLayer) {
-        if (firstLayer % LAYERS_PER_GRAPH != 0) {
-            throw new IllegalArgumentException(
-                    "a qwen35 decode stage must start on a multiple of "
-                            + LAYERS_PER_GRAPH
-                            + " layers, not at layer "
-                            + firstLayer);
-        }
         return firstLayer;
     }
 
     /**
-     * Adjacent layers to a graph.
-     *
-     * <p>Four: decode submissions fall to a quarter without building one graph for the whole trunk.
-     * Not a tuning knob and not user-settable — the grouping is a property of this family's plan,
-     * and changing it is an experiment with its own measurement.
+     * Adjacent layers to a graph: the whole stage by default, as for the single-token stages
+     * ({@link Qwen35FFNLayersGrouped#LAYERS_PER_GRAPH}). Every graph is a launch and a stream
+     * synchronization per token, which is most of the time between kernels for a model whose layers
+     * are as short as a mixture of experts' are.
      */
-    private static final int LAYERS_PER_GRAPH = 4;
+    private static final int LAYERS_PER_GRAPH = Qwen35FFNLayersGrouped.LAYERS_PER_GRAPH;
 
     /** How many layers this family puts in one decode graph. Read by the topology tests. */
     protected int layersPerGraph() {
@@ -117,7 +109,8 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
     /** The graph holding {@code layerIndex}: named for the first layer in it. */
     @Override
     protected String layerGraphName(int layerIndex) {
-        return "layer_" + (layerIndex - layerIndex % LAYERS_PER_GRAPH);
+        int offset = layerIndex - firstLayer;
+        return "layer_" + (firstLayer + offset - offset % LAYERS_PER_GRAPH);
     }
 
     // @formatter:off
@@ -131,7 +124,7 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
     // @formatter:on
     @Override
     protected String layerTaskPrefix(int layerIndex) {
-        int slot = layerIndex % LAYERS_PER_GRAPH;
+        int slot = (layerIndex - firstLayer) % LAYERS_PER_GRAPH;
         return slot == 0 ? "" : "l" + slot + "_";
     }
 
@@ -175,6 +168,18 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
                 state.workspace.wrapSsmK,
                 state.workspace.wrapSsmV,
                 state.workspace.wrapSsmOut);
+        if (config.isMixtureOfExperts()) {
+            layer.transferToDevice(
+                    DataTransferMode.FIRST_EXECUTION,
+                    state.workspace.wrapRouterLogits,
+                    state.workspace.wrapSelectedExperts,
+                    state.workspace.wrapRoutingWeights,
+                    state.workspace.wrapSharedGate,
+                    state.workspace.wrapMoeHidden,
+                    state.workspace.wrapMoeHiddenQuants,
+                    state.workspace.wrapMoeHiddenQScales,
+                    state.workspace.wrapMoeHiddenQSums);
+        }
         // What prefill left behind: the caches, the table that addresses them, and the recurrence.
         String source = cacheSource();
         layer.consumeFromDevice(source, keyStore(), valueStore());
