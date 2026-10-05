@@ -195,4 +195,56 @@ public final class TransformerComputeKernelsQ8_0DP4A {
             hb.set(rowId, silu * upSum);
         }
     }
+
+    /**
+     * {@code hb[row] = gelu(w1[row]·x) * (w3[row]·x)}, both projections against the same quantized
+     * activation. GELU is applied to the gate reduced across every warp, never per warp.
+     */
+    public static void fusedFFNGateUpGeGLUQ8_0DP4A(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            FloatArray hb,
+            ByteArray w1,
+            ByteArray w3,
+            int n,
+            int d,
+            int localWorkGroupSize) {
+        int rowId = context.groupIdx;
+        if (rowId >= d) {
+            return;
+        }
+        int localId = context.localIdx;
+        int warpCount = localWorkGroupSize / 32;
+        // Gate in the first warpCount entries, up in the second.
+        float[] warpSums = context.allocateFloatLocalArray(warpCount * 2);
+
+        float gate = rowPartial(context, xQuants, xScales, w1, n, rowId, localWorkGroupSize);
+        float up = rowPartial(context, xQuants, xScales, w3, n, rowId, localWorkGroupSize);
+        gate += context.simdShuffleDown(gate, 16);
+        gate += context.simdShuffleDown(gate, 8);
+        gate += context.simdShuffleDown(gate, 4);
+        gate += context.simdShuffleDown(gate, 2);
+        gate += context.simdShuffleDown(gate, 1);
+        up += context.simdShuffleDown(up, 16);
+        up += context.simdShuffleDown(up, 8);
+        up += context.simdShuffleDown(up, 4);
+        up += context.simdShuffleDown(up, 2);
+        up += context.simdShuffleDown(up, 1);
+        if ((localId & 31) == 0) {
+            warpSums[localId >> 5] = gate;
+            warpSums[warpCount + (localId >> 5)] = up;
+        }
+        context.localBarrier();
+
+        if (localId == 0) {
+            float gateSum = 0.0f;
+            float upSum = 0.0f;
+            for (int warp = 0; warp < warpCount; warp++) {
+                gateSum += warpSums[warp];
+                upSum += warpSums[warpCount + warp];
+            }
+            hb.set(rowId, TransformerComputeKernelsLayered.geluActivation(gateSum) * upSum);
+        }
+    }
 }
