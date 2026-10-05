@@ -153,15 +153,85 @@ public final class Qwen35Forward {
         return state.nextnLogits;
     }
 
-    /** The dense SwiGLU feed-forward both layer kinds share, from {@code xb} into {@code xb2}. */
+    /** The feed-forward both layer kinds share, from {@code xb} into {@code xb2}. */
     private static void feedForward(
             Qwen35Configuration config, Qwen35StandardWeights weights, Qwen35State state, int l) {
+        if (config.isMixtureOfExperts()) {
+            mixtureOfExperts(config, weights, state, l);
+            return;
+        }
         final int dim = config.dim();
         final int hidden = config.hiddenDim();
         CpuOperations.matVec(weights.ffnGate[l], state.xb, state.hb, hidden, dim);
         CpuOperations.matVec(weights.ffnUp[l], state.xb, state.hb2, hidden, dim);
         CpuOperations.swiGLU(state.hb, state.hb2);
         CpuOperations.matVec(weights.ffnDown[l], state.hb, state.xb2, dim, hidden);
+    }
+
+    // @formatter:off
+    /**
+     * The mixture-of-experts feed-forward of {@code qwen35moe}, from {@code xb} into {@code xb2}.
+     *
+     * <p>A softmax over every expert's score, the top {@code used} kept and their weights
+     * renormalized to sum to one; each selected expert's SwiGLU output added in weighted, in
+     * descending weight order; then the shared expert's, scaled by the sigmoid of its gate. The
+     * same arithmetic as llama.cpp's {@code build_moe_ffn} with a softmax gate and {@code norm_w},
+     * plus its shared-expert branch.
+     */
+    // @formatter:on
+    private static void mixtureOfExperts(
+            Qwen35Configuration config, Qwen35StandardWeights weights, Qwen35State state, int l) {
+        final int dim = config.dim();
+        var experts = config.experts();
+        var tensors = weights.experts();
+
+        CpuOperations.moeRouter(
+                state.xb,
+                tensors.router()[l],
+                state.expertScores,
+                state.expertIds,
+                state.expertWeights,
+                experts.count(),
+                experts.used(),
+                dim);
+        float total = 0f;
+        for (float weight : state.expertWeights) {
+            total += weight;
+        }
+        for (int k = 0; k < experts.used(); k++) {
+            state.expertWeights[k] /= total;
+        }
+
+        state.xb2.fillInPlace(0, dim, 0f);
+        for (int k = 0; k < experts.used(); k++) {
+            CpuOperations.expertFeedForward(
+                    state.xb,
+                    state.expertIds[k],
+                    tensors.gateExperts()[l],
+                    tensors.upExperts()[l],
+                    tensors.downExperts()[l],
+                    state.expertHidden,
+                    state.expertHiddenUp,
+                    state.expertOut,
+                    experts.hiddenDim(),
+                    dim);
+            CpuOperations.weightedAccumulate(
+                    state.xb2, state.expertOut, state.expertWeights[k], dim);
+        }
+
+        if (experts.sharedHiddenDim() > 0) {
+            int shared = experts.sharedHiddenDim();
+            CpuOperations.matVec(
+                    tensors.sharedGate()[l], state.xb, state.expertHidden, shared, dim);
+            CpuOperations.matVec(
+                    tensors.sharedUp()[l], state.xb, state.expertHiddenUp, shared, dim);
+            CpuOperations.swiGLU(state.expertHidden, state.expertHiddenUp);
+            CpuOperations.matVec(
+                    tensors.sharedDown()[l], state.expertHidden, state.expertOut, dim, shared);
+            float gate = tensors.sharedGateInput()[l].dot(0, state.xb, 0, dim);
+            CpuOperations.weightedAccumulate(
+                    state.xb2, state.expertOut, CpuOperations.logistic(gate), dim);
+        }
     }
 
     // @formatter:off

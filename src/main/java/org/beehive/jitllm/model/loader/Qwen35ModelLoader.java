@@ -11,6 +11,7 @@ import org.beehive.jitllm.backend.tornado.tensor.TornadoTensorLoader;
 import org.beehive.jitllm.format.DataTypeMapping;
 import org.beehive.jitllm.format.GGMLTensorEntry;
 import org.beehive.jitllm.format.GGUF;
+import org.beehive.jitllm.inference.weights.Qwen35ExpertWeights;
 import org.beehive.jitllm.inference.weights.Weights;
 import org.beehive.jitllm.inference.weights.standard.Qwen35StandardWeights;
 import org.beehive.jitllm.inference.weights.tornado.Qwen35TornadoWeights;
@@ -18,6 +19,7 @@ import org.beehive.jitllm.model.format.ChatFormat.ChatTokens;
 import org.beehive.jitllm.model.format.Qwen35ChatFormat;
 import org.beehive.jitllm.model.qwen35.Qwen35;
 import org.beehive.jitllm.model.qwen35.Qwen35Configuration;
+import org.beehive.jitllm.model.qwen35.Qwen35Experts;
 import org.beehive.jitllm.runtime.diagnostics.DiagnosticCode;
 import org.beehive.jitllm.runtime.tensor.DataType;
 import org.beehive.jitllm.tensor.standard.ArrayFloatTensor;
@@ -70,40 +72,59 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
     // @formatter:off
     @Override
     protected Qwen35Configuration createConfiguration(Map<String, Object> metadata) {
-        int modelContextLength = (int) metadata.get("qwen35.context_length");
+        // qwen35 and qwen35moe name the same keys under their own architecture.
+        String p = metadata.get("general.architecture") + ".";
+        int modelContextLength = (int) metadata.get(p + "context_length");
         int finalContextLength = resolveContextLength(modelContextLength);
 
         // block_count counts the MTP blocks with the trunk; the trunk is what the forward pass
         // runs, so the two are separated here rather than at every use.
-        int blockCount = (int) metadata.get("qwen35.block_count");
+        int blockCount = (int) metadata.get(p + "block_count");
         int nextnLayers =
-                metadata.containsKey("qwen35.nextn_predict_layers")
-                        ? (int) metadata.get("qwen35.nextn_predict_layers")
+                metadata.containsKey(p + "nextn_predict_layers")
+                        ? (int) metadata.get(p + "nextn_predict_layers")
                         : 0;
+
+        // A mixture of experts states its experts in place of a dense feed-forward width.
+        Qwen35Experts experts =
+                metadata.containsKey(p + "expert_count")
+                        ? new Qwen35Experts(
+                                (int) metadata.get(p + "expert_count"),
+                                (int) metadata.get(p + "expert_used_count"),
+                                (int) metadata.get(p + "expert_feed_forward_length"),
+                                metadata.containsKey(p + "expert_shared_feed_forward_length")
+                                        ? (int)
+                                                metadata.get(
+                                                        p + "expert_shared_feed_forward_length")
+                                        : 0)
+                        : null;
 
         Qwen35Configuration config =
                 new Qwen35Configuration(
                         getModelQuantization(metadata),
-                        (int) metadata.get("qwen35.embedding_length"),
-                        (int) metadata.get("qwen35.feed_forward_length"),
+                        (int) metadata.get(p + "embedding_length"),
+                        experts != null
+                                ? experts.routedHiddenDim()
+                                : (int) metadata.get(p + "feed_forward_length"),
                         blockCount - nextnLayers,
                         nextnLayers,
-                        (int) metadata.get("qwen35.attention.head_count"),
-                        (int) metadata.get("qwen35.attention.head_count_kv"),
-                        (int) metadata.get("qwen35.attention.key_length"),
-                        (int) metadata.get("qwen35.attention.value_length"),
-                        (int) metadata.get("qwen35.full_attention_interval"),
-                        (int) metadata.get("qwen35.ssm.conv_kernel"),
-                        (int) metadata.get("qwen35.ssm.state_size"),
-                        (int) metadata.get("qwen35.ssm.group_count"),
-                        (int) metadata.get("qwen35.ssm.time_step_rank"),
-                        (int) metadata.get("qwen35.ssm.inner_size"),
-                        (int) metadata.get("qwen35.rope.dimension_count"),
+                        (int) metadata.get(p + "attention.head_count"),
+                        (int) metadata.get(p + "attention.head_count_kv"),
+                        (int) metadata.get(p + "attention.key_length"),
+                        (int) metadata.get(p + "attention.value_length"),
+                        (int) metadata.get(p + "full_attention_interval"),
+                        (int) metadata.get(p + "ssm.conv_kernel"),
+                        (int) metadata.get(p + "ssm.state_size"),
+                        (int) metadata.get(p + "ssm.group_count"),
+                        (int) metadata.get(p + "ssm.time_step_rank"),
+                        (int) metadata.get(p + "ssm.inner_size"),
+                        (int) metadata.get(p + "rope.dimension_count"),
                         vocabulary.size(),
                         modelContextLength,
                         finalContextLength,
-                        (float) metadata.get("qwen35.attention.layer_norm_rms_epsilon"),
-                        (float) metadata.get("qwen35.rope.freq_base"));
+                        (float) metadata.get(p + "attention.layer_norm_rms_epsilon"),
+                        (float) metadata.get(p + "rope.freq_base"),
+                        experts);
         validate(config);
         return config;
     }
@@ -263,12 +284,20 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         FloatTensor[] ffnNorm =
                 perBlock(
                         blocks, l -> tensorEntries.get("blk." + l + ".post_attention_norm.weight"));
+        // A dense feed-forward, or none: a mixture of experts carries its experts instead.
+        boolean moe = config.isMixtureOfExperts();
         FloatTensor[] ffnGate =
-                perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_gate.weight"));
+                moe
+                        ? new FloatTensor[blocks]
+                        : perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_gate.weight"));
         FloatTensor[] ffnDown =
-                perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_down.weight"));
+                moe
+                        ? new FloatTensor[blocks]
+                        : perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_down.weight"));
         FloatTensor[] ffnUp =
-                perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_up.weight"));
+                moe
+                        ? new FloatTensor[blocks]
+                        : perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_up.weight"));
 
         // Attention blocks: every trunk layer that does not recur, plus every MTP block.
         FloatTensor[] wq = new FloatTensor[blocks];
@@ -325,38 +354,70 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
             nextnSharedHeadNorm[l] = optional(tensorEntries, blk + "shared_head_norm.weight");
         }
 
-        return new Qwen35StandardWeights(
-                blocks,
-                ModelLoader.loadTensor(tokenEmbeddings),
-                attnNorm,
-                ffnNorm,
-                ffnGate,
-                ffnDown,
-                ffnUp,
-                ModelLoader.loadTensor(tensorEntries.get("output_norm.weight")),
-                ModelLoader.loadTensor(outputWeight),
-                new ArrayFloatTensor(ropeFreqs.first()),
-                new ArrayFloatTensor(ropeFreqs.second()),
-                wq,
-                wk,
-                wv,
-                wo,
-                attnQNorm,
-                attnKNorm,
-                ssmQkv,
-                ssmGate,
-                ssmConv1d,
-                ssmAlpha,
-                ssmBeta,
-                ssmDtBias,
-                ssmA,
-                ssmNorm,
-                ssmOut,
-                nextnENorm,
-                nextnHNorm,
-                nextnEhProj,
-                nextnSharedHeadNorm,
-                DataTypeMapping.sourceType(outputWeight.ggmlType()));
+        Qwen35StandardWeights standard =
+                new Qwen35StandardWeights(
+                        blocks,
+                        ModelLoader.loadTensor(tokenEmbeddings),
+                        attnNorm,
+                        ffnNorm,
+                        ffnGate,
+                        ffnDown,
+                        ffnUp,
+                        ModelLoader.loadTensor(tensorEntries.get("output_norm.weight")),
+                        ModelLoader.loadTensor(outputWeight),
+                        new ArrayFloatTensor(ropeFreqs.first()),
+                        new ArrayFloatTensor(ropeFreqs.second()),
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        attnQNorm,
+                        attnKNorm,
+                        ssmQkv,
+                        ssmGate,
+                        ssmConv1d,
+                        ssmAlpha,
+                        ssmBeta,
+                        ssmDtBias,
+                        ssmA,
+                        ssmNorm,
+                        ssmOut,
+                        nextnENorm,
+                        nextnHNorm,
+                        nextnEhProj,
+                        nextnSharedHeadNorm,
+                        DataTypeMapping.sourceType(outputWeight.ggmlType()));
+        if (moe) {
+            standard.attachExperts(
+                    new Qwen35ExpertWeights<>(
+                            perBlock(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_gate_inp.weight")),
+                            perBlock(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_gate_exps.weight")),
+                            perBlock(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_up_exps.weight")),
+                            perBlock(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_down_exps.weight")),
+                            perBlock(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_gate_shexp.weight")),
+                            perBlock(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_up_shexp.weight")),
+                            perBlock(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_down_shexp.weight")),
+                            perBlock(
+                                    blocks,
+                                    l ->
+                                            tensorEntries.get(
+                                                    "blk." + l + ".ffn_gate_inp_shexp.weight"))));
+        }
+        return standard;
     }
 
     // @formatter:on
@@ -449,9 +510,11 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
 
         for (int l = 0; l < blocks; l++) {
             String blk = "blk." + l + ".";
-            ffnGate[l] = deviceTensor(tensorEntries, blk + "ffn_gate.weight");
-            ffnDown[l] = deviceTensor(tensorEntries, blk + "ffn_down.weight");
-            ffnUp[l] = deviceTensor(tensorEntries, blk + "ffn_up.weight");
+            if (!config.isMixtureOfExperts()) {
+                ffnGate[l] = deviceTensor(tensorEntries, blk + "ffn_gate.weight");
+                ffnDown[l] = deviceTensor(tensorEntries, blk + "ffn_down.weight");
+                ffnUp[l] = deviceTensor(tensorEntries, blk + "ffn_up.weight");
+            }
             if (config.isRecurrentLayer(l)) {
                 ssmQkv[l] = deviceTensor(tensorEntries, blk + "attn_qkv.weight");
                 ssmGate[l] = deviceTensor(tensorEntries, blk + "attn_gate.weight");
@@ -476,34 +539,67 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
 
         DataType weightType = projectionType(tensorEntries, config);
 
-        return new Qwen35TornadoWeights(
-                blocks,
-                ModelLoader.loadTornadoTensorNative(tokenEmbeddings),
-                attnNorm,
-                ffnNorm,
-                ffnGate,
-                ffnDown,
-                ffnUp,
-                ModelLoader.loadTornadoTensorNative(tensorEntries.get("output_norm.weight")),
-                ModelLoader.loadTornadoTensorNative(outputWeight),
-                TornadoTensorLoader.fromFloats(ropeFreqs.first()),
-                TornadoTensorLoader.fromFloats(ropeFreqs.second()),
-                wq,
-                wk,
-                wv,
-                wo,
-                attnQNorm,
-                attnKNorm,
-                ssmQkv,
-                ssmGate,
-                ssmConv1d,
-                ssmAlpha,
-                ssmBeta,
-                ssmDtBias,
-                ssmA,
-                ssmNorm,
-                ssmOut,
-                weightType);
+        Qwen35TornadoWeights device =
+                new Qwen35TornadoWeights(
+                        blocks,
+                        ModelLoader.loadTornadoTensorNative(tokenEmbeddings),
+                        attnNorm,
+                        ffnNorm,
+                        ffnGate,
+                        ffnDown,
+                        ffnUp,
+                        ModelLoader.loadTornadoTensorNative(
+                                tensorEntries.get("output_norm.weight")),
+                        ModelLoader.loadTornadoTensorNative(outputWeight),
+                        TornadoTensorLoader.fromFloats(ropeFreqs.first()),
+                        TornadoTensorLoader.fromFloats(ropeFreqs.second()),
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        attnQNorm,
+                        attnKNorm,
+                        ssmQkv,
+                        ssmGate,
+                        ssmConv1d,
+                        ssmAlpha,
+                        ssmBeta,
+                        ssmDtBias,
+                        ssmA,
+                        ssmNorm,
+                        ssmOut,
+                        weightType);
+        if (config.isMixtureOfExperts()) {
+            device.attachExperts(
+                    new Qwen35ExpertWeights<>(
+                            perBlockDevice(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_gate_inp.weight")),
+                            perBlockDevice(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_gate_exps.weight")),
+                            perBlockDevice(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_up_exps.weight")),
+                            perBlockDevice(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_down_exps.weight")),
+                            perBlockDevice(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_gate_shexp.weight")),
+                            perBlockDevice(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_up_shexp.weight")),
+                            perBlockDevice(
+                                    blocks,
+                                    l -> tensorEntries.get("blk." + l + ".ffn_down_shexp.weight")),
+                            perBlockDevice(
+                                    blocks,
+                                    l ->
+                                            tensorEntries.get(
+                                                    "blk." + l + ".ffn_gate_inp_shexp.weight"))));
+        }
+        return device;
     }
 
     /** A device tensor, in the representation the file gave it. */
@@ -567,6 +663,14 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
                             : new String[] {
                                 "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up"
                             };
+            if (config.isMixtureOfExperts()) {
+                // The routed and shared experts are read by their own tasks, chosen by their own
+                // representation; the mixer projections are what the model reports.
+                kinds =
+                        config.isRecurrentLayer(l)
+                                ? new String[] {"attn_qkv", "attn_gate"}
+                                : new String[] {"attn_q", "attn_k", "attn_v", "attn_output"};
+            }
             for (String kind : kinds) {
                 String name = "blk." + l + "." + kind + ".weight";
                 GGMLTensorEntry entry = entries.get(name);

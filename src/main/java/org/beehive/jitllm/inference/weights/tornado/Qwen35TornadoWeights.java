@@ -1,6 +1,7 @@
 package org.beehive.jitllm.inference.weights.tornado;
 
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
+import org.beehive.jitllm.inference.weights.Qwen35ExpertWeights;
 import org.beehive.jitllm.inference.weights.Weights;
 import org.beehive.jitllm.runtime.tensor.DataType;
 
@@ -132,5 +133,26 @@ public final class Qwen35TornadoWeights extends TornadoWeights {
         this.ssmNorm = ssmNorm;
         this.ssmOut = ssmOut;
     }
+
     // @formatter:on
+
+    /**
+     * A {@code qwen35moe} model's expert tensors, or null for a dense model. Set once by the
+     * loader, right after construction, in place of the dense feed-forward arrays (which are then
+     * null at every block).
+     */
+    private Qwen35ExpertWeights<TornadoTensor> experts;
+
+    /** The expert tensors of a mixture-of-experts model; null for a dense one. */
+    public Qwen35ExpertWeights<TornadoTensor> experts() {
+        return experts;
+    }
+
+    /** Attaches the expert tensors, once. */
+    public void attachExperts(Qwen35ExpertWeights<TornadoTensor> experts) {
+        if (this.experts != null) {
+            throw new IllegalStateException("expert weights are already attached");
+        }
+        this.experts = experts;
+    }
 }

@@ -31,6 +31,9 @@ public class Qwen35 extends AbstractModel {
 
     private static final ArchitectureId ARCHITECTURE = ArchitectureId.of("qwen35");
 
+    /** The same stack with a mixture-of-experts feed-forward (Qwen3.6-35B-A3B). */
+    private static final ArchitectureId MOE_ARCHITECTURE = ArchitectureId.of("qwen35moe");
+
     /**
      * Whether to drive generation through the MTP draft head.
      *
@@ -186,6 +189,6 @@ public class Qwen35 extends AbstractModel {
 
     @Override
     public ArchitectureId architectureId() {
-        return ARCHITECTURE;
+        return configuration.isMixtureOfExperts() ? MOE_ARCHITECTURE : ARCHITECTURE;
     }
 }

@@ -7,6 +7,7 @@ import org.beehive.jitllm.backend.tornado.TensorCoreSupport;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35BatchKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35Int8Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35MMAKernels;
+import org.beehive.jitllm.backend.tornado.kernels.Qwen35MoeBatchKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_1;
@@ -378,7 +379,8 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     k,
                     mode,
                     partial,
-                    splits);
+                    splits,
+                    state.workspace.batchStartPosHolder);
             if (splits > 1) {
                 // The splits' partial sums added in order, then stored or added to the residual.
                 splitReduceTasks.put(qualified + "_reduce", batchSize * n);
@@ -390,7 +392,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         out,
                         batchSize * n,
                         splits,
-                        mode);
+                        mode,
+                        state.workspace.batchStartPosHolder,
+                        n);
             }
             return;
         }
@@ -1329,6 +1333,18 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 state.workspace.ffnScaleBatch,
                 require(weights.rms_ffn_weightLayered, layerIndex, "post_attention_norm"));
 
+        if (config.isMixtureOfExperts()) {
+            mixtureOfExpertsBatch(layer, layerIndex);
+            layer.persistOnDevice(
+                    state.workspace.wrapXBatch,
+                    keyStore(),
+                    valueStore(),
+                    state.workspace.wrapBlockTable,
+                    state.workspace.wrapConvState,
+                    state.workspace.wrapDeltaState);
+            return layer;
+        }
+
         TornadoTensor down = require(weights.w2Layered, layerIndex, "ffn_down");
         // Both representations this family's ffn_down comes in. The Q4_1 kernel below was written
         // and tested with the Q4_0 one, and then never reached: this condition asked for Q4_0 and
@@ -1892,28 +1908,50 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 config.dim(),
                 valueDim,
                 false);
-        matVecBatch(
-                layer,
-                layerIndex,
-                "ssm_beta_proj",
-                "ssm_beta",
-                require(weights.ssmBeta, layerIndex, "ssm_beta"),
-                state.workspace.wrapNormedBatch,
-                state.workspace.wrapSsmBetaBatch,
-                config.dim(),
-                valueHeads,
-                false);
-        matVecBatch(
-                layer,
-                layerIndex,
-                "ssm_alpha_proj",
-                "ssm_alpha",
-                require(weights.ssmAlpha, layerIndex, "ssm_alpha"),
-                state.workspace.wrapNormedBatch,
-                state.workspace.wrapSsmAlphaBatch,
-                config.dim(),
-                valueHeads,
-                false);
+        TornadoTensor ssmBeta = require(weights.ssmBeta, layerIndex, "ssm_beta");
+        TornadoTensor ssmAlpha = require(weights.ssmAlpha, layerIndex, "ssm_alpha");
+        if (ssmBeta.dataType() == DataType.Q8_0
+                && ssmAlpha.dataType() == DataType.Q8_0
+                && quantizedInput == state.workspace.wrapNormedBatch) {
+            // Both narrow projections in one launch, against the chunk the norm quantized.
+            alphaBetaFused.add("batchLayer_" + layerIndex + ".");
+            layer.task(
+                    "ssm_alpha_beta",
+                    Qwen35MoeBatchKernels::alphaBetaQ8_0,
+                    context,
+                    state.workspace.wrapQ8ActBatch,
+                    state.workspace.wrapQ8ActScales,
+                    ssmAlpha.asByteArray(),
+                    ssmBeta.asByteArray(),
+                    state.workspace.wrapSsmAlphaBatch,
+                    state.workspace.wrapSsmBetaBatch,
+                    state.workspace.batchStartPosHolder,
+                    config.dim(),
+                    valueHeads);
+        } else {
+            matVecBatch(
+                    layer,
+                    layerIndex,
+                    "ssm_beta_proj",
+                    "ssm_beta",
+                    ssmBeta,
+                    state.workspace.wrapNormedBatch,
+                    state.workspace.wrapSsmBetaBatch,
+                    config.dim(),
+                    valueHeads,
+                    false);
+            matVecBatch(
+                    layer,
+                    layerIndex,
+                    "ssm_alpha_proj",
+                    "ssm_alpha",
+                    ssmAlpha,
+                    state.workspace.wrapNormedBatch,
+                    state.workspace.wrapSsmAlphaBatch,
+                    config.dim(),
+                    valueHeads,
+                    false);
+        }
 
         layer.task(
                 "ssm_decay_beta",
@@ -2143,13 +2181,282 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
 
     // ── transfers ─────────────────────────────────────────────────────────────
 
+    // @formatter:off
+    /**
+     * The {@code qwen35moe} feed-forward of one layer over the chunk, from the normalized (and
+     * quantized) chunk into {@code wrapXBatch}: batched routing, the assignments grouped by expert,
+     * the grouped expert GEMMs, the shared expert as three ordinary int8 GEMMs over the chunk, and
+     * the weighted combine into the residual stream. See {@link Qwen35MoeBatchKernels}.
+     */
+    // @formatter:on
+    private void mixtureOfExpertsBatch(TaskGraph layer, int layerIndex) {
+        if (!int8Quantizes(config.dim())) {
+            throw new UnsupportedOperationException(
+                    "the qwen35moe batched prefill runs its experts on the int8 tensor cores, at"
+                            + " widths that are a multiple of 128; this width is "
+                            + batchSize);
+        }
+        var experts = config.experts();
+        var tensors = weights.experts();
+        var ws = state.workspace;
+        int dim = config.dim();
+        int hidden = experts.hiddenDim();
+        int shared = experts.sharedHiddenDim();
+        if (experts.count() > Qwen35MoeBatchKernels.GROUP_THREADS
+                || experts.count() % Qwen35MoeBatchKernels.ROUTER_TILE != 0
+                || batchSize % Qwen35MoeBatchKernels.ROUTER_TILE != 0) {
+            throw new UnsupportedOperationException(
+                    "the batched expert path needs at most 1024 experts, and experts and a chunk"
+                            + " width that are multiples of 64");
+        }
+        layer.task(
+                "moe_router",
+                Qwen35MoeBatchKernels::routerTiled,
+                context,
+                ws.wrapNormedBatch,
+                tensors.router()[layerIndex].asFloatArray(),
+                ws.wrapMoeLogitsBatch,
+                ws.batchStartPosHolder,
+                dim,
+                experts.count());
+        layer.task(
+                "moe_shared_gate_input",
+                Qwen35MoeBatchKernels::sharedGateBatch,
+                context,
+                ws.wrapNormedBatch,
+                tensors.sharedGateInput()[layerIndex].asFloatArray(),
+                ws.wrapMoeSharedGateBatch,
+                ws.batchStartPosHolder,
+                dim);
+        layer.task(
+                "moe_topk",
+                Qwen35MoeBatchKernels::routerTopKBatch,
+                context,
+                ws.wrapMoeLogitsBatch,
+                ws.wrapMoeIdsBatch,
+                ws.wrapMoeWeightsBatch,
+                ws.batchStartPosHolder,
+                experts.count(),
+                experts.used());
+        layer.task(
+                "moe_group",
+                Qwen35MoeBatchKernels::groupByExpert,
+                context,
+                ws.wrapMoeIdsBatch,
+                ws.batchStartPosHolder,
+                ws.wrapMoeSortedToken,
+                ws.wrapMoePosition,
+                ws.wrapMoeTiles,
+                experts.count(),
+                experts.used(),
+                batchSize);
+        layer.task(
+                "moe_gate_up",
+                Qwen35MoeBatchKernels::groupedGateUpQ8_0,
+                context,
+                ws.wrapQ8ActBatch,
+                ws.wrapQ8ActScales,
+                ws.wrapMoeSortedToken,
+                ws.wrapMoeTiles,
+                tensors.gateExperts()[layerIndex].asByteArray(),
+                tensors.upExperts()[layerIndex].asByteArray(),
+                ws.wrapMoeHiddenBatch,
+                dim,
+                hidden);
+        layer.task(
+                "moe_hidden_q8",
+                Qwen35Int8Kernels::quantizeActivationsQ8Warp,
+                context,
+                ws.wrapMoeHiddenBatch,
+                ws.wrapMoeHiddenQ8,
+                ws.wrapMoeHiddenScales,
+                hidden);
+        layer.task(
+                "moe_down",
+                Qwen35MoeBatchKernels::groupedDownQ8_0,
+                context,
+                ws.wrapMoeHiddenQ8,
+                ws.wrapMoeHiddenScales,
+                ws.wrapMoeTiles,
+                tensors.downExperts()[layerIndex].asByteArray(),
+                ws.wrapMoeOutBatch,
+                dim,
+                hidden);
+        // The shared expert, over every row of the chunk.
+        layer.task(
+                "moe_shared_gate",
+                Qwen35Int8Kernels::gemmInt8Q8_0,
+                context,
+                ws.wrapQ8ActBatch,
+                ws.wrapQ8ActScales,
+                tensors.sharedGate()[layerIndex].asByteArray(),
+                ws.wrapMoeSharedGateUp,
+                ws.wrapMoeSharedGateUp,
+                batchSize,
+                shared,
+                dim,
+                Qwen35Int8Kernels.EPILOGUE_STORE,
+                ws.wrapMoeSharedGateUp,
+                1,
+                ws.batchStartPosHolder);
+        layer.task(
+                "moe_shared_up",
+                Qwen35Int8Kernels::gemmInt8Q8_0,
+                context,
+                ws.wrapQ8ActBatch,
+                ws.wrapQ8ActScales,
+                tensors.sharedUp()[layerIndex].asByteArray(),
+                ws.wrapMoeSharedHidden,
+                ws.wrapMoeSharedGateUp,
+                batchSize,
+                shared,
+                dim,
+                Qwen35Int8Kernels.EPILOGUE_SWIGLU,
+                ws.wrapMoeSharedHidden,
+                1,
+                ws.batchStartPosHolder);
+        layer.task(
+                "moe_shared_q8",
+                Qwen35Int8Kernels::quantizeActivationsQ8Warp,
+                context,
+                ws.wrapMoeSharedHidden,
+                ws.wrapMoeSharedQ8,
+                ws.wrapMoeSharedScales,
+                shared);
+        layer.task(
+                "moe_shared_down",
+                Qwen35Int8Kernels::gemmInt8Q8_0,
+                context,
+                ws.wrapMoeSharedQ8,
+                ws.wrapMoeSharedScales,
+                tensors.sharedDown()[layerIndex].asByteArray(),
+                ws.wrapMoeSharedOut,
+                ws.wrapMoeSharedOut,
+                batchSize,
+                dim,
+                shared,
+                Qwen35Int8Kernels.EPILOGUE_STORE,
+                ws.wrapMoeSharedOut,
+                1,
+                ws.batchStartPosHolder);
+        layer.task(
+                "moe_combine",
+                Qwen35MoeBatchKernels::combine,
+                context,
+                ws.wrapMoeOutBatch,
+                ws.wrapMoePosition,
+                ws.wrapMoeWeightsBatch,
+                ws.wrapMoeSharedOut,
+                ws.wrapMoeSharedGateBatch,
+                ws.wrapXBatch,
+                ws.batchStartPosHolder,
+                dim,
+                experts.used());
+    }
+
+    /** Layers whose decay and beta projections run as one fused int8 launch, for its grid. */
+    private final java.util.Set<String> alphaBetaFused = new java.util.HashSet<>();
+
+    /** The chunk's MoE scratch, bound by every layer graph in turn. */
+    private Object[] moeBatchBuffers() {
+        var ws = state.workspace;
+        return new Object[] {
+            ws.wrapMoeLogitsBatch,
+            ws.wrapMoeIdsBatch,
+            ws.wrapMoeWeightsBatch,
+            ws.wrapMoeSharedGateBatch,
+            ws.wrapMoeSortedToken,
+            ws.wrapMoePosition,
+            ws.wrapMoeTiles,
+            ws.wrapMoeHiddenBatch,
+            ws.wrapMoeHiddenQ8,
+            ws.wrapMoeHiddenScales,
+            ws.wrapMoeOutBatch,
+            ws.wrapMoeSharedGateUp,
+            ws.wrapMoeSharedHidden,
+            ws.wrapMoeSharedQ8,
+            ws.wrapMoeSharedScales,
+            ws.wrapMoeSharedOut
+        };
+    }
+
+    /** Grids of the MoE tasks of one layer, whose tasks are prefixed {@code prefix}. */
+    private void moeGrids(GridScheduler scheduler, String prefix) {
+        var experts = config.experts();
+        int dim = config.dim();
+        int assignments = batchSize * experts.used();
+        int shared = experts.sharedHiddenDim();
+        int maxTiles = Qwen35MoeBatchKernels.maxTiles(assignments, experts.count());
+        WorkerGrid router =
+                new uk.ac.manchester.tornado.api.WorkerGrid2D(
+                        batchSize / Qwen35MoeBatchKernels.ROUTER_TILE * 256,
+                        experts.count() / Qwen35MoeBatchKernels.ROUTER_TILE);
+        router.setLocalWork(256, 1, 1);
+        scheduler.addWorkerGrid(prefix + "moe_router", router);
+        scheduler.addWorkerGrid(
+                prefix + "moe_shared_gate_input",
+                WorkerGridFactory.genericWorker(batchSize * 32, 128));
+        scheduler.addWorkerGrid(
+                prefix + "moe_topk", WorkerGridFactory.genericWorker(batchSize * 32, 32));
+        scheduler.addWorkerGrid(
+                prefix + "moe_group",
+                WorkerGridFactory.genericWorker(
+                        Qwen35MoeBatchKernels.GROUP_THREADS, Qwen35MoeBatchKernels.GROUP_THREADS));
+        WorkerGrid gateUp =
+                new uk.ac.manchester.tornado.api.WorkerGrid2D(
+                        experts.hiddenDim()
+                                / Qwen35MoeBatchKernels.TILE_COLS
+                                * Qwen35MoeBatchKernels.GEMM_THREADS,
+                        maxTiles);
+        gateUp.setLocalWork(Qwen35MoeBatchKernels.GEMM_THREADS, 1, 1);
+        scheduler.addWorkerGrid(prefix + "moe_gate_up", gateUp);
+        WorkerGrid down =
+                new uk.ac.manchester.tornado.api.WorkerGrid2D(
+                        dim / Qwen35MoeBatchKernels.TILE_COLS * Qwen35MoeBatchKernels.GEMM_THREADS,
+                        maxTiles);
+        down.setLocalWork(Qwen35MoeBatchKernels.GEMM_THREADS, 1, 1);
+        scheduler.addWorkerGrid(prefix + "moe_down", down);
+        scheduler.addWorkerGrid(
+                prefix + "moe_hidden_q8",
+                WorkerGridFactory.genericWorker(assignments * experts.hiddenDim(), 128));
+        scheduler.addWorkerGrid(
+                prefix + "moe_shared_q8", WorkerGridFactory.genericWorker(batchSize * shared, 128));
+        int local = Qwen35Int8Kernels.Q8_GEMM_THREADS;
+        for (String[] task :
+                new String[][] {
+                    {"moe_shared_gate", String.valueOf(shared)},
+                    {"moe_shared_up", String.valueOf(shared)},
+                    {"moe_shared_down", String.valueOf(dim)}
+                }) {
+            WorkerGrid gemm =
+                    new uk.ac.manchester.tornado.api.WorkerGrid2D(
+                            (batchSize / GEMM_TILE) * local, Integer.parseInt(task[1]) / GEMM_TILE);
+            gemm.setLocalWork(local, 1, 1);
+            scheduler.addWorkerGrid(prefix + task[0], gemm);
+        }
+        scheduler.addWorkerGrid(
+                prefix + "moe_combine", WorkerGridFactory.genericWorker(batchSize * dim, 256));
+    }
+
     private void transferLayerWeights(TaskGraph layer, int layerIndex) {
         List<Object> tensors = new ArrayList<>();
         tensors.add(weights.rms_att_weightLayered[layerIndex].asFloatArray());
         tensors.add(weights.rms_ffn_weightLayered[layerIndex].asFloatArray());
-        tensors.add(deviceArray(require(weights.w1Layered, layerIndex, "ffn_gate")));
-        tensors.add(deviceArray(require(weights.w2Layered, layerIndex, "ffn_down")));
-        tensors.add(deviceArray(require(weights.w3Layered, layerIndex, "ffn_up")));
+        if (config.isMixtureOfExperts()) {
+            var experts = weights.experts();
+            tensors.add(experts.router()[layerIndex].asFloatArray());
+            tensors.add(experts.sharedGateInput()[layerIndex].asFloatArray());
+            tensors.add(experts.gateExperts()[layerIndex].asByteArray());
+            tensors.add(experts.upExperts()[layerIndex].asByteArray());
+            tensors.add(experts.downExperts()[layerIndex].asByteArray());
+            tensors.add(experts.sharedGate()[layerIndex].asByteArray());
+            tensors.add(experts.sharedUp()[layerIndex].asByteArray());
+            tensors.add(experts.sharedDown()[layerIndex].asByteArray());
+        } else {
+            tensors.add(deviceArray(require(weights.w1Layered, layerIndex, "ffn_gate")));
+            tensors.add(deviceArray(require(weights.w2Layered, layerIndex, "ffn_down")));
+            tensors.add(deviceArray(require(weights.w3Layered, layerIndex, "ffn_up")));
+        }
         if (config.isRecurrentLayer(layerIndex)) {
             tensors.add(deviceArray(require(weights.ssmQkv, layerIndex, "attn_qkv")));
             tensors.add(deviceArray(require(weights.ssmGate, layerIndex, "attn_gate")));
@@ -2198,6 +2505,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             if (state.workspace.wrapQ8SplitPartial != null) {
                 layer.transferToDevice(
                         DataTransferMode.FIRST_EXECUTION, state.workspace.wrapQ8SplitPartial);
+            }
+            if (config.isMixtureOfExperts()) {
+                layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, moeBatchBuffers());
             }
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION, state.workspace.batchStartPosHolder);
@@ -2281,6 +2591,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     valueStore(),
                     state.workspace.batchStartPosHolder);
             layer.consumeFromDevice(predecessor, state.workspace.wrapBlockTable);
+            if (config.isMixtureOfExperts()) {
+                layer.consumeFromDevice(predecessor, moeBatchBuffers());
+            }
             if (state.workspace.wrapQ8ActBatch != null) {
                 layer.consumeFromDevice(
                         predecessor,
@@ -2495,6 +2808,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             scheduler.addWorkerGrid(prefix + "ffn_rms_reduce", rmsReduce);
             scheduler.addWorkerGrid(prefix + "attn_rms_apply", rmsApply);
             scheduler.addWorkerGrid(prefix + "ffn_rms_apply", rmsApply);
+            if (config.isMixtureOfExperts()) {
+                moeGrids(scheduler, prefix);
+            }
             if (TENSOR_CORES && TensorCoreSupport.isTensorCoreCapableBackend()) {
                 scheduler.addWorkerGrid(prefix + "attn_rms_apply_fp16", fp16Convert);
                 scheduler.addWorkerGrid(prefix + "ffn_rms_apply_fp16", fp16Convert);
@@ -2549,6 +2865,11 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 scheduler.addWorkerGrid(
                         prefix + "ssm_alpha_proj",
                         matVecWorker(prefix + "ssm_alpha_proj", config.numberOfValueHeads()));
+                if (alphaBetaFused.contains(prefix)) {
+                    scheduler.addWorkerGrid(
+                            prefix + "ssm_alpha_beta",
+                            WorkerGridFactory.genericWorker(batchSize * 128, 128));
+                }
                 scheduler.addWorkerGrid(prefix + "ssm_decay_beta", decayBeta);
                 if (parallelConv()) {
                     scheduler.addWorkerGrid(prefix + "ssm_conv", convDim);

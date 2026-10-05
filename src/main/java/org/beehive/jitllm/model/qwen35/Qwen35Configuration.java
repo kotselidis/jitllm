@@ -49,8 +49,68 @@ public record Qwen35Configuration(
         int contextLengthModel,
         int contextLength,
         float rmsNormEps,
-        float ropeTheta)
+        float ropeTheta,
+        Qwen35Experts experts)
         implements Configuration {
+
+    /**
+     * A dense model: every layer's feed-forward is one SwiGLU of {@code hiddenDim}.
+     *
+     * <p>For a mixture of experts ({@code qwen35moe}) {@code hiddenDim} is the routed experts'
+     * combined width for one token ({@link Qwen35Experts#routedHiddenDim()}), which is what every
+     * buffer sized by it holds.
+     */
+    public Qwen35Configuration(
+            String quantization,
+            int dim,
+            int hiddenDim,
+            int numberOfLayers,
+            int numberOfNextnLayers,
+            int numberOfHeads,
+            int numberOfKeyValueHeads,
+            int numberOfHeadsKey,
+            int numberOfHeadsValue,
+            int fullAttentionInterval,
+            int ssmConvKernel,
+            int ssmStateSize,
+            int ssmGroupCount,
+            int ssmTimeStepRank,
+            int ssmInnerSize,
+            int ropeDimensionCount,
+            int vocabularySize,
+            int contextLengthModel,
+            int contextLength,
+            float rmsNormEps,
+            float ropeTheta) {
+        this(
+                quantization,
+                dim,
+                hiddenDim,
+                numberOfLayers,
+                numberOfNextnLayers,
+                numberOfHeads,
+                numberOfKeyValueHeads,
+                numberOfHeadsKey,
+                numberOfHeadsValue,
+                fullAttentionInterval,
+                ssmConvKernel,
+                ssmStateSize,
+                ssmGroupCount,
+                ssmTimeStepRank,
+                ssmInnerSize,
+                ropeDimensionCount,
+                vocabularySize,
+                contextLengthModel,
+                contextLength,
+                rmsNormEps,
+                ropeTheta,
+                null);
+    }
+
+    /** Whether the feed-forward is a mixture of experts ({@code qwen35moe}) rather than dense. */
+    public boolean isMixtureOfExperts() {
+        return experts != null;
+    }
 
     @Override
     public String quantization() {

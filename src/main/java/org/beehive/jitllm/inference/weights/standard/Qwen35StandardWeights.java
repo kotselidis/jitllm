@@ -1,5 +1,6 @@
 package org.beehive.jitllm.inference.weights.standard;
 
+import org.beehive.jitllm.inference.weights.Qwen35ExpertWeights;
 import org.beehive.jitllm.inference.weights.Weights;
 import org.beehive.jitllm.runtime.tensor.DataType;
 import org.beehive.jitllm.tensor.standard.FloatTensor;
@@ -177,5 +178,25 @@ public final class Qwen35StandardWeights implements Weights {
     @Override
     public DataType dataType() {
         return weightType;
+    }
+
+    /**
+     * A {@code qwen35moe} model's expert tensors, or null for a dense model. Set once by the
+     * loader, right after construction, in place of the dense feed-forward arrays (which are then
+     * null at every block).
+     */
+    private Qwen35ExpertWeights<FloatTensor> experts;
+
+    /** The expert tensors of a mixture-of-experts model; null for a dense one. */
+    public Qwen35ExpertWeights<FloatTensor> experts() {
+        return experts;
+    }
+
+    /** Attaches the expert tensors, once. */
+    public void attachExperts(Qwen35ExpertWeights<FloatTensor> experts) {
+        if (this.experts != null) {
+            throw new IllegalStateException("expert weights are already attached");
+        }
+        this.experts = experts;
     }
 }

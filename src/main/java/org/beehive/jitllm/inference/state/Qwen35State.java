@@ -117,6 +117,25 @@ public final class Qwen35State extends State {
     /** Its value slice, {@code valueHeads * headValueDim}. */
     public final FloatTensor ssmV;
 
+    // ---- mixture of experts (qwen35moe), host forward pass; null for a dense model ----------
+
+    /** Router scores, one per expert; softmaxed in place by the router. */
+    public final FloatTensor expertScores;
+
+    /** The experts selected for the current token, highest weight first. */
+    public final int[] expertIds;
+
+    /** Their renormalized routing weights, in the same order. */
+    public final float[] expertWeights;
+
+    /** One expert's (or the shared expert's) gate and up activations. */
+    public final FloatTensor expertHidden;
+
+    public final FloatTensor expertHiddenUp;
+
+    /** One expert's output, before it is weighted into the feed-forward result. */
+    public final FloatTensor expertOut;
+
     public Qwen35State(Configuration config, int batchsize) {
         this(config, batchsize, null);
     }
@@ -151,6 +170,24 @@ public final class Qwen35State extends State {
         this.ssmQ = ArrayFloatTensor.allocate(c.deltaNetKeyDim());
         this.ssmK = ArrayFloatTensor.allocate(c.deltaNetKeyDim());
         this.ssmV = ArrayFloatTensor.allocate(c.deltaNetValueDim());
+
+        if (c.isMixtureOfExperts()) {
+            var experts = c.experts();
+            int width = Math.max(experts.hiddenDim(), experts.sharedHiddenDim());
+            this.expertScores = ArrayFloatTensor.allocate(experts.count());
+            this.expertIds = new int[experts.used()];
+            this.expertWeights = new float[experts.used()];
+            this.expertHidden = ArrayFloatTensor.allocate(width);
+            this.expertHiddenUp = ArrayFloatTensor.allocate(width);
+            this.expertOut = ArrayFloatTensor.allocate(c.dim());
+        } else {
+            this.expertScores = null;
+            this.expertIds = null;
+            this.expertWeights = null;
+            this.expertHidden = null;
+            this.expertHiddenUp = null;
+            this.expertOut = null;
+        }
     }
 
     /**
@@ -389,6 +426,21 @@ public final class Qwen35State extends State {
         workspace.tempLogits =
                 TornadoWorkspaces.floats(1 + ((config.dim() + localSize - 1) / localSize));
 
+        if (config.isMixtureOfExperts()) {
+            // The routing of one token and its experts' activations; the shared expert's gate is
+            // one value.
+            var experts = config.experts();
+            workspace.wrapRouterLogits = TornadoWorkspaces.floats(experts.count());
+            workspace.wrapSelectedExperts = TornadoWorkspaces.ints(experts.used());
+            workspace.wrapRoutingWeights = TornadoWorkspaces.floats(experts.used());
+            workspace.wrapSharedGate = TornadoWorkspaces.floats(1);
+            int moeHidden = experts.routedHiddenDim() + experts.sharedHiddenDim();
+            workspace.wrapMoeHidden = TornadoWorkspaces.floats(moeHidden);
+            workspace.wrapMoeHiddenQuants = TornadoWorkspaces.ints(moeHidden / 4);
+            workspace.wrapMoeHiddenQScales = TornadoWorkspaces.floats(moeHidden / 32);
+            workspace.wrapMoeHiddenQSums = TornadoWorkspaces.ints(moeHidden / 32);
+        }
+
         allocateBatchWorkspace(config, kvDim);
 
         // Sized by the blocks that attend, not by the block count: see keyValueLayerIndex.
@@ -476,6 +528,36 @@ public final class Qwen35State extends State {
             workspace.wrapInt8WeightScales =
                     TornadoWorkspaces.floats(
                             Math.toIntExact((long) config.hiddenDim() * config.dim() / 32));
+        }
+        if (config.isMixtureOfExperts()) {
+            // A chunk's routing, its assignments sorted by expert, and the experts' activations
+            // in that sorted order; the shared expert's over the whole chunk.
+            var experts = config.experts();
+            int assignments = batch * experts.used();
+            int hidden = experts.hiddenDim();
+            int shared = Math.max(experts.sharedHiddenDim(), 32);
+            workspace.wrapMoeLogitsBatch = TornadoWorkspaces.floats(batch * experts.count());
+            workspace.wrapMoeIdsBatch = TornadoWorkspaces.ints(assignments);
+            workspace.wrapMoeWeightsBatch = TornadoWorkspaces.floats(assignments);
+            workspace.wrapMoeSharedGateBatch = TornadoWorkspaces.floats(batch);
+            workspace.wrapMoeSortedToken = TornadoWorkspaces.ints(assignments);
+            workspace.wrapMoePosition = TornadoWorkspaces.ints(assignments);
+            workspace.wrapMoeTiles =
+                    TornadoWorkspaces.ints(
+                            1
+                                    + 3
+                                            * org.beehive.jitllm.backend.tornado.kernels
+                                                    .Qwen35MoeBatchKernels.maxTiles(
+                                                    assignments, experts.count()));
+            workspace.wrapMoeHiddenBatch = TornadoWorkspaces.floats(assignments * hidden);
+            workspace.wrapMoeHiddenQ8 = TornadoWorkspaces.bytes(assignments * hidden);
+            workspace.wrapMoeHiddenScales = TornadoWorkspaces.floats(assignments * hidden / 32);
+            workspace.wrapMoeOutBatch = TornadoWorkspaces.floats(assignments * config.dim());
+            workspace.wrapMoeSharedGateUp = TornadoWorkspaces.floats(batch * shared);
+            workspace.wrapMoeSharedHidden = TornadoWorkspaces.floats(batch * shared);
+            workspace.wrapMoeSharedQ8 = TornadoWorkspaces.bytes(batch * shared);
+            workspace.wrapMoeSharedScales = TornadoWorkspaces.floats(batch * shared / 32);
+            workspace.wrapMoeSharedOut = TornadoWorkspaces.floats(batch * config.dim());
         }
         if (storageOptions().usesFp16KeyValueCache()) {
             // The capacity rounded up to whole 32-key tiles: the tensor-core kernels' transposed

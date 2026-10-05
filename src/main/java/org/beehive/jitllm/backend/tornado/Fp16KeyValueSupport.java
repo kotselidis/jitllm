@@ -81,7 +81,7 @@ public final class Fp16KeyValueSupport {
             return noBatchedPrefill;
         }
         switch (c.architecture()) {
-            case "qwen35" -> {
+            case "qwen35", "qwen35moe" -> {
                 // FP16 writers and readers in every mode, including batched prefill. On CUDA the
                 // split-KV and tensor-core attention read it; on OpenCL (an NVIDIA-class device,
                 // checked above) the single-workgroup FP16 kernel does.

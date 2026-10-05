@@ -650,8 +650,9 @@ public final class Qwen35Int8Kernels {
      *
      * <p>{@code epilogue}: {@link #EPILOGUE_STORE} writes {@code out}, {@link #EPILOGUE_RESIDUAL}
      * adds into it, {@link #EPILOGUE_SWIGLU} writes {@code out = silu(gate) * product} ({@code
-     * gate} is not read otherwise). Requires M % 128 == 0, N % 128 == 0, K % 64 == 0. Worker:
-     * WorkerGrid2D((M/128) * 512, N/128 * splits), local {@link #Q8_GEMM_THREADS}.
+     * gate} is not read otherwise). Only the first {@code rowsHolder[1]} rows are computed: a
+     * chunk's padding rows are left as they were. Requires M % 128 == 0, N % 128 == 0, K % 64 == 0.
+     * Worker: WorkerGrid2D((M/128) * 512, N/128 * splits), local {@link #Q8_GEMM_THREADS}.
      */
     // @formatter:on
     public static void gemmInt8Q8_0(
@@ -666,7 +667,8 @@ public final class Qwen35Int8Kernels {
             int k,
             int epilogue,
             FloatArray partial,
-            int splits) {
+            int splits,
+            IntArray rowsHolder) {
         int tid = ctx.localIdx;
         int warpId = tid >> 5;
         int lane = tid & 31;
@@ -676,7 +678,8 @@ public final class Qwen35Int8Kernels {
         int colTile = ctx.groupIdy / splits;
         int split = ctx.groupIdy - colTile * splits;
         int blockCol = I8_BN * colTile;
-        if (blockRow < m && blockCol < n) {
+        // A chunk's real rows are rowsHolder[1]; a block wholly past them has nothing to do.
+        if (blockRow < m && blockRow < rowsHolder.get(1) && blockCol < n) {
             int kBlocks = k / Q8_BLOCK;
             int rounds = k / I8_BK;
             // This block's share of the rounds; with one split, all of them.
@@ -941,9 +944,11 @@ public final class Qwen35Int8Kernels {
             FloatArray out,
             int total,
             int splits,
-            int epilogue) {
+            int epilogue,
+            IntArray rowsHolder,
+            int n) {
         int i = ctx.globalIdx;
-        if (i < total) {
+        if (i < total && i < rowsHolder.get(1) * n) {
             float sum = partial.get(i);
             for (int s = 1; s < splits; s++) {
                 sum += partial.get(s * total + i);

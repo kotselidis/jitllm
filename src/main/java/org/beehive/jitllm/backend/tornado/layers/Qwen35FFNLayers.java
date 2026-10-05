@@ -5,6 +5,7 @@ import java.util.List;
 import org.beehive.jitllm.backend.tornado.device.TornadoDevices;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35AttentionKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35DeltaNetKernels;
+import org.beehive.jitllm.backend.tornado.kernels.Qwen35MoeKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen3Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
@@ -822,6 +823,19 @@ public class Qwen35FFNLayers
             normedActivationQuantized = true;
         }
 
+        if (config.isMixtureOfExperts()) {
+            mixtureOfExperts(layer, layerIndex);
+            if (lastLayerOfGraph(layerIndex)) {
+                layer.persistOnDevice(
+                        qwen35State.workspace.wrapX,
+                        keyStore(),
+                        valueStore(),
+                        qwen35State.workspace.wrapConvState,
+                        qwen35State.workspace.wrapDeltaState);
+            }
+            return layer;
+        }
+
         fusedGateUp(
                 layer,
                 layerIndex,
@@ -864,6 +878,92 @@ public class Qwen35FFNLayers
                     qwen35State.workspace.wrapDeltaState);
         }
         return layer;
+    }
+
+    // @formatter:off
+    /**
+     * The {@code qwen35moe} feed-forward of one layer, from the normalized and quantized {@code
+     * wrapXb} into the residual stream: router and shared gate, top-k, every selected expert's and
+     * the shared expert's gate/up, and their weighted down projections added to {@code wrapX}. See
+     * {@link Qwen35MoeKernels}.
+     */
+    // @formatter:on
+    private void mixtureOfExperts(TaskGraph layer, int layerIndex) {
+        if (!DP4A) {
+            throw new UnsupportedOperationException(
+                    "the qwen35moe experts read a quantized activation, which needs a device"
+                            + " with packed integer dot products");
+        }
+        var experts = config.experts();
+        var tensors = weights.experts();
+        var workspace = qwen35State.workspace;
+        layer.task(
+                tn("moe_router"),
+                Qwen35MoeKernels::routerAndSharedGate,
+                context,
+                workspace.wrapXb,
+                tensors.router()[layerIndex].asFloatArray(),
+                tensors.sharedGateInput()[layerIndex].asFloatArray(),
+                workspace.wrapRouterLogits,
+                workspace.wrapSharedGate,
+                config.dim(),
+                experts.count());
+        layer.task(
+                tn("moe_topk"),
+                Qwen35MoeKernels::routerTopK,
+                context,
+                workspace.wrapRouterLogits,
+                workspace.wrapSelectedExperts,
+                workspace.wrapRoutingWeights,
+                experts.count(),
+                experts.used());
+        layer.task(
+                tn("moe_gate_up"),
+                Qwen35MoeKernels::expertsGateUpQ8_0DP4A,
+                context,
+                workspace.wrapXbQuants,
+                workspace.wrapXbScales,
+                workspace.wrapSelectedExperts,
+                tensors.gateExperts()[layerIndex].asByteArray(),
+                tensors.upExperts()[layerIndex].asByteArray(),
+                tensors.sharedGate()[layerIndex].asByteArray(),
+                tensors.sharedUp()[layerIndex].asByteArray(),
+                workspace.wrapMoeHidden,
+                config.dim(),
+                experts.hiddenDim(),
+                experts.sharedHiddenDim(),
+                experts.used());
+        layer.task(
+                tn("moe_down_quantize"),
+                TransformerComputeKernelsQ4_0::quantizeActivationQ8Blocks,
+                context,
+                workspace.wrapMoeHidden,
+                workspace.wrapMoeHiddenQuants,
+                workspace.wrapMoeHiddenQScales,
+                workspace.wrapMoeHiddenQSums);
+        layer.task(
+                tn("moe_down"),
+                Qwen35MoeKernels::expertsDownResidualQ8_0DP4A,
+                context,
+                workspace.wrapMoeHiddenQuants,
+                workspace.wrapMoeHiddenQScales,
+                workspace.wrapSelectedExperts,
+                workspace.wrapRoutingWeights,
+                workspace.wrapSharedGate,
+                tensors.downExperts()[layerIndex].asByteArray(),
+                tensors.sharedDown()[layerIndex].asByteArray(),
+                workspace.wrapX,
+                config.dim(),
+                experts.hiddenDim(),
+                experts.sharedHiddenDim(),
+                experts.used());
+    }
+
+    /** Lanes for {@code warps} warps, rounded up to whole {@link Qwen35MoeKernels#LOCAL} blocks. */
+    private static WorkerGrid warpWorker(int warps) {
+        int lanes = warps * 32;
+        int local = Qwen35MoeKernels.LOCAL;
+        return WorkerGridFactory.genericWorker((lanes + local - 1) / local * local, local);
     }
 
     // @formatter:off
@@ -1702,9 +1802,21 @@ public class Qwen35FFNLayers
         List<Object> tensors = new ArrayList<>();
         tensors.add(weights.rms_att_weightLayered[layerIndex].asFloatArray());
         tensors.add(weights.rms_ffn_weightLayered[layerIndex].asFloatArray());
-        tensors.add(deviceArray(require(weights.w1Layered, layerIndex, "ffn_gate")));
-        tensors.add(deviceArray(require(weights.w2Layered, layerIndex, "ffn_down")));
-        tensors.add(deviceArray(require(weights.w3Layered, layerIndex, "ffn_up")));
+        if (config.isMixtureOfExperts()) {
+            var experts = weights.experts();
+            tensors.add(experts.router()[layerIndex].asFloatArray());
+            tensors.add(experts.sharedGateInput()[layerIndex].asFloatArray());
+            tensors.add(experts.gateExperts()[layerIndex].asByteArray());
+            tensors.add(experts.upExperts()[layerIndex].asByteArray());
+            tensors.add(experts.downExperts()[layerIndex].asByteArray());
+            tensors.add(experts.sharedGate()[layerIndex].asByteArray());
+            tensors.add(experts.sharedUp()[layerIndex].asByteArray());
+            tensors.add(experts.sharedDown()[layerIndex].asByteArray());
+        } else {
+            tensors.add(deviceArray(require(weights.w1Layered, layerIndex, "ffn_gate")));
+            tensors.add(deviceArray(require(weights.w2Layered, layerIndex, "ffn_down")));
+            tensors.add(deviceArray(require(weights.w3Layered, layerIndex, "ffn_up")));
+        }
         if (config.isRecurrentLayer(layerIndex)) {
             tensors.add(deviceArray(require(weights.ssmQkv, layerIndex, "attn_qkv")));
             tensors.add(deviceArray(require(weights.ssmGate, layerIndex, "attn_gate")));
@@ -1770,6 +1882,18 @@ public class Qwen35FFNLayers
                         qwen35State.workspace.wrapXbScales,
                         qwen35State.workspace.wrapXbSums);
             }
+            if (config.isMixtureOfExperts()) {
+                layer.transferToDevice(
+                        DataTransferMode.FIRST_EXECUTION,
+                        qwen35State.workspace.wrapRouterLogits,
+                        qwen35State.workspace.wrapSelectedExperts,
+                        qwen35State.workspace.wrapRoutingWeights,
+                        qwen35State.workspace.wrapSharedGate,
+                        qwen35State.workspace.wrapMoeHidden,
+                        qwen35State.workspace.wrapMoeHiddenQuants,
+                        qwen35State.workspace.wrapMoeHiddenQScales,
+                        qwen35State.workspace.wrapMoeHiddenQSums);
+            }
             // The recurrent state persists across tokens and is updated in place, so it is
             // uploaded once — zeroed — and never read back. Uploading it every execution would
             // overwrite the device's own history with the host's stale copy.
@@ -1812,6 +1936,18 @@ public class Qwen35FFNLayers
                         qwen35State.workspace.wrapXbQuants,
                         qwen35State.workspace.wrapXbScales,
                         qwen35State.workspace.wrapXbSums);
+            }
+            if (config.isMixtureOfExperts()) {
+                layer.consumeFromDevice(
+                        predecessor,
+                        qwen35State.workspace.wrapRouterLogits,
+                        qwen35State.workspace.wrapSelectedExperts,
+                        qwen35State.workspace.wrapRoutingWeights,
+                        qwen35State.workspace.wrapSharedGate,
+                        qwen35State.workspace.wrapMoeHidden,
+                        qwen35State.workspace.wrapMoeHiddenQuants,
+                        qwen35State.workspace.wrapMoeHiddenQScales,
+                        qwen35State.workspace.wrapMoeHiddenQSums);
             }
             layer.consumeFromDevice(
                     predecessor,
@@ -1919,8 +2055,23 @@ public class Qwen35FFNLayers
                 scheduler.addWorkerGrid(prefix + "attn_rms_apply", rmsApply);
                 scheduler.addWorkerGrid(prefix + "ffn_rms_apply", rmsApply);
             }
-            scheduler.addWorkerGrid(prefix + "ffn_gate_up", matVecWorker(config.hiddenDim()));
-            scheduler.addWorkerGrid(prefix + "ffn_down_proj", matVecWorker(config.dim()));
+            if (config.isMixtureOfExperts()) {
+                var experts = config.experts();
+                scheduler.addWorkerGrid(prefix + "moe_router", warpWorker(experts.count() + 1));
+                scheduler.addWorkerGrid(
+                        prefix + "moe_topk", WorkerGridFactory.genericWorker(32, 32));
+                scheduler.addWorkerGrid(
+                        prefix + "moe_gate_up",
+                        warpWorker(experts.routedHiddenDim() + experts.sharedHiddenDim()));
+                scheduler.addWorkerGrid(
+                        prefix + "moe_down_quantize",
+                        WorkerGridFactory.genericWorker(
+                                experts.routedHiddenDim() + experts.sharedHiddenDim(), 32));
+                scheduler.addWorkerGrid(prefix + "moe_down", warpWorker(config.dim()));
+            } else {
+                scheduler.addWorkerGrid(prefix + "ffn_gate_up", matVecWorker(config.hiddenDim()));
+                scheduler.addWorkerGrid(prefix + "ffn_down_proj", matVecWorker(config.dim()));
+            }
 
             if (config.isRecurrentLayer(layer)) {
                 scheduler.addWorkerGrid(

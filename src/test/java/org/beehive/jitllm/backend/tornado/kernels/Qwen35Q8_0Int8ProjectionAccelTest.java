@@ -18,6 +18,7 @@ import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.types.HalfFloat;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.IntArray;
 
 /**
  * The Q8_0 batched-prefill projections: the int8 GEMM that reads the Q8_0 blocks itself, its three
@@ -65,6 +66,13 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
 
     private static byte quant(byte[] raw, int k, int col, int e) {
         return raw[(col * (k / 32) + e / 32) * BLOCK_BYTES + 2 + e % 32];
+    }
+
+    /** The rows holder a GEMM reads its active row count from: all {@code m} rows. */
+    private static IntArray rowsOf(int m) {
+        IntArray rows = new IntArray(3);
+        rows.set(1, m);
+        return rows;
     }
 
     private static WorkerGrid lanes(int count, int local) {
@@ -125,7 +133,8 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 k,
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 out,
-                                1)
+                                1,
+                                rowsOf(m))
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, out, q8, dA);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("q8g.q", lanes(m * k, 256));
@@ -208,7 +217,8 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 k,
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 stored,
-                                1)
+                                1,
+                                rowsOf(m))
                         .task(
                                 "r",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -223,7 +233,8 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 k,
                                 Qwen35Int8Kernels.EPILOGUE_RESIDUAL,
                                 residual,
-                                1)
+                                1,
+                                rowsOf(m))
                         .task(
                                 "g",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -238,7 +249,8 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 k,
                                 Qwen35Int8Kernels.EPILOGUE_SWIGLU,
                                 swiglu,
-                                1)
+                                1,
+                                rowsOf(m))
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, stored, residual, swiglu);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("q8e.q", lanes(m * k, 256));
@@ -377,7 +389,8 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 k,
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 whole,
-                                1)
+                                1,
+                                rowsOf(m))
                         .task(
                                 "s",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -392,7 +405,8 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 k,
                                 Qwen35Int8Kernels.EPILOGUE_STORE,
                                 partial,
-                                splits)
+                                splits,
+                                rowsOf(m))
                         .task(
                                 "sr",
                                 Qwen35Int8Kernels::reduceSplitsQ8_0,
@@ -401,7 +415,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 stored,
                                 m * n,
                                 splits,
-                                Qwen35Int8Kernels.EPILOGUE_STORE)
+                                Qwen35Int8Kernels.EPILOGUE_STORE,
+                                rowsOf(m),
+                                n)
                         .task(
                                 "r",
                                 Qwen35Int8Kernels::gemmInt8Q8_0,
@@ -416,7 +432,8 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 k,
                                 Qwen35Int8Kernels.EPILOGUE_RESIDUAL,
                                 partial,
-                                splits)
+                                splits,
+                                rowsOf(m))
                         .task(
                                 "rr",
                                 Qwen35Int8Kernels::reduceSplitsQ8_0,
@@ -425,7 +442,9 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
                                 residual,
                                 m * n,
                                 splits,
-                                Qwen35Int8Kernels.EPILOGUE_RESIDUAL)
+                                Qwen35Int8Kernels.EPILOGUE_RESIDUAL,
+                                rowsOf(m),
+                                n)
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, whole, stored, residual);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("q8s.q", lanes(m * k, 256));
