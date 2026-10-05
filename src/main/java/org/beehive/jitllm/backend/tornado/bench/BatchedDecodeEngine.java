@@ -210,7 +210,7 @@ public class BatchedDecodeEngine {
         ChatFormat cf = model.chatFormat();
         List<Integer> prompt = new ArrayList<>();
         if (model.shouldAddBeginOfText()) {
-            prompt.add(cf.getBeginOfText());
+            prompt.addAll(cf.beginOfTextTokens());
         }
         prompt.addAll(cf.encodeMessage(new ChatFormat.Message(ChatFormat.Role.USER, userPrompt)));
         prompt.addAll(cf.encodeHeader(new ChatFormat.Message(ChatFormat.Role.ASSISTANT, "")));
