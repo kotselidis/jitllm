@@ -260,7 +260,8 @@ public final class DeepSeek2BatchKernels {
             int paddedPositions) {
         int keyWidth = rank + rope;
         int idx = context.globalIdx;
-        if (idx < paddedPositions * keyWidth) {
+        int filled = ((batchInfo.get(0) + batchInfo.get(1) + 127) / 128) * 128;
+        if (idx < Math.min(paddedPositions, filled) * keyWidth) {
             int t = idx / keyWidth;
             int c = idx - t * keyWidth;
             int valid = batchInfo.get(0) + batchInfo.get(1);
@@ -293,7 +294,8 @@ public final class DeepSeek2BatchKernels {
             int paddedPositions) {
         int keyWidth = rank + rope;
         int idx = context.globalIdx;
-        if (idx < paddedPositions * keyWidth) {
+        int filled = ((batchInfo.get(0) + batchInfo.get(1) + 127) / 128) * 128;
+        if (idx < Math.min(paddedPositions, filled) * keyWidth) {
             int t = idx / keyWidth;
             int c = idx - t * keyWidth;
             int valid = batchInfo.get(0) + batchInfo.get(1);
@@ -363,7 +365,9 @@ public final class DeepSeek2BatchKernels {
             context.localBarrier();
         }
         float inverse = 1.0f / TornadoMath.max(reduce[0], 1.0e-30f);
-        for (int j = tid; j < paddedPositions; j += GROUP) {
+        int filled = ((batchInfo.get(0) + batchInfo.get(1) + 127) / 128) * 128;
+        int width = Math.min(paddedPositions, filled);
+        for (int j = tid; j < width; j += GROUP) {
             if (j < valid) {
                 probs.set(base + j, new HalfFloat(TornadoMath.exp(scores.get(base + j) * scale - max) * inverse));
             }
@@ -470,7 +474,8 @@ public final class DeepSeek2BatchKernels {
 
     // @formatter:off
     /**
-     * {@link TransformerBatchPrefillKernels#gemmMMA} with leading dimensions and a batch: problem
+     * {@link TransformerBatchPrefillKernels#gemmMMA} with leading dimensions and a batch (each
+     * operand's problem index shifted, and B's divided, as the offsets and {@code groupB} say): problem
      * {@code z = groupIdz} computes {@code C[r][colOffset + c] = A[r] . B[c]} for {@code r < M, c
      * < N} over {@code K}, where {@code A[r]} starts at {@code z * aBatch + r * lda}, {@code B[c]}
      * at {@code z * bBatch + c * ldb}, and {@code C}'s rows are {@code ldc} apart with {@code
@@ -491,17 +496,34 @@ public final class DeepSeek2BatchKernels {
             int ldc,
             int aBatch,
             int bBatch,
-            int cBatchCols) {
+            int cBatchCols,
+            IntArray batchInfo,
+            int boundN,
+            int boundK,
+            int zOffsetA,
+            int zOffsetB,
+            int groupB,
+            int zOffsetC) {
+        // With a bound set, N or K stops at the chunk's last position rounded up to whole tiles:
+        // the positions past it hold nothing the attention reads.
+        int filled = ((batchInfo.get(0) + batchInfo.get(1) + 127) / 128) * 128;
+        int limitN = boundN * Math.min(N, filled) + (1 - boundN) * N;
+        int limitK = boundK * Math.min(K, filled) + (1 - boundK) * K;
+        if (BN * ctx.groupIdy >= limitN) {
+            return;
+        }
         int tid = ctx.localIdx;
         int warpId = tid / WARP_SIZE;
         int warpM = warpId / WARPS_N;
         int warpN = warpId % WARPS_N;
         int blockRow = BM * ctx.groupIdx;
         int blockCol = BN * ctx.groupIdy;
+        // Problem z reads A's problem z + zOffsetA, B's (z + zOffsetB) / groupB (several query heads
+        // sharing one key/value head), and writes C's z + zOffsetC.
         int z = ctx.groupIdz;
-        int aBase = z * aBatch;
-        int bBase = z * bBatch;
-        int colOffset = z * cBatchCols;
+        int aBase = (z + zOffsetA) * aBatch;
+        int bBase = ((z + zOffsetB) / groupB) * bBatch;
+        int colOffset = (z + zOffsetC) * cBatchCols;
 
         int[] aTile = ctx.allocateIntLocalArray(BM * BK / 2);
         int[] bTile = ctx.allocateIntLocalArray(BK * BN / 2);
@@ -570,7 +592,7 @@ public final class DeepSeek2BatchKernels {
         bTile[bIdx3] = bReg3;
         ctx.localBarrier();
 
-        int numKSteps = K / BK;
+        int numKSteps = limitK / BK;
         for (int kStep = 0; kStep < numKSteps; kStep++) {
             if (kStep + 1 < numKSteps) {
                 int kOff = (kStep + 1) * BK;

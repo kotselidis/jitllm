@@ -320,6 +320,14 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
      */
     private FloatArray quantizedInput;
 
+    /**
+     * Whether a Q4_0 projection's int8 GEMM reads the Q4_0 blocks where they lie ({@link
+     * Qwen35Int8Kernels#gemmInt8Q4_0}) rather than decoding them into the int8 scratch first.
+     * {@code -Djitllm.qwen35.directQ4_0=false} keeps the decode pass.
+     */
+    private static final boolean DIRECT_Q4_0 =
+            !"false".equalsIgnoreCase(System.getProperty("jitllm.qwen35.directQ4_0", "true"));
+
     /** The int8 pair: the decode of {@code w} into the int8 scratch, then the block-scaled GEMM. */
     private void int8Projection(
             TaskGraph graph,
@@ -348,8 +356,8 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             int k,
             Epilogue epilogue,
             boolean q8) {
-        if (q8) {
-            // The GEMM reads the Q8_0 blocks itself: no decode task, no weight scratch.
+        if (q8 || DIRECT_Q4_0) {
+            // The GEMM reads the Q8_0 or Q4_0 blocks itself: no decode task, no weight scratch.
             q8DirectGemms.add(qualified);
             gemmTasks.put(qualified, n);
             int mode =
@@ -367,7 +375,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             }
             graph.task(
                     task,
-                    Qwen35Int8Kernels::gemmInt8Q8_0,
+                    q8 ? Qwen35Int8Kernels::gemmInt8Q8_0 : Qwen35Int8Kernels::gemmInt8Q4_0,
                     context,
                     state.workspace.wrapQ8ActBatch,
                     state.workspace.wrapQ8ActScales,
@@ -666,8 +674,14 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 if (tensors != null
                         && layer < tensors.length
                         && tensors[layer] != null
-                        && tensors[layer].dataType() == DataType.Q8_0) {
-                    if (q8Int8Eligible("", outputs, inputs)) {
+                        && (tensors[layer].dataType() == DataType.Q8_0
+                                || (DIRECT_Q4_0
+                                        && tensors[layer].dataType() == DataType.Q4_0))) {
+                    boolean eligible =
+                            tensors[layer].dataType() == DataType.Q8_0
+                                    ? q8Int8Eligible("", outputs, inputs)
+                                    : int8Eligible(outputs, inputs);
+                    if (eligible) {
                         int splits = gemmSplits(outputs, inputs);
                         if (splits > 1) {
                             partials = Math.max(partials, (long) splits * batchSize * outputs);

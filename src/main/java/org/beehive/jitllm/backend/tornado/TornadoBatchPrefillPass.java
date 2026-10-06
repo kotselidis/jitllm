@@ -200,6 +200,20 @@ public final class TornadoBatchPrefillPass {
                                 });
             }
             case Q4_0 -> {
+                if (state.workspace.embeddingQ8Batch != null) {
+                    // The activation decodes on the device: copy each token's raw Q4_0 row.
+                    long rowBytes =
+                            (long) ((config.dim() + Q4_0_BLOCK_SIZE - 1) / Q4_0_BLOCK_SIZE)
+                                    * Q4_0_BLOCK_BYTES;
+                    MemorySegment table =
+                            weights.getTokenEmbeddingTable().asByteArray().getSegment();
+                    MemorySegment rows = state.workspace.embeddingQ8Batch.getSegment();
+                    for (int b = 0; b < chunkSize; b++) {
+                        MemorySegment.copy(
+                                table, tokens[b] * rowBytes, rows, b * rowBytes, rowBytes);
+                    }
+                    break;
+                }
                 // Retained: 18 bytes per 32 weights, an unsigned nibble recentred by eight. Decoded
                 // here into the FP32 batch carrier, as the Q8_0 branch above decodes its own — the
                 // batch activation graph then passes it through rather than converting. Rows in

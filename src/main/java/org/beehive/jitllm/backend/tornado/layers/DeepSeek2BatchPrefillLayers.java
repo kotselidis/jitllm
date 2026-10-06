@@ -378,7 +378,7 @@ public class DeepSeek2BatchPrefillLayers implements BatchPrefillTransformerLayer
         }
         grid(g, p + "cache_f16", lanes(npad * keyWidth, 256));
         mma(g, p + "scores", state.absorbedF16Batch, state.keysF16, state.scoresBatch,
-                rows, npad, keyWidth, keyWidth, keyWidth, npad, 0, 0, 0, 1);
+                rows, npad, keyWidth, keyWidth, keyWidth, npad, 0, 0, 0, 1, 1, 0);
         g.task(
                 p + "softmax",
                 DeepSeek2BatchKernels::causalSoftmax,
@@ -391,7 +391,7 @@ public class DeepSeek2BatchPrefillLayers implements BatchPrefillTransformerLayer
                 config.attentionScale());
         grid(g, p + "softmax", lanes(rows * DeepSeek2BatchKernels.GROUP, DeepSeek2BatchKernels.GROUP));
         mma(g, p + "attend", state.probsF16Batch, state.latentTF16, state.latentBatch,
-                rows, rank, npad, npad, npad, rank, 0, 0, 0, 1);
+                rows, rank, npad, npad, npad, rank, 0, 0, 0, 1, 0, 1);
         toHalf(g, p + "latent_f16", state.latentBatch, state.latentF16Batch, rows * rank);
         // Decompress: per head, out[t][h][j] = v_b[h][j] . latent[t][h].
         mma(g, p + "decompress", state.latentF16Batch, vBF16[l], state.attnOutBatch,
@@ -697,6 +697,28 @@ public class DeepSeek2BatchPrefillLayers implements BatchPrefillTransformerLayer
             int bBatch,
             int cBatchCols,
             int batches) {
+        mma(g, task, a, b, c, m, n, k, lda, ldb, ldc, aBatch, bBatch, cBatchCols, batches, 0, 0);
+    }
+
+    /** {@link #mma} with N or K bounded by the chunk's last position, rounded to whole tiles. */
+    private void mma(
+            TaskGraph g,
+            String task,
+            HalfFloatArray a,
+            HalfFloatArray b,
+            FloatArray c,
+            int m,
+            int n,
+            int k,
+            int lda,
+            int ldb,
+            int ldc,
+            int aBatch,
+            int bBatch,
+            int cBatchCols,
+            int batches,
+            int boundN,
+            int boundK) {
         g.task(
                 task,
                 DeepSeek2BatchKernels::gemmMMAStrided,
@@ -712,7 +734,14 @@ public class DeepSeek2BatchPrefillLayers implements BatchPrefillTransformerLayer
                 ldc,
                 aBatch,
                 bBatch,
-                cBatchCols);
+                cBatchCols,
+                state.workspace.batchStartPosHolder,
+                boundN,
+                boundK,
+                0,
+                0,
+                1,
+                0);
         WorkerGrid3D grid = new WorkerGrid3D((m / 128) * 256, n / 128, batches);
         grid.setLocalWork(256, 1, 1);
         grid(g, task, grid);

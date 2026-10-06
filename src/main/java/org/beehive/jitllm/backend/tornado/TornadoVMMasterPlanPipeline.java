@@ -968,8 +968,11 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             List<ImmutableTaskGraph> graphs,
             GridScheduler scheduler) {
         if (s == 0) {
-            if (weights.getTokenEmbeddingTable().dataType() == DataType.Q8_0) {
-                var activation = new BatchPrefillQ8DeviceActivation(stageState, config, batchSize);
+            DataType embedding = weights.getTokenEmbeddingTable().dataType();
+            if (embedding == DataType.Q8_0 || embedding == DataType.Q4_0) {
+                var activation =
+                        new BatchPrefillQ8DeviceActivation(
+                                stageState, config, batchSize, embedding);
                 graphs.add(activation.getImmutableTaskGraph());
                 activation.updateGridScheduler(scheduler);
                 // The host stages each chunk's raw embedding rows in the session's state.
