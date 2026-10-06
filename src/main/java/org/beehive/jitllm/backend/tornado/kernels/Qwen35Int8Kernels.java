@@ -1306,19 +1306,17 @@ public final class Qwen35Int8Kernels {
             int k,
             int kBlocks,
             int tid) {
+        // One 16-byte copy per lane: a row's two 32-byte blocks of the round are four 16-byte
+        // chunks, 512 in all. Four 4-byte copies each cost a sixth of the GEMM's time.
         int kb0 = round * 2;
-        int dst = buf * 2 * TILE_WORDS;
-        for (int s = 0; s < 4; s++) {
-            int linear = tid + (s << 9);
-            int b = linear >> 10;
-            int row = (linear >> 3) & 127;
-            int quad = linear & 7;
-            ctx.asyncCopyToLocal(
-                    aTile,
-                    dst + linear,
-                    a8,
-                    (blockRow + row) * k + (kb0 + b) * Q8_BLOCK + (quad << 2));
-        }
+        int b = tid >> 8;
+        int row = (tid >> 1) & 127;
+        int half = tid & 1;
+        ctx.asyncCopyToLocal16(
+                aTile,
+                buf * 2 * TILE_WORDS + b * TILE_WORDS + (row << 3) + (half << 2),
+                a8,
+                (blockRow + row) * k + (kb0 + b) * Q8_BLOCK + (half << 4));
         if (tid < 256) {
             sA[buf * 2 * I8_BM + tid] =
                     dA.get((blockRow + (tid & 127)) * kBlocks + kb0 + (tid >> 7));
