@@ -4,6 +4,9 @@ import java.util.ArrayList;
 import java.util.List;
 import org.beehive.jitllm.backend.tornado.kernels.Gemma4AttentionKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Gemma4BatchPrefillKernels;
+import org.beehive.jitllm.backend.tornado.workspace.TornadoWorkspaces;
+import org.beehive.jitllm.backend.tornado.kernels.TensorCoreAttentionKernels;
+import org.beehive.jitllm.backend.tornado.kernels.DeepSeek2BatchKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35Int8Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
@@ -204,6 +207,25 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
     /** The int8 tasks' worker grids, by qualified task name, recorded as the graphs are built. */
     private final java.util.Map<String, WorkerGrid> int8Grids = new java.util.LinkedHashMap<>();
 
+    /**
+     * Whether the attention runs as FP16 tensor-core GEMMs over the cache gathered per key/value
+     * head: scores, a causal sliding-window softmax and the weighted values, a pass of query heads
+     * at a time. Needs the FP16 cache. {@code -Djitllm.gemma4.gemmAttention=false} keeps the
+     * tensor-core attention kernel.
+     */
+    private static final boolean GEMM_ATTENTION =
+            !"false".equalsIgnoreCase(System.getProperty("jitllm.gemma4.gemmAttention", "true"));
+
+    private boolean gemmAttention;
+    private int paddedPositions;
+    private int headsPerPass;
+    private HalfFloatArray queriesF16;
+    private HalfFloatArray keysF16;
+    private HalfFloatArray valuesTF16;
+    private FloatArray scores;
+    private HalfFloatArray probs;
+    private FloatArray attnF32;
+
     public Gemma4BatchPrefillLayers(
             Gemma4State state,
             Gemma4TornadoWeights weights,
@@ -306,6 +328,22 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             }
         }
 
+        this.gemmAttention =
+                GEMM_ATTENTION
+                        && fp16KeyValue
+                        && org.beehive.jitllm.backend.tornado.TensorCoreSupport
+                                .isTensorCoreCapableBackend();
+        if (gemmAttention) {
+            paddedPositions = (config.contextLength() + 127) / 128 * 128;
+            headsPerPass = headsPerPass(nHead, paddedBatch, paddedPositions);
+            int qWidth = nHead * config.maxHeadDim();
+            queriesF16 = TornadoWorkspaces.halfFloats(paddedBatch * qWidth);
+            keysF16 = TornadoWorkspaces.halfFloats(config.maxKeyValueDim() * paddedPositions);
+            valuesTF16 = TornadoWorkspaces.halfFloats(config.maxKeyValueDim() * paddedPositions);
+            scores = TornadoWorkspaces.floats(paddedBatch * headsPerPass * paddedPositions);
+            probs = TornadoWorkspaces.halfFloats(paddedBatch * headsPerPass * paddedPositions);
+            attnF32 = TornadoWorkspaces.floats(paddedBatch * qWidth);
+        }
         this.int8Qkv = new boolean[layers];
         this.int8Wo = new boolean[layers];
         this.int8GateUp = new boolean[layers];
@@ -340,6 +378,148 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 && !nativeProjections
                 && org.beehive.jitllm.backend.tornado.TensorCoreSupport
                         .isTensorCoreCapableBackend();
+    }
+
+    /** The most query heads per attention pass whose scores fit in 64 MB, a divisor of all. */
+    private static int headsPerPass(int heads, int rows, int positions) {
+        long budget = 64L << 20;
+        for (int h = heads; h >= 1; h--) {
+            if (heads % h == 0 && (long) rows * h * positions * 4 <= budget) {
+                return h;
+            }
+        }
+        return 1;
+    }
+
+    // @formatter:off
+    /**
+     * The chunk's attention as FP16 tensor-core GEMMs: the layer's cache rows up to the chunk's last
+     * position gathered per key/value head, the queries in FP16, then per pass of {@link
+     * #headsPerPass} query heads the scores (each head against its key/value head), the causal
+     * sliding-window softmax (this family's attention scale is one), and the weighted values; the
+     * output in FP16 for the output projection.
+     */
+    // @formatter:on
+    private void gemmAttention(
+            TaskGraph layer,
+            int hd,
+            int kvMul,
+            int qDim,
+            int kvDim,
+            int stride,
+            int cacheBaseOffset,
+            int window) {
+        var ws = state.workspace;
+        int npad = paddedPositions;
+        String graph = layer.getTaskGraphName() + ".";
+        layer.task(
+                "attn_gather",
+                TensorCoreAttentionKernels::gatherKeyValues,
+                context,
+                ws.batchStartPosHolder,
+                ws.wrapKeyCacheFP16,
+                ws.wrapValueCacheFP16,
+                keysF16,
+                valuesTF16,
+                cacheBaseOffset,
+                kvDim,
+                hd,
+                npad);
+        int8Grids.put(graph + "attn_gather", elementwise(npad * kvDim, 256));
+        layer.task(
+                "attn_q16",
+                TensorCoreAttentionKernels::queriesToHalf,
+                context,
+                ws.qkvResultBatch,
+                queriesF16,
+                qDim,
+                stride,
+                paddedBatch * qDim);
+        int8Grids.put(graph + "attn_q16", elementwise(paddedBatch * qDim, 256));
+        int hp = headsPerPass;
+        for (int pass = 0; pass * hp < nHead; pass++) {
+            int z0 = pass * hp;
+            String sTask = "attn_scores_" + pass;
+            layer.task(
+                    sTask,
+                    DeepSeek2BatchKernels::gemmMMAStrided,
+                    context,
+                    queriesF16,
+                    keysF16,
+                    scores,
+                    paddedBatch,
+                    npad,
+                    hd,
+                    qDim,
+                    hd,
+                    hp * npad,
+                    hd,
+                    npad * hd,
+                    npad,
+                    ws.batchStartPosHolder,
+                    1,
+                    0,
+                    z0,
+                    z0,
+                    kvMul,
+                    0);
+            int8Grids.put(graph + sTask, mma3(paddedBatch, npad, hp));
+            String pTask = "attn_softmax_" + pass;
+            layer.task(
+                    pTask,
+                    TensorCoreAttentionKernels::windowedSoftmax,
+                    context,
+                    ws.batchStartPosHolder,
+                    scores,
+                    probs,
+                    hp,
+                    npad,
+                    1.0f,
+                    window);
+            WorkerGrid1D softmax =
+                    new WorkerGrid1D(paddedBatch * hp * TensorCoreAttentionKernels.SOFTMAX_LANES);
+            softmax.setLocalWork(TensorCoreAttentionKernels.SOFTMAX_LANES, 1, 1);
+            int8Grids.put(graph + pTask, softmax);
+            String aTask = "attn_values_" + pass;
+            layer.task(
+                    aTask,
+                    DeepSeek2BatchKernels::gemmMMAStrided,
+                    context,
+                    probs,
+                    valuesTF16,
+                    attnF32,
+                    paddedBatch,
+                    hd,
+                    npad,
+                    hp * npad,
+                    npad,
+                    qDim,
+                    npad,
+                    hd * npad,
+                    hd,
+                    ws.batchStartPosHolder,
+                    0,
+                    1,
+                    0,
+                    z0,
+                    kvMul,
+                    z0);
+            int8Grids.put(graph + aTask, mma3(paddedBatch, hd, hp));
+        }
+        layer.task(
+                "attn_out16",
+                DeepSeek2BatchKernels::toHalf,
+                context,
+                attnF32,
+                ws.attnOutFP16,
+                paddedBatch * qDim);
+        int8Grids.put(graph + "attn_out16", elementwise(paddedBatch * qDim, 256));
+    }
+
+    private static WorkerGrid mma3(int m, int n, int batches) {
+        WorkerGrid3D grid = new WorkerGrid3D((m / 128) * 256, n / 128, batches);
+        grid.setLocalWork(256, 1, 1);
+        return grid;
     }
 
     /** Quantizes {@code k}-wide FP16 rows of the padded chunk to int8 blocks for the GEMMs after. */
@@ -765,6 +945,16 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         state.workspace.attnOutF32Batch,
                         state.workspace.attnProbStageBatch);
             }
+            if (gemmAttention) {
+                layer.transferToDevice(
+                        DataTransferMode.FIRST_EXECUTION,
+                        queriesF16,
+                        keysF16,
+                        valuesTF16,
+                        scores,
+                        probs,
+                        attnF32);
+            }
             if (ple) {
                 layer.transferToDevice(
                         DataTransferMode.FIRST_EXECUTION,
@@ -812,6 +1002,10 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         "batchPrefillLayer_" + firstLayer,
                         state.workspace.attnOutF32Batch,
                         state.workspace.attnProbStageBatch);
+            }
+            if (gemmAttention) {
+                layer.consumeFromDevice(
+                        pred, queriesF16, keysF16, valuesTF16, scores, probs, attnF32);
             }
         }
 
@@ -1097,7 +1291,9 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     stride);
         }
 
-        if (tensorCoreAttention(layerIndex)) {
+        if (gemmAttention) {
+            gemmAttention(layer, headDim, kvMul, qDim, kvDim, stride, cacheBaseOffset, windowSize);
+        } else if (tensorCoreAttention(layerIndex)) {
             layer.task(
                     "batch_attention",
                     Gemma4AttentionKernels::attentionPrefillTensorCoreFP16,
@@ -1684,7 +1880,7 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             // would leave the rows between the two untouched, and the kernel's own guard — which
             // writes zeros and returns — would never run for them. It matters only when the chunk
             // width is not a multiple of 128, which nothing rounds it to.
-            scheduler.addWorkerGrid(
+            if (!gemmAttention) scheduler.addWorkerGrid(
                     p + "batch_attention",
                     tensorCoreAttention(l)
                             ? WorkerGridFactory.genericWorker(
