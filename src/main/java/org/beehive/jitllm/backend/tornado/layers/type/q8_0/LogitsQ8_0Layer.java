@@ -116,6 +116,8 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
                                 System.getProperty("jitllm.qwen35.packedIntegerDot", "true"))
                 && (weights.wclsByteArray.dataType()
                                 == org.beehive.jitllm.runtime.tensor.DataType.Q6_K
+                        || weights.wclsByteArray.dataType()
+                                == org.beehive.jitllm.runtime.tensor.DataType.Q4_K
                         || packedQ8_0Vocabulary(weights))
                 && state.workspace.wrapXbQuants != null
                 && org.beehive.jitllm.backend.tornado.device.TornadoDevices.current()
@@ -171,6 +173,22 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
                         context,
                         state.workspace.wrapXbQuants,
                         state.workspace.wrapXbScales,
+                        state.workspace.wrapLogits,
+                        w.asByteArray(),
+                        config.dim(),
+                        config.vocabularySize(),
+                        localSize);
+                return;
+            }
+            if (w.dataType() == org.beehive.jitllm.runtime.tensor.DataType.Q4_K) {
+                logits.task(
+                        "vocab_proj",
+                        org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_K
+                                ::matrixVectorGenericQ4_KDP4A,
+                        context,
+                        state.workspace.wrapXbQuants,
+                        state.workspace.wrapXbScales,
+                        state.workspace.wrapXbSums,
                         state.workspace.wrapLogits,
                         w.asByteArray(),
                         config.dim(),

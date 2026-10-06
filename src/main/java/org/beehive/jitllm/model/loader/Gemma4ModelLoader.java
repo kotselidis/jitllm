@@ -270,13 +270,26 @@ public class Gemma4ModelLoader extends AbstractModelLoader<Gemma4, Gemma4Configu
                 TornadoTensorLoader.fromFloats(ropeTables.imagSwa),
                 TornadoTensorLoader.fromFloats(ropeTables.realFull),
                 TornadoTensorLoader.fromFloats(ropeTables.imagFull),
-                tensorEntries.containsKey("output.weight")
-                        ? loadTornadoTensor(tensorEntries.get("output.weight"))
-                        : loadTornadoTensor(tokenEmbeddings),
+                loadOutput(
+                        retain,
+                        tensorEntries.containsKey("output.weight")
+                                ? tensorEntries.get("output.weight")
+                                : tokenEmbeddings),
                 weightType);
     }
 
     // @formatter:on
+
+    /**
+     * The output projection. Next to Q4_0 projections it stays Q4_K, read by the packed-integer
+     * Q4_K kernel, rather than becoming a Q8_0 copy of nearly twice the bytes.
+     */
+    private static TornadoTensor loadOutput(boolean retain, GGMLTensorEntry entry) {
+        if (retain) {
+            return loadTornadoTensorRetainingQ4_K(entry);
+        }
+        return loadTornadoTensor(entry);
+    }
 
     /**
      * Tensor entries produced by {@link GGUF#loadTensorsTornado} prefix every {@code
