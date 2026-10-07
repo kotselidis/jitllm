@@ -49,7 +49,7 @@ public final class BatchPrefillSupport {
                             : Optional.of(
                                     "the gemma4 batched prefill is written for tensor cores"
                                             + " only, which this device does not have");
-            case "qwen35" ->
+            case "qwen35", "qwen35moe" ->
                     BackendId.OPENCL.equals(c.backend())
                             ? Optional.of(
                                     "the qwen35 batched prefill projections do not compile on the"

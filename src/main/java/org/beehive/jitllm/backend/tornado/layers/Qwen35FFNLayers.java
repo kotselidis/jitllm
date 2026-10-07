@@ -120,6 +120,9 @@ public class Qwen35FFNLayers
      */
     private final String activationGraphName;
 
+    /** The feed-forward of a family built on this one, or {@code null} for the dense SwiGLU. */
+    protected final Qwen35FeedForward feedForward;
+
     public Qwen35FFNLayers(
             String taskGraphName,
             Qwen35State state,
@@ -162,9 +165,41 @@ public class Qwen35FFNLayers
             String activationGraphName,
             int firstLayer,
             int endLayer) {
+        this(
+                taskGraphName,
+                state,
+                weights,
+                config,
+                schedulerType,
+                activationGraphName,
+                firstLayer,
+                endLayer,
+                null);
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)}, their feed-forward {@code feedForward} in place of
+     * the dense SwiGLU when it is not null: a family built on this one.
+     */
+    public Qwen35FFNLayers(
+            String taskGraphName,
+            Qwen35State state,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            SchedulerType schedulerType,
+            String activationGraphName,
+            int firstLayer,
+            int endLayer,
+            Qwen35FeedForward feedForward) {
         super(taskGraphName, state, weights, config, schedulerType);
+        if (feedForward != null && !DP4A) {
+            throw new UnsupportedOperationException(
+                    "this feed-forward reads a quantized activation, which needs a device with"
+                            + " packed integer dot products");
+        }
         this.qwen35State = state;
         this.activationGraphName = activationGraphName;
+        this.feedForward = feedForward;
         restrictToLayers(firstLayer, endLayer);
         setupFFNLayers();
     }
@@ -919,6 +954,27 @@ public class Qwen35FFNLayers
             normedActivationQuantized = true;
         }
 
+        if (feedForward != null) {
+            feedForward.appendTasks(layer, context, layerIndex, this::tn);
+        } else {
+            denseFeedForward(layer, layerIndex);
+        }
+
+        if (lastLayerOfGraph(layerIndex)) {
+            layer.persistOnDevice(
+                    qwen35State.workspace.wrapX,
+                    keyStore(),
+                    valueStore(),
+                    qwen35State.workspace.wrapConvState,
+                    qwen35State.workspace.wrapDeltaState);
+        }
+        return layer;
+    }
+
+    /**
+     * The dense feed-forward of one layer, from the normalized {@code wrapXb} into {@code wrapX}.
+     */
+    private void denseFeedForward(TaskGraph layer, int layerIndex) {
         fusedGateUp(
                 layer,
                 layerIndex,
@@ -951,16 +1007,6 @@ public class Qwen35FFNLayers
                 config.hiddenDim(),
                 config.dim(),
                 true);
-
-        if (lastLayerOfGraph(layerIndex)) {
-            layer.persistOnDevice(
-                    qwen35State.workspace.wrapX,
-                    keyStore(),
-                    valueStore(),
-                    qwen35State.workspace.wrapConvState,
-                    qwen35State.workspace.wrapDeltaState);
-        }
-        return layer;
     }
 
     // @formatter:off
@@ -1799,9 +1845,13 @@ public class Qwen35FFNLayers
         List<Object> tensors = new ArrayList<>();
         tensors.add(weights.rms_att_weightLayered[layerIndex].asFloatArray());
         tensors.add(weights.rms_ffn_weightLayered[layerIndex].asFloatArray());
-        tensors.add(require(weights.w1Layered, layerIndex, "ffn_gate"));
-        tensors.add(require(weights.w2Layered, layerIndex, "ffn_down"));
-        tensors.add(require(weights.w3Layered, layerIndex, "ffn_up"));
+        if (feedForward != null) {
+            tensors.addAll(feedForward.layerWeights(layerIndex));
+        } else {
+            tensors.add(require(weights.w1Layered, layerIndex, "ffn_gate"));
+            tensors.add(require(weights.w2Layered, layerIndex, "ffn_down"));
+            tensors.add(require(weights.w3Layered, layerIndex, "ffn_up"));
+        }
         if (config.isRecurrentLayer(layerIndex)) {
             tensors.add(require(weights.ssmQkv, layerIndex, "attn_qkv"));
             tensors.add(require(weights.ssmGate, layerIndex, "attn_gate"));
@@ -1870,6 +1920,9 @@ public class Qwen35FFNLayers
                         qwen35State.workspace.wrapXbScales,
                         qwen35State.workspace.wrapXbSums);
             }
+            if (feedForward != null) {
+                layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, feedForward.scratch());
+            }
             // The recurrent state persists across tokens and is updated in place, so it is
             // uploaded once — zeroed — and never read back. Uploading it every execution would
             // overwrite the device's own history with the host's stale copy.
@@ -1912,6 +1965,9 @@ public class Qwen35FFNLayers
                         qwen35State.workspace.wrapXbQuants,
                         qwen35State.workspace.wrapXbScales,
                         qwen35State.workspace.wrapXbSums);
+            }
+            if (feedForward != null) {
+                layer.consumeFromDevice(predecessor, feedForward.scratch());
             }
             layer.consumeFromDevice(
                     predecessor,
@@ -2019,10 +2075,15 @@ public class Qwen35FFNLayers
                 scheduler.addWorkerGrid(prefix + "attn_rms_apply", rmsApply);
                 scheduler.addWorkerGrid(prefix + "ffn_rms_apply", rmsApply);
             }
-            scheduler.addWorkerGrid(
-                    prefix + "ffn_gate_up", projWorker(layer, "ffn_gate_up", config.hiddenDim()));
-            scheduler.addWorkerGrid(
-                    prefix + "ffn_down_proj", projWorker(layer, "ffn_down_proj", config.dim()));
+            if (feedForward != null) {
+                feedForward.addWorkerGrids(scheduler, prefix);
+            } else {
+                scheduler.addWorkerGrid(
+                        prefix + "ffn_gate_up",
+                        projWorker(layer, "ffn_gate_up", config.hiddenDim()));
+                scheduler.addWorkerGrid(
+                        prefix + "ffn_down_proj", projWorker(layer, "ffn_down_proj", config.dim()));
+            }
 
             if (config.isRecurrentLayer(layer)) {
                 scheduler.addWorkerGrid(

@@ -101,6 +101,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
     private final Qwen35Configuration config;
     private final int batchSize;
 
+    /** The feed-forward of a family built on this one, or {@code null} for the dense SwiGLU. */
+    private final Qwen35BatchFeedForward feedForward;
+
     /** The layers this prefill builds, {@code [firstLayer, endLayer)}: one pipeline stage's. */
     private final int firstLayer;
 
@@ -562,6 +565,21 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             int batchSize,
             int firstLayer,
             int endLayer) {
+        this(state, weights, config, batchSize, firstLayer, endLayer, null);
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)}, their feed-forward {@code feedForward} in place of
+     * the dense SwiGLU when it is not null: a family built on this one.
+     */
+    public Qwen35BatchPrefillLayers(
+            Qwen35State state,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            int batchSize,
+            int firstLayer,
+            int endLayer,
+            Qwen35BatchFeedForward feedForward) {
         if (firstLayer < 0 || endLayer > config.numberOfLayers() || firstLayer >= endLayer) {
             throw new IllegalArgumentException(
                     "layer range ["
@@ -579,6 +597,13 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         this.firstLayer = firstLayer;
         this.endLayer = endLayer;
         allocateQ8Scratch();
+        if (feedForward != null && !int8Quantizes(config.dim())) {
+            throw new UnsupportedOperationException(
+                    "this feed-forward runs on the int8 tensor cores, at widths that are a"
+                            + " multiple of 128; this width is "
+                            + batchSize);
+        }
+        this.feedForward = feedForward;
         this.graphs =
                 IntStream.range(firstLayer, endLayer)
                         .mapToObj(this::buildLayer)
@@ -1337,6 +1362,24 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 state.workspace.ffnScaleBatch,
                 require(weights.rms_ffn_weightLayered, layerIndex, "post_attention_norm"));
 
+        if (feedForward != null) {
+            feedForward.appendTasks(layer, context, layerIndex);
+        } else {
+            denseFeedForward(layer, layerIndex);
+        }
+
+        layer.persistOnDevice(
+                state.workspace.wrapXBatch,
+                keyStore(),
+                valueStore(),
+                state.workspace.wrapBlockTable,
+                state.workspace.wrapConvState,
+                state.workspace.wrapDeltaState);
+        return layer;
+    }
+
+    /** The dense feed-forward of one layer, from the normalized chunk into {@code wrapXBatch}. */
+    private void denseFeedForward(TaskGraph layer, int layerIndex) {
         TornadoTensor down = require(weights.w2Layered, layerIndex, "ffn_down");
         // Both representations this family's ffn_down comes in. The Q4_1 kernel below was written
         // and tested with the Q4_0 one, and then never reached: this condition asked for Q4_0 and
@@ -1468,15 +1511,6 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     config.dim(),
                     true);
         }
-
-        layer.persistOnDevice(
-                state.workspace.wrapXBatch,
-                keyStore(),
-                valueStore(),
-                state.workspace.wrapBlockTable,
-                state.workspace.wrapConvState,
-                state.workspace.wrapDeltaState);
-        return layer;
     }
 
     /** The largest workgroup a CUDA device schedules; a head wider than it keeps one lane. */
@@ -2177,9 +2211,13 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         List<Object> tensors = new ArrayList<>();
         tensors.add(weights.rms_att_weightLayered[layerIndex].asFloatArray());
         tensors.add(weights.rms_ffn_weightLayered[layerIndex].asFloatArray());
-        tensors.add(require(weights.w1Layered, layerIndex, "ffn_gate"));
-        tensors.add(require(weights.w2Layered, layerIndex, "ffn_down"));
-        tensors.add(require(weights.w3Layered, layerIndex, "ffn_up"));
+        if (feedForward != null) {
+            tensors.addAll(feedForward.layerWeights(layerIndex));
+        } else {
+            tensors.add(require(weights.w1Layered, layerIndex, "ffn_gate"));
+            tensors.add(require(weights.w2Layered, layerIndex, "ffn_down"));
+            tensors.add(require(weights.w3Layered, layerIndex, "ffn_up"));
+        }
         if (config.isRecurrentLayer(layerIndex)) {
             tensors.add(require(weights.ssmQkv, layerIndex, "attn_qkv"));
             tensors.add(require(weights.ssmGate, layerIndex, "attn_gate"));
@@ -2228,6 +2266,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             if (state.workspace.wrapQ8SplitPartial != null) {
                 layer.transferToDevice(
                         DataTransferMode.FIRST_EXECUTION, state.workspace.wrapQ8SplitPartial);
+            }
+            if (feedForward != null) {
+                layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, feedForward.scratch());
             }
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION, state.workspace.batchStartPosHolder);
@@ -2309,6 +2350,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     valueStore(),
                     state.workspace.batchStartPosHolder);
             layer.consumeFromDevice(predecessor, state.workspace.wrapBlockTable);
+            if (feedForward != null) {
+                layer.consumeFromDevice(predecessor, feedForward.scratch());
+            }
             if (state.workspace.wrapQ8ActBatch != null) {
                 layer.consumeFromDevice(
                         predecessor,
@@ -2521,6 +2565,9 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             scheduler.addWorkerGrid(prefix + "ffn_rms_reduce", rmsReduce);
             scheduler.addWorkerGrid(prefix + "attn_rms_apply", rmsApply);
             scheduler.addWorkerGrid(prefix + "ffn_rms_apply", rmsApply);
+            if (feedForward != null) {
+                feedForward.addWorkerGrids(scheduler, prefix);
+            }
             if (TENSOR_CORES && TensorCoreSupport.isTensorCoreCapableBackend()) {
                 scheduler.addWorkerGrid(prefix + "attn_rms_apply_fp16", fp16Convert);
                 scheduler.addWorkerGrid(prefix + "ffn_rms_apply_fp16", fp16Convert);

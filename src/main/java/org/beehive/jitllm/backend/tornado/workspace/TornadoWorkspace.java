@@ -273,6 +273,37 @@ public final class TornadoWorkspace {
     public FloatArray wrapExpertGate;
     public FloatArray wrapSharedGate;
     public FloatArray wrapSharedOutput;
+
+    /**
+     * A {@code qwen35moe} token's expert activations: every selected expert's hidden rows, then the
+     * shared expert's.
+     */
+    public FloatArray wrapMoeHidden;
+
+    /** {@link #wrapMoeHidden} quantized per 32-block, for the packed-integer down projection. */
+    public IntArray wrapMoeHiddenQuants;
+
+    public FloatArray wrapMoeHiddenQScales;
+    public IntArray wrapMoeHiddenQSums;
+
+    // A qwen35moe chunk's routing and expert activations (see Qwen35MoeBatchKernels).
+    public FloatArray wrapMoeLogitsBatch;
+    public IntArray wrapMoeIdsBatch;
+    public FloatArray wrapMoeWeightsBatch;
+    public FloatArray wrapMoeSharedGateBatch;
+    public IntArray wrapMoeSortedToken;
+    public IntArray wrapMoePosition;
+    public IntArray wrapMoeTiles;
+    public FloatArray wrapMoeHiddenBatch;
+    public ByteArray wrapMoeHiddenQ8;
+    public FloatArray wrapMoeHiddenScales;
+    public FloatArray wrapMoeOutBatch;
+    public FloatArray wrapMoeSharedGateUp;
+    public FloatArray wrapMoeSharedHidden;
+    public ByteArray wrapMoeSharedQ8;
+    public FloatArray wrapMoeSharedScales;
+    public FloatArray wrapMoeSharedOut;
+
     public FloatArray wrapRouterLogitsBatch;
     public IntArray activeBatchSizeHolder;
     public IntArray wrapSelectedExpertsBatch;

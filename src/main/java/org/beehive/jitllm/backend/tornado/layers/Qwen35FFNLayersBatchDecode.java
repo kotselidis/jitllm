@@ -54,6 +54,22 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
             SchedulerType schedulerType,
             int firstLayer,
             int endLayer) {
+        this(taskGraphName, state, weights, config, schedulerType, firstLayer, endLayer, null);
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)} with the feed-forward of a family built on this
+     * one.
+     */
+    public Qwen35FFNLayersBatchDecode(
+            String taskGraphName,
+            Qwen35State state,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            SchedulerType schedulerType,
+            int firstLayer,
+            int endLayer,
+            Qwen35FeedForward feedForward) {
         super(
                 taskGraphName,
                 state,
@@ -62,7 +78,8 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
                 schedulerType,
                 "decodeActivation",
                 requireGroupStart(firstLayer),
-                endLayer);
+                endLayer,
+                feedForward);
     }
 
     private static int requireGroupStart(int firstLayer) {
@@ -175,6 +192,9 @@ public class Qwen35FFNLayersBatchDecode extends Qwen35FFNLayers {
                 state.workspace.wrapSsmK,
                 state.workspace.wrapSsmV,
                 state.workspace.wrapSsmOut);
+        if (feedForward != null) {
+            layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, feedForward.scratch());
+        }
         // What prefill left behind: the caches, the table that addresses them, and the recurrence.
         String source = cacheSource();
         layer.consumeFromDevice(source, keyStore(), valueStore());

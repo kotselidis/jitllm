@@ -75,40 +75,42 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
     // @formatter:off
     @Override
     protected Qwen35Configuration createConfiguration(Map<String, Object> metadata) {
-        int modelContextLength = (int) metadata.get("qwen35.context_length");
+        // A family built on this one names the same keys under its own architecture.
+        String p = metadata.get("general.architecture") + ".";
+        int modelContextLength = (int) metadata.get(p + "context_length");
         int finalContextLength = resolveContextLength(modelContextLength);
 
         // block_count counts the MTP blocks with the trunk; the trunk is what the forward pass
         // runs, so the two are separated here rather than at every use.
-        int blockCount = (int) metadata.get("qwen35.block_count");
+        int blockCount = (int) metadata.get(p + "block_count");
         int nextnLayers =
-                metadata.containsKey("qwen35.nextn_predict_layers")
-                        ? (int) metadata.get("qwen35.nextn_predict_layers")
+                metadata.containsKey(p + "nextn_predict_layers")
+                        ? (int) metadata.get(p + "nextn_predict_layers")
                         : 0;
 
         Qwen35Configuration config =
                 new Qwen35Configuration(
                         getModelQuantization(metadata),
-                        (int) metadata.get("qwen35.embedding_length"),
-                        (int) metadata.get("qwen35.feed_forward_length"),
+                        (int) metadata.get(p + "embedding_length"),
+                        feedForwardLength(metadata, p),
                         blockCount - nextnLayers,
                         nextnLayers,
-                        (int) metadata.get("qwen35.attention.head_count"),
-                        (int) metadata.get("qwen35.attention.head_count_kv"),
-                        (int) metadata.get("qwen35.attention.key_length"),
-                        (int) metadata.get("qwen35.attention.value_length"),
-                        (int) metadata.get("qwen35.full_attention_interval"),
-                        (int) metadata.get("qwen35.ssm.conv_kernel"),
-                        (int) metadata.get("qwen35.ssm.state_size"),
-                        (int) metadata.get("qwen35.ssm.group_count"),
-                        (int) metadata.get("qwen35.ssm.time_step_rank"),
-                        (int) metadata.get("qwen35.ssm.inner_size"),
-                        (int) metadata.get("qwen35.rope.dimension_count"),
+                        (int) metadata.get(p + "attention.head_count"),
+                        (int) metadata.get(p + "attention.head_count_kv"),
+                        (int) metadata.get(p + "attention.key_length"),
+                        (int) metadata.get(p + "attention.value_length"),
+                        (int) metadata.get(p + "full_attention_interval"),
+                        (int) metadata.get(p + "ssm.conv_kernel"),
+                        (int) metadata.get(p + "ssm.state_size"),
+                        (int) metadata.get(p + "ssm.group_count"),
+                        (int) metadata.get(p + "ssm.time_step_rank"),
+                        (int) metadata.get(p + "ssm.inner_size"),
+                        (int) metadata.get(p + "rope.dimension_count"),
                         vocabulary.size(),
                         modelContextLength,
                         finalContextLength,
-                        (float) metadata.get("qwen35.attention.layer_norm_rms_epsilon"),
-                        (float) metadata.get("qwen35.rope.freq_base"));
+                        (float) metadata.get(p + "attention.layer_norm_rms_epsilon"),
+                        (float) metadata.get(p + "rope.freq_base"));
         validate(config);
         return config;
     }
@@ -128,6 +130,19 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
      * anything about this loader — but this is the first model where the default cannot run at all,
      * and quietly changing the rule for everyone is not this port's decision to make.
      */
+    /** The feed-forward's hidden width; a family whose feed-forward is not dense states its own. */
+    protected int feedForwardLength(Map<String, Object> metadata, String prefix) {
+        return (int) metadata.get(prefix + "feed_forward_length");
+    }
+
+    /**
+     * Whether every layer carries a dense SwiGLU feed-forward ({@code ffn_gate}, {@code ffn_up},
+     * {@code ffn_down}). A family that replaces it loads its own tensors instead.
+     */
+    protected boolean hasDenseFeedForward() {
+        return true;
+    }
+
     private int resolveContextLength(int modelContextLength) {
         if (contextLength > 0) {
             return Math.min(contextLength, modelContextLength);
@@ -268,12 +283,20 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         FloatTensor[] ffnNorm =
                 perBlock(
                         blocks, l -> tensorEntries.get("blk." + l + ".post_attention_norm.weight"));
+        // A dense feed-forward, or none: a family that replaces it loads its own tensors.
+        boolean dense = hasDenseFeedForward();
         FloatTensor[] ffnGate =
-                perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_gate.weight"));
+                dense
+                        ? perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_gate.weight"))
+                        : new FloatTensor[blocks];
         FloatTensor[] ffnDown =
-                perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_down.weight"));
+                dense
+                        ? perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_down.weight"))
+                        : new FloatTensor[blocks];
         FloatTensor[] ffnUp =
-                perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_up.weight"));
+                dense
+                        ? perBlock(blocks, l -> tensorEntries.get("blk." + l + ".ffn_up.weight"))
+                        : new FloatTensor[blocks];
 
         // Attention blocks: every trunk layer that does not recur, plus every MTP block.
         FloatTensor[] wq = new FloatTensor[blocks];
@@ -366,7 +389,7 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
 
     // @formatter:on
 
-    private static FloatTensor[] perBlock(int blocks, IntFunction<GGMLTensorEntry> entry) {
+    protected static FloatTensor[] perBlock(int blocks, IntFunction<GGMLTensorEntry> entry) {
         FloatTensor[] tensors = new FloatTensor[blocks];
         for (int l = 0; l < blocks; l++) {
             GGMLTensorEntry found = entry.apply(l);
@@ -454,9 +477,11 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
 
         for (int l = 0; l < blocks; l++) {
             String blk = "blk." + l + ".";
-            ffnGate[l] = projectionTensor(tensorEntries, blk + "ffn_gate.weight");
-            ffnDown[l] = projectionTensor(tensorEntries, blk + "ffn_down.weight");
-            ffnUp[l] = projectionTensor(tensorEntries, blk + "ffn_up.weight");
+            if (hasDenseFeedForward()) {
+                ffnGate[l] = projectionTensor(tensorEntries, blk + "ffn_gate.weight");
+                ffnDown[l] = projectionTensor(tensorEntries, blk + "ffn_down.weight");
+                ffnUp[l] = projectionTensor(tensorEntries, blk + "ffn_up.weight");
+            }
             if (config.isRecurrentLayer(l)) {
                 ssmQkv[l] = projectionTensor(tensorEntries, blk + "attn_qkv.weight");
                 ssmGate[l] = projectionTensor(tensorEntries, blk + "attn_gate.weight");
@@ -479,7 +504,7 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
             }
         }
 
-        DataType weightType = projectionType(tensorEntries, config);
+        DataType weightType = projectionType(tensorEntries, config, hasDenseFeedForward());
 
         return new Qwen35TornadoWeights(
                 blocks,
@@ -551,7 +576,8 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         return new Q8_0TornadoTensor(tensor.asByteArray(), new PackedTiles(rows, cols));
     }
 
-    private static TornadoTensor[] perBlockDevice(int blocks, IntFunction<GGMLTensorEntry> entry) {
+    protected static TornadoTensor[] perBlockDevice(
+            int blocks, IntFunction<GGMLTensorEntry> entry) {
         TornadoTensor[] tensors = new TornadoTensor[blocks];
         for (int l = 0; l < blocks; l++) {
             GGMLTensorEntry found = entry.apply(l);
@@ -589,7 +615,7 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
      */
     // @formatter:on
     private static DataType projectionType(
-            Map<String, GGMLTensorEntry> entries, Qwen35Configuration config) {
+            Map<String, GGMLTensorEntry> entries, Qwen35Configuration config, boolean dense) {
         DataType agreed = null;
         String agreedName = null;
         for (int l = 0; l < config.numberOfBlocks(); l++) {
@@ -599,6 +625,14 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
                             : new String[] {
                                 "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up"
                             };
+            if (!dense) {
+                // A feed-forward that is not dense is read by its own tasks, chosen by its own
+                // representation; the mixer projections are what the model reports.
+                kinds =
+                        config.isRecurrentLayer(l)
+                                ? new String[] {"attn_qkv", "attn_gate"}
+                                : new String[] {"attn_q", "attn_k", "attn_v", "attn_output"};
+            }
             for (String kind : kinds) {
                 String name = "blk." + l + "." + kind + ".weight";
                 GGMLTensorEntry entry = entries.get(name);

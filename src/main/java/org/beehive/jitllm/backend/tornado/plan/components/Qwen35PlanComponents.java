@@ -5,9 +5,11 @@ import org.beehive.jitllm.backend.tornado.layers.Activation;
 import org.beehive.jitllm.backend.tornado.layers.ActivationTaskGraph;
 import org.beehive.jitllm.backend.tornado.layers.BatchPrefillTransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchDecodeActivation;
+import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchFeedForward;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchPrefillLayers;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersBatchDecode;
+import org.beehive.jitllm.backend.tornado.layers.Qwen35FeedForward;
 import org.beehive.jitllm.backend.tornado.layers.TransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillActivation;
@@ -56,7 +58,16 @@ public class Qwen35PlanComponents implements BatchPrefillDecodeForwardPlanCompon
 
     @Override
     public TransformerLayerTaskGraphs singleTokenTransformerLayers() {
-        return new Qwen35FFNLayers("qwen35FFN", state, weights, config, schedulerType);
+        return new Qwen35FFNLayers(
+                "qwen35FFN",
+                state,
+                weights,
+                config,
+                schedulerType,
+                "activationUpdate",
+                0,
+                config.numberOfLayers(),
+                feedForward());
     }
 
     @Override
@@ -75,7 +86,15 @@ public class Qwen35PlanComponents implements BatchPrefillDecodeForwardPlanCompon
     @Override
     public TransformerLayerTaskGraphs prefillDecodeTransformerLayers() {
         return new Qwen35FFNLayers(
-                "qwen35FFN", state, weights, config, schedulerType, "decodeActivation");
+                "qwen35FFN",
+                state,
+                weights,
+                config,
+                schedulerType,
+                "decodeActivation",
+                0,
+                config.numberOfLayers(),
+                feedForward());
     }
 
     @Override
@@ -100,7 +119,14 @@ public class Qwen35PlanComponents implements BatchPrefillDecodeForwardPlanCompon
 
     @Override
     public BatchPrefillTransformerLayerTaskGraphs batchPrefillTransformerLayers(int batchSize) {
-        return new Qwen35BatchPrefillLayers(state, weights, config, batchSize);
+        return new Qwen35BatchPrefillLayers(
+                state,
+                weights,
+                config,
+                batchSize,
+                0,
+                config.numberOfLayers(),
+                batchFeedForward(batchSize));
     }
 
     @Override
@@ -110,6 +136,26 @@ public class Qwen35PlanComponents implements BatchPrefillDecodeForwardPlanCompon
 
     @Override
     public TransformerLayerTaskGraphs batchDecodeTransformerLayers() {
-        return new Qwen35FFNLayersBatchDecode("qwen35FFN", state, weights, config, schedulerType);
+        return new Qwen35FFNLayersBatchDecode(
+                "qwen35FFN",
+                state,
+                weights,
+                config,
+                schedulerType,
+                0,
+                config.numberOfLayers(),
+                feedForward());
+    }
+
+    // ── A family built on this one ────────────────────────────────────────────
+
+    /** The single-token feed-forward in place of the dense SwiGLU, or {@code null} for it. */
+    protected Qwen35FeedForward feedForward() {
+        return null;
+    }
+
+    /** The batched-prefill feed-forward in place of the dense SwiGLU, or {@code null} for it. */
+    protected Qwen35BatchFeedForward batchFeedForward(int batchSize) {
+        return null;
     }
 }

@@ -32,7 +32,7 @@ import org.beehive.jitllm.tensor.standard.FloatTensor;
  * current position; a recurrent state has no such mask, and a stale one silently conditions the new
  * sequence on the old one.
  */
-public final class Qwen35State extends State {
+public class Qwen35State extends State {
 
     /**
      * Rolling convolution history per recurrent layer, {@code convDim * (kernel - 1)} elements,
