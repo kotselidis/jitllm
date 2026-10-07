@@ -13,6 +13,7 @@ import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_1;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_K;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ5_K;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ6_K;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ8_0DP4A;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.plan.FusedOperandSupport;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
@@ -132,9 +133,36 @@ public class Qwen35FFNLayers
             Qwen35Configuration config,
             SchedulerType schedulerType,
             String activationGraphName) {
+        this(
+                taskGraphName,
+                state,
+                weights,
+                config,
+                schedulerType,
+                activationGraphName,
+                0,
+                config.numberOfLayers());
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)} only: one stage of a model split across devices.
+     * The first layer of the range takes the role layer 0 has otherwise. The key/value and
+     * recurrent state keep their whole-model layout and absolute indices, so a stage's state holds
+     * room for every layer and uses its own.
+     */
+    public Qwen35FFNLayers(
+            String taskGraphName,
+            Qwen35State state,
+            Qwen35TornadoWeights weights,
+            Qwen35Configuration config,
+            SchedulerType schedulerType,
+            String activationGraphName,
+            int firstLayer,
+            int endLayer) {
         super(taskGraphName, state, weights, config, schedulerType);
         this.qwen35State = state;
         this.activationGraphName = activationGraphName;
+        restrictToLayers(firstLayer, endLayer);
         setupFFNLayers();
     }
 
@@ -214,8 +242,25 @@ public class Qwen35FFNLayers
                         && residual
                         && x == state.workspace.wrapSsmOut
                         && ssmActivationQuantized;
+        // Q8_0 wherever the activation it reads has been quantized: the normalized input, the
+        // SwiGLU output or the delta-net readout. The weight block is already signed bytes, so the
+        // packed dot product needs no conversion of it.
+        boolean packedQ8_0 =
+                w.dataType() == DataType.Q8_0
+                        && ((!residual && x == state.workspace.wrapXb && normedActivationQuantized)
+                                || (residual
+                                        && x == state.workspace.wrapHb
+                                        && hiddenActivationQuantized)
+                                || (residual
+                                        && x == state.workspace.wrapSsmOut
+                                        && ssmActivationQuantized));
         dispatches.add(
-                new Dispatch(layer, task, role, w.dataType(), packed || packedQ5_K || packedQ4_1));
+                new Dispatch(
+                        layer,
+                        task,
+                        role,
+                        w.dataType(),
+                        packed || packedQ5_K || packedQ4_1 || packedQ8_0));
         switch (w.dataType()) {
             case F32 -> {
                 if (residual) {
@@ -258,7 +303,23 @@ public class Qwen35FFNLayers
                 }
             }
             case Q8_0 -> {
-                if (residual) {
+                if (packedQ8_0) {
+                    graph.task(
+                            tn(task),
+                            residual
+                                    ? TransformerComputeKernelsQ8_0DP4A
+                                            ::matrixVectorGenericWithResidualQ8_0DP4A
+                                    : TransformerComputeKernelsQ8_0DP4A
+                                            ::matrixVectorGenericQ8_0DP4A,
+                            context,
+                            state.workspace.wrapXbQuants,
+                            state.workspace.wrapXbScales,
+                            out,
+                            w.asByteArray(),
+                            n,
+                            d,
+                            MATVEC_LOCAL);
+                } else if (residual) {
                     graph.task(
                             tn(task),
                             TransformerComputeKernelsLayered
@@ -548,8 +609,32 @@ public class Qwen35FFNLayers
                 gate.dataType() == DataType.Q4_0
                         && x == qwen35State.workspace.wrapXb
                         && normedActivationQuantized;
+        boolean packedQ8_0 =
+                gate.dataType() == DataType.Q8_0
+                        && x == qwen35State.workspace.wrapXb
+                        && normedActivationQuantized;
         dispatches.add(
-                new Dispatch(layer, "ffn_gate_up", "ffn_gate|ffn_up", gate.dataType(), packed));
+                new Dispatch(
+                        layer,
+                        "ffn_gate_up",
+                        "ffn_gate|ffn_up",
+                        gate.dataType(),
+                        packed || packedQ8_0));
+        if (packedQ8_0) {
+            graph.task(
+                    tn("ffn_gate_up"),
+                    TransformerComputeKernelsQ8_0DP4A::fusedFFNGateUpSiLUQ8_0DP4A,
+                    context,
+                    qwen35State.workspace.wrapXbQuants,
+                    qwen35State.workspace.wrapXbScales,
+                    qwen35State.workspace.wrapHb,
+                    gate.asByteArray(),
+                    up.asByteArray(),
+                    config.dim(),
+                    config.hiddenDim(),
+                    MATVEC_LOCAL);
+            return;
+        }
         if (packed) {
             graph.task(
                     tn("ffn_gate_up"),
@@ -650,13 +735,13 @@ public class Qwen35FFNLayers
      * Whether {@code layerIndex} is the first layer of its graph, and so owns the graph's inputs.
      */
     protected final boolean firstLayerOfGraph(int layerIndex) {
-        return layerIndex == 0
+        return layerIndex == firstLayer
                 || !layerGraphName(layerIndex - 1).equals(layerGraphName(layerIndex));
     }
 
     /** Whether {@code layerIndex} is the last layer of its graph, and so publishes its outputs. */
     protected final boolean lastLayerOfGraph(int layerIndex) {
-        return layerIndex == config.numberOfLayers() - 1
+        return layerIndex == endLayer(config.numberOfLayers()) - 1
                 || !layerGraphName(layerIndex + 1).equals(layerGraphName(layerIndex));
     }
 
@@ -690,7 +775,7 @@ public class Qwen35FFNLayers
         // store of wrapX is an ordinary dependency between tasks and consuming it would be wrong.
         if (firstLayerOfGraph(layerIndex)) {
             String predecessor =
-                    layerIndex == 0 ? activationGraphName : layerGraphName(layerIndex - 1);
+                    layerIndex == firstLayer ? activationGraphName : layerGraphName(layerIndex - 1);
             layer.consumeFromDevice(predecessor, qwen35State.workspace.wrapX);
             configureLayerDataTransfers(layer, layerIndex);
         }
@@ -1657,7 +1742,7 @@ public class Qwen35FFNLayers
 
     @Override
     protected TaskGraph configureLayerDataTransfers(TaskGraph layer, int layerIndex) {
-        if (layerIndex == 0) {
+        if (layerIndex == firstLayer) {
             layer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION,
                     qwen35State.workspace.positionHolder,
@@ -1808,7 +1893,7 @@ public class Qwen35FFNLayers
         // value head for a split kernel, the elementwise default for the lane-per-column one.
         WorkerGrid deltaRule = deltaRuleWorker(deltaRuleGeometry(), config);
 
-        for (int layer = 0; layer < config.numberOfLayers(); layer++) {
+        for (int layer = firstLayer; layer < endLayer(config.numberOfLayers()); layer++) {
             // The same graph and the same task qualification the tasks were built with; a
             // grouped family puts two layers in one graph and distinguishes them by task prefix.
             String prefix = layerGraphName(layer) + "." + layerTaskPrefix(layer);

@@ -1,0 +1,198 @@
+package org.beehive.jitllm.backend.tornado.kernels;
+
+import uk.ac.manchester.tornado.api.KernelContext;
+import uk.ac.manchester.tornado.api.math.TornadoMath;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
+import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.api.utils.QuantizationUtils;
+
+// @formatter:off
+/**
+ * Decode projections over Q8_0 weights as packed integer dot products ({@code dp4a}).
+ *
+ * <p>The activation is the one {@link TransformerComputeKernelsQ4_0#quantizeActivationQ8Blocks}
+ * prepares for the Q4_0 projections: 32-element blocks of signed bytes, four to an int, with an
+ * FP32 scale per block. A Q8_0 weight block has the same shape — an FP16 scale and 32 signed bytes
+ * — so a block's dot product is eight {@code dp4a} instructions on the raw bytes, times the two
+ * scales. Unlike Q4_0 nothing is recentred, so the activation's block sums are not read.
+ *
+ * <p>One workgroup per output row, as in the Q4_0 kernels: each lane walks blocks, each warp
+ * reduces with shuffles, and lane 0 combines the warps. {@code localWorkGroupSize} must be a
+ * multiple of 32. The weight bytes are read two at a time, which keeps every read aligned: a block
+ * starts at an even offset and its quants two bytes later.
+ */
+// @formatter:on
+public final class TransformerComputeKernelsQ8_0DP4A {
+
+    private static final int QK = 32;
+    private static final int BLOCK_BYTES = 34;
+    private static final int QS_OFFSET = 2;
+
+    private TransformerComputeKernelsQ8_0DP4A() {}
+
+    /** The integer dot product of one weight block with the activation block it multiplies. */
+    private static int blockDot(ByteArray w, int blockByteOffset, IntArray xQuants, int quantBase) {
+        int dot = 0;
+        for (int g = 0; g < QK / 4; g++) {
+            int offset = blockByteOffset + QS_OFFSET + g * 4;
+            int packed =
+                    (w.getHalfFloat(offset).getHalfFloatValue() & 0xFFFF)
+                            | ((w.getHalfFloat(offset + 2).getHalfFloatValue() & 0xFFFF) << 16);
+            dot = QuantizationUtils.dp4a_packed(packed, xQuants.get(quantBase + g), dot);
+        }
+        return dot;
+    }
+
+    /** This lane's share of row {@code rowId}'s dot product. */
+    private static float rowPartial(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            ByteArray w,
+            int n,
+            int rowId,
+            int localWorkGroupSize) {
+        int blocksPerRow = n / QK;
+        int rowBlockOffset = rowId * blocksPerRow;
+        float partial = 0.0f;
+        for (int block = context.localIdx; block < blocksPerRow; block += localWorkGroupSize) {
+            int blockByteOffset = (rowBlockOffset + block) * BLOCK_BYTES;
+            float weightScale = w.getHalfFloat(blockByteOffset).getFloat32();
+            partial +=
+                    weightScale
+                            * xScales.get(block)
+                            * blockDot(w, blockByteOffset, xQuants, block * (QK / 4));
+        }
+        return partial;
+    }
+
+    /** {@code output[row] = w[row]·x}, the activation quantized. */
+    public static void matrixVectorGenericQ8_0DP4A(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            FloatArray output,
+            ByteArray w,
+            int n,
+            int d,
+            int localWorkGroupSize) {
+        int rowId = context.groupIdx;
+        if (rowId >= d) {
+            return;
+        }
+        int localId = context.localIdx;
+        int warpCount = localWorkGroupSize / 32;
+        float[] warpSums = context.allocateFloatLocalArray(warpCount);
+
+        float partial = rowPartial(context, xQuants, xScales, w, n, rowId, localWorkGroupSize);
+        partial += context.simdShuffleDown(partial, 16);
+        partial += context.simdShuffleDown(partial, 8);
+        partial += context.simdShuffleDown(partial, 4);
+        partial += context.simdShuffleDown(partial, 2);
+        partial += context.simdShuffleDown(partial, 1);
+        if ((localId & 31) == 0) {
+            warpSums[localId >> 5] = partial;
+        }
+        context.localBarrier();
+
+        if (localId == 0) {
+            float total = 0.0f;
+            for (int warp = 0; warp < warpCount; warp++) {
+                total += warpSums[warp];
+            }
+            output.set(rowId, total);
+        }
+    }
+
+    /** {@code hb[row] += w[row]·x}, the activation quantized. */
+    public static void matrixVectorGenericWithResidualQ8_0DP4A(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            FloatArray hb,
+            ByteArray w,
+            int n,
+            int d,
+            int localWorkGroupSize) {
+        int rowId = context.groupIdx;
+        if (rowId >= d) {
+            return;
+        }
+        int localId = context.localIdx;
+        int warpCount = localWorkGroupSize / 32;
+        float[] warpSums = context.allocateFloatLocalArray(warpCount);
+
+        float partial = rowPartial(context, xQuants, xScales, w, n, rowId, localWorkGroupSize);
+        partial += context.simdShuffleDown(partial, 16);
+        partial += context.simdShuffleDown(partial, 8);
+        partial += context.simdShuffleDown(partial, 4);
+        partial += context.simdShuffleDown(partial, 2);
+        partial += context.simdShuffleDown(partial, 1);
+        if ((localId & 31) == 0) {
+            warpSums[localId >> 5] = partial;
+        }
+        context.localBarrier();
+
+        if (localId == 0) {
+            float total = 0.0f;
+            for (int warp = 0; warp < warpCount; warp++) {
+                total += warpSums[warp];
+            }
+            hb.set(rowId, hb.get(rowId) + total);
+        }
+    }
+
+    /**
+     * {@code hb[row] = silu(w1[row]·x) * (w3[row]·x)}, both projections against the same quantized
+     * activation. SiLU is applied to the gate reduced across every warp, never per warp.
+     */
+    public static void fusedFFNGateUpSiLUQ8_0DP4A(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            FloatArray hb,
+            ByteArray w1,
+            ByteArray w3,
+            int n,
+            int d,
+            int localWorkGroupSize) {
+        int rowId = context.groupIdx;
+        if (rowId >= d) {
+            return;
+        }
+        int localId = context.localIdx;
+        int warpCount = localWorkGroupSize / 32;
+        // Gate in the first warpCount entries, up in the second.
+        float[] warpSums = context.allocateFloatLocalArray(warpCount * 2);
+
+        float gate = rowPartial(context, xQuants, xScales, w1, n, rowId, localWorkGroupSize);
+        float up = rowPartial(context, xQuants, xScales, w3, n, rowId, localWorkGroupSize);
+        gate += context.simdShuffleDown(gate, 16);
+        gate += context.simdShuffleDown(gate, 8);
+        gate += context.simdShuffleDown(gate, 4);
+        gate += context.simdShuffleDown(gate, 2);
+        gate += context.simdShuffleDown(gate, 1);
+        up += context.simdShuffleDown(up, 16);
+        up += context.simdShuffleDown(up, 8);
+        up += context.simdShuffleDown(up, 4);
+        up += context.simdShuffleDown(up, 2);
+        up += context.simdShuffleDown(up, 1);
+        if ((localId & 31) == 0) {
+            warpSums[localId >> 5] = gate;
+            warpSums[warpCount + (localId >> 5)] = up;
+        }
+        context.localBarrier();
+
+        if (localId == 0) {
+            float gateSum = 0.0f;
+            float upSum = 0.0f;
+            for (int warp = 0; warp < warpCount; warp++) {
+                gateSum += warpSums[warp];
+                upSum += warpSums[warpCount + warp];
+            }
+            float silu = gateSum / (1.0f + TornadoMath.exp(-gateSum));
+            hb.set(rowId, silu * upSum);
+        }
+    }
+}
