@@ -154,41 +154,87 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
         }
 
         // Load all tensors uniformly as TornadoTensor hierarchy
-        return new LlamaTornadoWeights(
-                loadTornadoTensor(tokenEmbeddings),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".attn_norm.weight")), // fp32
-                perLayerQuantized(
-                        retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
-                perLayerQuantized(
-                        retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
-                perLayerQuantized(
-                        retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
-                perLayerQuantized(
-                        retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")), // fp32
-                perLayerQuantized(
-                        retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
-                // ffn_down keeps its own type: llama.cpp's Q4_0 recipe writes some layers' down
-                // projection as Q4_1, and the layer graph picks the kernel per layer.
-                retainQ4_0
-                        ? loadArrayOfTornadoTensorsNative(
-                                nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight"))
-                        : loadArrayOfTornadoTensors(
-                                nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
-                perLayerQuantized(
-                        retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
-                loadTornadoTensor(tensorEntries.get("output_norm.weight")), // fp32
-                TornadoTensorLoader.fromFloats(ropeFreqs.first()),
-                TornadoTensorLoader.fromFloats(ropeFreqs.second()),
-                // Q4_0 files keep the output projection as Q6_K. Kept as it is, the logits graph
-                // reads it with the packed-integer Q6_K kernel instead of a Q8_0 copy that is a
-                // quarter larger and read in floating point.
-                retainQ4_0 && outputWeight.ggmlType() == GGMLType.Q6_K
-                        ? loadTornadoTensorNative(outputWeight)
-                        : loadTornadoTensor(outputWeight),
-                weightType);
+        LlamaTornadoWeights weights =
+                new LlamaTornadoWeights(
+                        loadTornadoTensor(tokenEmbeddings),
+                        loadArrayOfTornadoTensors(
+                                nl,
+                                i -> tensorEntries.get("blk." + i + ".attn_norm.weight")), // fp32
+                        packQ4(
+                                perLayerQuantized(
+                                        retainQ4_0,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_q.weight"),
+                                retainQ4_0),
+                        packQ4(
+                                perLayerQuantized(
+                                        retainQ4_0,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_k.weight"),
+                                retainQ4_0),
+                        packQ4(
+                                perLayerQuantized(
+                                        retainQ4_0,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_v.weight"),
+                                retainQ4_0),
+                        packQ4(
+                                perLayerQuantized(
+                                        retainQ4_0,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_output.weight"),
+                                retainQ4_0),
+                        loadArrayOfTornadoTensors(
+                                nl,
+                                i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")), // fp32
+                        packQ4(
+                                perLayerQuantized(
+                                        retainQ4_0,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
+                                i -> tensorEntries.get("blk." + i + ".ffn_gate.weight"),
+                                retainQ4_0),
+                        // ffn_down keeps its own type: llama.cpp's Q4_0 recipe writes some layers'
+                        // down
+                        // projection as Q4_1, and the layer graph picks the kernel per layer.
+                        packQ4(
+                                retainQ4_0
+                                        ? loadArrayOfTornadoTensorsNative(
+                                                nl,
+                                                i ->
+                                                        tensorEntries.get(
+                                                                "blk." + i + ".ffn_down.weight"))
+                                        : loadArrayOfTornadoTensors(
+                                                nl,
+                                                i ->
+                                                        tensorEntries.get(
+                                                                "blk." + i + ".ffn_down.weight")),
+                                i -> tensorEntries.get("blk." + i + ".ffn_down.weight"),
+                                retainQ4_0),
+                        packQ4(
+                                perLayerQuantized(
+                                        retainQ4_0,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
+                                i -> tensorEntries.get("blk." + i + ".ffn_up.weight"),
+                                retainQ4_0),
+                        loadTornadoTensor(tensorEntries.get("output_norm.weight")), // fp32
+                        TornadoTensorLoader.fromFloats(ropeFreqs.first()),
+                        TornadoTensorLoader.fromFloats(ropeFreqs.second()),
+                        // Q4_0 files keep the output projection as Q6_K. Kept as it is, the logits
+                        // graph
+                        // reads it with the packed-integer Q6_K kernel instead of a Q8_0 copy that
+                        // is a
+                        // quarter larger and read in floating point.
+                        retainQ4_0 && outputWeight.ggmlType() == GGMLType.Q6_K
+                                ? loadTornadoTensorNative(outputWeight)
+                                : loadTornadoTensor(outputWeight),
+                        weightType);
+        return weights;
     }
 
     // @formatter:on

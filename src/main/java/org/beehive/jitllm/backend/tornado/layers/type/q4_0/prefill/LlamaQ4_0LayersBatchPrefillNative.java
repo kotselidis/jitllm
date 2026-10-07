@@ -280,20 +280,19 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                     state.workspace.wrapBlockTable);
         }
 
-        layer.transferToDevice(
-                DataTransferMode.FIRST_EXECUTION,
+        state.workspace.packedRepack.upload(
+                layer,
                 weights.rms_att_weightLayered[layerIndex].asFloatArray(),
-                weights.wqLayered[layerIndex].asByteArray(),
-                weights.wkLayered[layerIndex].asByteArray(),
-                weights.wvLayered[layerIndex].asByteArray(),
-                weights.woLayered[layerIndex].asByteArray(),
+                weights.wqLayered[layerIndex],
+                weights.wkLayered[layerIndex],
+                weights.wvLayered[layerIndex],
+                weights.woLayered[layerIndex],
                 weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
-                weights.w1Layered[layerIndex].asByteArray(),
-                weights.w2Layered[layerIndex].asByteArray(),
-                weights.w3Layered[layerIndex].asByteArray(),
+                weights.w1Layered[layerIndex],
+                weights.w2Layered[layerIndex],
+                weights.w3Layered[layerIndex],
                 weights.freq_cis_realFlat.asFloatArray(),
                 weights.freq_cis_imagFlat.asFloatArray());
-
         int dim = config.dim();
         int kvDim = config.kvDim();
         int hidDim = config.hiddenDim();
@@ -795,7 +794,9 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
         FloatArray partial = splits > 1 ? splitPartial : out;
         layer.task(
                 name,
-                Int8GemmKernels::gemmInt8Q4_0,
+                w.isPackedQ4()
+                        ? Int8GemmKernels::gemmInt8Q4_0Packed
+                        : Int8GemmKernels::gemmInt8Q4_0,
                 context,
                 q8,
                 q8Scales,
@@ -836,6 +837,11 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
 
     /** Decodes {@code w} into the scratch at {@code offset}, by the tensor's own representation. */
     private void dequantize(TaskGraph layer, String name, TornadoTensor w, int offset) {
+        if (w.isPackedQ4()) {
+            // A packed weight has only the int8 GEMM.
+            throw org.beehive.jitllm.backend.tornado.tensor.PackedWeights.noPackedKernel(
+                    "llama batch-prefill task '" + name + "'");
+        }
         DataType type = w.dataType();
         if (type == DataType.Q4_0) {
             layer.task(

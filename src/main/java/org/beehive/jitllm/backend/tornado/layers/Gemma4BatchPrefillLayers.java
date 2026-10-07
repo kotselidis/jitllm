@@ -505,9 +505,11 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         String graph = layer.getTaskGraphName() + ".";
         layer.task(
                 task,
-                w.dataType() == DataType.Q4_0
-                        ? Int8GemmKernels::gemmInt8Q4_0
-                        : Int8GemmKernels::gemmInt8Q8_0,
+                w.isPackedQ4()
+                        ? Int8GemmKernels::gemmInt8Q4_0Packed
+                        : w.dataType() == DataType.Q4_0
+                                ? Int8GemmKernels::gemmInt8Q4_0
+                                : Int8GemmKernels::gemmInt8Q8_0,
                 context,
                 state.workspace.wrapQ8ActBatch,
                 state.workspace.wrapQ8ActScales,
@@ -673,6 +675,12 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
      */
     // @formatter:on
     private void addDequant(TaskGraph layer, String taskName, TornadoTensor w, int destOffset) {
+        if (w.isPackedQ4()) {
+            // A packed weight has only the int8 GEMM (-Djitllm.gemma4.noInt8Prefill and native
+            // projections are not open to it).
+            throw org.beehive.jitllm.backend.tornado.tensor.PackedWeights.noPackedKernel(
+                    "gemma4 batch-prefill task '" + taskName + "'");
+        }
         switch (w.dataType()) {
             case Q8_0 ->
                     layer.task(
@@ -954,24 +962,22 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         }
         // Each projection in the file's representation: the int8 and FP16 GEMMs read it, and
         // cuBLAS reads it decoded into the shared FP16 scratch.
-        layer.transferToDevice(
-                DataTransferMode.FIRST_EXECUTION,
-                weights.wqLayered[layerIndex].asByteArray(),
-                weights.woLayered[layerIndex].asByteArray(),
-                weights.w1Layered[layerIndex].asByteArray(),
-                weights.w3Layered[layerIndex].asByteArray(),
-                weights.w2Layered[layerIndex].asByteArray());
+        Object[] projections = {
+            weights.wqLayered[layerIndex],
+            weights.woLayered[layerIndex],
+            weights.w1Layered[layerIndex],
+            weights.w3Layered[layerIndex],
+            weights.w2Layered[layerIndex]
+        };
+        state.workspace.packedRepack.upload(layer, projections);
         if (hasOwnKv) {
             requireDecodable(weights.wkLayered[layerIndex], "blk." + layerIndex + ".attn_k");
             requireDecodable(valueWeights(layerIndex), "blk." + layerIndex + ".attn_v");
             layer.transferToDevice(
                     DataTransferMode.FIRST_EXECUTION, weights.attnKNorm[layerIndex].asFloatArray());
-            layer.transferToDevice(
-                    DataTransferMode.FIRST_EXECUTION, weights.wkLayered[layerIndex].asByteArray());
+            state.workspace.packedRepack.upload(layer, weights.wkLayered[layerIndex]);
             if (weights.wvLayered[layerIndex] != null) {
-                layer.transferToDevice(
-                        DataTransferMode.FIRST_EXECUTION,
-                        weights.wvLayered[layerIndex].asByteArray());
+                state.workspace.packedRepack.upload(layer, weights.wvLayered[layerIndex]);
             }
         }
         if (weights.layerOutputScale[layerIndex] != null) {

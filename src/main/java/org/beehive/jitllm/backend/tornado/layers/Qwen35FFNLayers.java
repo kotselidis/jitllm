@@ -9,15 +9,18 @@ import org.beehive.jitllm.backend.tornado.kernels.Qwen3Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_1;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_K;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ5_K;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ6_K;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ8_0DP4A;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ8_0Packed;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.plan.FusedOperandSupport;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
+import org.beehive.jitllm.backend.tornado.tensor.PackedWeights;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
 import org.beehive.jitllm.inference.state.Qwen35State;
 import org.beehive.jitllm.inference.weights.tornado.Qwen35TornadoWeights;
@@ -303,7 +306,32 @@ public class Qwen35FFNLayers
                 }
             }
             case Q8_0 -> {
-                if (packedQ8_0) {
+                if (w.isPackedQ8() && !packedQ8_0) {
+                    packedTasks().add(layer + "." + task);
+                    graph.task(
+                            tn(task),
+                            TransformerComputeKernelsQ8_0Packed::matrixVectorQ8_0PackedF32,
+                            context,
+                            x,
+                            out,
+                            w.asByteArray(),
+                            n,
+                            d,
+                            residual ? 1 : 0);
+                } else if (w.isPackedQ8()) {
+                    packedTasks().add(layer + "." + task);
+                    graph.task(
+                            tn(task),
+                            TransformerComputeKernelsQ8_0Packed::matrixVectorQ8_0Packed,
+                            context,
+                            state.workspace.wrapXbQuants,
+                            state.workspace.wrapXbScales,
+                            out,
+                            w.asByteArray(),
+                            n,
+                            d,
+                            residual ? 1 : 0);
+                } else if (packedQ8_0) {
                     graph.task(
                             tn(task),
                             residual
@@ -345,7 +373,40 @@ public class Qwen35FFNLayers
                 }
             }
             case Q4_0 -> {
-                if (residual && x == state.workspace.wrapHb && hiddenActivationQuantized) {
+                if (w.isPackedQ4()) {
+                    // A packed weight: the quantized activation where the branch made one (the two
+                    // DP4A conditions below), otherwise the FP32 one.
+                    boolean quantized =
+                            (residual && x == state.workspace.wrapHb && hiddenActivationQuantized)
+                                    || (!residual
+                                            && x == state.workspace.wrapXb
+                                            && normedActivationQuantized);
+                    packedQ4Tasks().add(layer + "." + task);
+                    if (quantized) {
+                        graph.task(
+                                tn(task),
+                                TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0Packed,
+                                context,
+                                state.workspace.wrapXbQuants,
+                                state.workspace.wrapXbScales,
+                                out,
+                                w.asByteArray(),
+                                n,
+                                d,
+                                residual ? 1 : 0);
+                    } else {
+                        graph.task(
+                                tn(task),
+                                TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0PackedF32,
+                                context,
+                                x,
+                                out,
+                                w.asByteArray(),
+                                n,
+                                d,
+                                residual ? 1 : 0);
+                    }
+                } else if (residual && x == state.workspace.wrapHb && hiddenActivationQuantized) {
                     graph.task(
                             tn(task),
                             TransformerComputeKernelsQ4_0::matrixVectorGenericWithResidualQ4_0DP4A,
@@ -620,6 +681,24 @@ public class Qwen35FFNLayers
                         "ffn_gate|ffn_up",
                         gate.dataType(),
                         packed || packedQ8_0));
+        if (gate.isPackedQ8() || up.isPackedQ8()) {
+            if (!packedQ8_0 || !gate.isPackedQ8() || !up.isPackedQ8()) {
+                throw PackedWeights.noPackedKernel("qwen35 layer " + layer + " fused gate/up");
+            }
+            packedTasks().add(layer + ".ffn_gate_up");
+            graph.task(
+                    tn("ffn_gate_up"),
+                    TransformerComputeKernelsQ8_0Packed::fusedFFNGateUpSiLUQ8_0Packed,
+                    context,
+                    qwen35State.workspace.wrapXbQuants,
+                    qwen35State.workspace.wrapXbScales,
+                    qwen35State.workspace.wrapHb,
+                    gate.asByteArray(),
+                    up.asByteArray(),
+                    config.dim(),
+                    config.hiddenDim());
+            return;
+        }
         if (packedQ8_0) {
             graph.task(
                     tn("ffn_gate_up"),
@@ -633,6 +712,24 @@ public class Qwen35FFNLayers
                     config.dim(),
                     config.hiddenDim(),
                     MATVEC_LOCAL);
+            return;
+        }
+        if (gate.isPackedQ4() || up.isPackedQ4()) {
+            if (!packed || !gate.isPackedQ4() || !up.isPackedQ4()) {
+                throw PackedWeights.noPackedKernel("qwen35 layer " + layer + " fused gate/up");
+            }
+            packedQ4Tasks().add(layer + ".ffn_gate_up");
+            graph.task(
+                    tn("ffn_gate_up"),
+                    TransformerComputeKernelsQ4_0Packed::fusedFFNGateUpSiLUQ4_0Packed,
+                    context,
+                    qwen35State.workspace.wrapXbQuants,
+                    qwen35State.workspace.wrapXbScales,
+                    qwen35State.workspace.wrapHb,
+                    gate.asByteArray(),
+                    up.asByteArray(),
+                    config.dim(),
+                    config.hiddenDim());
             return;
         }
         if (packed) {
@@ -1702,32 +1799,35 @@ public class Qwen35FFNLayers
         List<Object> tensors = new ArrayList<>();
         tensors.add(weights.rms_att_weightLayered[layerIndex].asFloatArray());
         tensors.add(weights.rms_ffn_weightLayered[layerIndex].asFloatArray());
-        tensors.add(deviceArray(require(weights.w1Layered, layerIndex, "ffn_gate")));
-        tensors.add(deviceArray(require(weights.w2Layered, layerIndex, "ffn_down")));
-        tensors.add(deviceArray(require(weights.w3Layered, layerIndex, "ffn_up")));
+        tensors.add(require(weights.w1Layered, layerIndex, "ffn_gate"));
+        tensors.add(require(weights.w2Layered, layerIndex, "ffn_down"));
+        tensors.add(require(weights.w3Layered, layerIndex, "ffn_up"));
         if (config.isRecurrentLayer(layerIndex)) {
-            tensors.add(deviceArray(require(weights.ssmQkv, layerIndex, "attn_qkv")));
-            tensors.add(deviceArray(require(weights.ssmGate, layerIndex, "attn_gate")));
-            tensors.add(deviceArray(require(weights.ssmAlpha, layerIndex, "ssm_alpha")));
-            tensors.add(deviceArray(require(weights.ssmBeta, layerIndex, "ssm_beta")));
-            tensors.add(deviceArray(require(weights.ssmOut, layerIndex, "ssm_out")));
+            tensors.add(require(weights.ssmQkv, layerIndex, "attn_qkv"));
+            tensors.add(require(weights.ssmGate, layerIndex, "attn_gate"));
+            tensors.add(require(weights.ssmAlpha, layerIndex, "ssm_alpha"));
+            tensors.add(require(weights.ssmBeta, layerIndex, "ssm_beta"));
+            tensors.add(require(weights.ssmOut, layerIndex, "ssm_out"));
             tensors.add(require(weights.ssmConv1d, layerIndex, "ssm_conv1d").asFloatArray());
             tensors.add(require(weights.ssmDtBias, layerIndex, "ssm_dt.bias").asFloatArray());
             tensors.add(require(weights.ssmA, layerIndex, "ssm_a").asFloatArray());
             tensors.add(require(weights.ssmNorm, layerIndex, "ssm_norm").asFloatArray());
         } else {
-            tensors.add(deviceArray(require(weights.wqLayered, layerIndex, "attn_q")));
-            tensors.add(deviceArray(require(weights.wkLayered, layerIndex, "attn_k")));
-            tensors.add(deviceArray(require(weights.wvLayered, layerIndex, "attn_v")));
-            tensors.add(deviceArray(require(weights.woLayered, layerIndex, "attn_output")));
+            tensors.add(require(weights.wqLayered, layerIndex, "attn_q"));
+            tensors.add(require(weights.wkLayered, layerIndex, "attn_k"));
+            tensors.add(require(weights.wvLayered, layerIndex, "attn_v"));
+            tensors.add(require(weights.woLayered, layerIndex, "attn_output"));
             tensors.add(require(weights.attnQNorm, layerIndex, "attn_q_norm").asFloatArray());
             tensors.add(require(weights.attnKNorm, layerIndex, "attn_k_norm").asFloatArray());
         }
         String source = weightSourceGraphName(layerIndex);
         if (source != null) {
-            layer.consumeFromDevice(source, tensors.toArray());
+            layer.consumeFromDevice(
+                    source,
+                    org.beehive.jitllm.backend.tornado.plan.PackedRepack.deviceArrays(
+                            tensors.toArray()));
         } else {
-            layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, tensors.toArray());
+            state.workspace.packedRepack.upload(layer, tensors.toArray());
         }
     }
 
@@ -1919,14 +2019,18 @@ public class Qwen35FFNLayers
                 scheduler.addWorkerGrid(prefix + "attn_rms_apply", rmsApply);
                 scheduler.addWorkerGrid(prefix + "ffn_rms_apply", rmsApply);
             }
-            scheduler.addWorkerGrid(prefix + "ffn_gate_up", matVecWorker(config.hiddenDim()));
-            scheduler.addWorkerGrid(prefix + "ffn_down_proj", matVecWorker(config.dim()));
+            scheduler.addWorkerGrid(
+                    prefix + "ffn_gate_up", projWorker(layer, "ffn_gate_up", config.hiddenDim()));
+            scheduler.addWorkerGrid(
+                    prefix + "ffn_down_proj", projWorker(layer, "ffn_down_proj", config.dim()));
 
             if (config.isRecurrentLayer(layer)) {
                 scheduler.addWorkerGrid(
-                        prefix + "ssm_qkv_proj", matVecWorker(config.deltaNetConvDim()));
+                        prefix + "ssm_qkv_proj",
+                        projWorker(layer, "ssm_qkv_proj", config.deltaNetConvDim()));
                 scheduler.addWorkerGrid(
-                        prefix + "ssm_gate_proj", matVecWorker(config.deltaNetValueDim()));
+                        prefix + "ssm_gate_proj",
+                        projWorker(layer, "ssm_gate_proj", config.deltaNetValueDim()));
                 if (DP4A && packedScratchHolds(config.deltaNetValueDim())) {
                     scheduler.addWorkerGrid(
                             prefix + "ssm_out_quantize",
@@ -1948,12 +2052,16 @@ public class Qwen35FFNLayers
                 scheduler.addWorkerGrid(prefix + "ssm_delta_rule", deltaRule);
                 scheduler.addWorkerGrid(
                         prefix + "ssm_gated_norm", gatedNormIsWide() ? gatedNormWide : valueHeads);
-                scheduler.addWorkerGrid(prefix + "ssm_out_proj", matVecWorker(config.dim()));
+                scheduler.addWorkerGrid(
+                        prefix + "ssm_out_proj", projWorker(layer, "ssm_out_proj", config.dim()));
             } else {
                 scheduler.addWorkerGrid(
-                        prefix + "attn_q_proj", matVecWorker(config.queryGateDim()));
-                scheduler.addWorkerGrid(prefix + "attn_k_proj", matVecWorker(config.kvDim()));
-                scheduler.addWorkerGrid(prefix + "attn_v_proj", matVecWorker(config.kvDim()));
+                        prefix + "attn_q_proj",
+                        projWorker(layer, "attn_q_proj", config.queryGateDim()));
+                scheduler.addWorkerGrid(
+                        prefix + "attn_k_proj", projWorker(layer, "attn_k_proj", config.kvDim()));
+                scheduler.addWorkerGrid(
+                        prefix + "attn_v_proj", projWorker(layer, "attn_v_proj", config.kvDim()));
                 scheduler.addWorkerGrid(prefix + "attn_split_query_gate", queryGate);
                 scheduler.addWorkerGrid(prefix + "attn_qk_norm", qkNorm);
                 scheduler.addWorkerGrid(prefix + "attn_rope", rope);
@@ -1963,10 +2071,56 @@ public class Qwen35FFNLayers
                     scheduler.addWorkerGrid(prefix + "attention_combine", attentionCombine);
                 }
                 scheduler.addWorkerGrid(prefix + "attn_output_gate", outputGate);
-                scheduler.addWorkerGrid(prefix + "attn_output_proj", matVecWorker(config.dim()));
+                scheduler.addWorkerGrid(
+                        prefix + "attn_output_proj",
+                        projWorker(layer, "attn_output_proj", config.dim()));
             }
         }
         return scheduler;
+    }
+
+    /**
+     * The decode tasks whose weight is packed ({@code "layer.task"}), with their
+     * workgroup-per-8-rows grid.
+     */
+    // Not initialised at its declaration: the task graphs may be built from a superclass
+    // constructor, before this class's field initialisers have run.
+    private java.util.Set<String> packedTasks;
+
+    private java.util.Set<String> packedTasks() {
+        if (packedTasks == null) {
+            packedTasks = new java.util.HashSet<>();
+        }
+        return packedTasks;
+    }
+
+    /** The decode tasks whose weight is packed Q4_0, with their workgroup-per-16-rows grid. */
+    private java.util.Set<String> packedQ4Tasks;
+
+    private java.util.Set<String> packedQ4Tasks() {
+        if (packedQ4Tasks == null) {
+            packedQ4Tasks = new java.util.HashSet<>();
+        }
+        return packedQ4Tasks;
+    }
+
+    /** {@link #matVecWorker}, or a workgroup per eight rows where the task's weight is packed. */
+    private WorkerGrid projWorker(int layer, String task, int rows) {
+        if (packedQ4Tasks().contains(layer + "." + task)) {
+            int local =
+                    task.equals("ffn_gate_up")
+                            ? TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL
+                            : TransformerComputeKernelsQ4_0Packed.LOCAL;
+            return WorkerGridFactory.genericWorker(rows / 16 * local, local);
+        }
+        if (packedTasks().contains(layer + "." + task)) {
+            int local =
+                    task.equals("ffn_gate_up")
+                            ? TransformerComputeKernelsQ8_0Packed.FUSED_LOCAL
+                            : TransformerComputeKernelsQ8_0Packed.LOCAL;
+            return WorkerGridFactory.genericWorker(rows / 8 * local, local);
+        }
+        return matVecWorker(rows);
     }
 
     /** One workgroup per output row, which is how every matrix-vector kernel here is written. */

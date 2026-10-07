@@ -218,64 +218,112 @@ public class Gemma4ModelLoader extends AbstractModelLoader<Gemma4, Gemma4Configu
                                 outputWeight.ggmlType(), ExecutionTarget.GPU);
         RopeTables ropeTables = computeRopeTables(tensorEntries, config);
 
-        return new Gemma4TornadoWeights(
-                loadTornadoTensor(tokenEmbeddings),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".attn_norm.weight")),
-                loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
-                loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
-                // Absent on the 31B's global layers, whose values are their keys.
-                loadOptionalProjections(
-                        retain, nl, i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
-                loadProjections(
-                        retain, nl, i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".attn_q_norm.weight")),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".attn_k_norm.weight")),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".post_attention_norm.weight")),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")),
-                loadProjections(
-                        retain, nl, i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
-                loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
-                loadProjections(
-                        retain, nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
-                loadArrayOfTornadoTensors(
-                        nl, i -> tensorEntries.get("blk." + i + ".post_ffw_norm.weight")),
-                ple
-                        ? loadArrayOfTornadoTensors(
-                                nl, i -> tensorEntries.get("blk." + i + ".inp_gate.weight"))
-                        : new TornadoTensor[nl],
-                ple
-                        ? loadArrayOfTornadoTensors(
-                                nl, i -> tensorEntries.get("blk." + i + ".proj.weight"))
-                        : new TornadoTensor[nl],
-                ple
-                        ? loadArrayOfTornadoTensors(
-                                nl, i -> tensorEntries.get("blk." + i + ".post_norm.weight"))
-                        : new TornadoTensor[nl],
-                loadArrayOfTornadoTensorsNullable(
-                        nl, i -> tensorEntries.get("blk." + i + ".layer_output_scale.weight")),
-                ple
-                        ? longIndexed(
-                                stripTornadoArrayHeader(
-                                        tensorEntries.get("per_layer_token_embd.weight")))
-                        : null,
-                ple ? loadTornadoTensor(tensorEntries.get("per_layer_model_proj.weight")) : null,
-                ple ? loadTornadoTensor(tensorEntries.get("per_layer_proj_norm.weight")) : null,
-                loadTornadoTensor(tensorEntries.get("output_norm.weight")),
-                TornadoTensorLoader.fromFloats(ropeTables.realSwa),
-                TornadoTensorLoader.fromFloats(ropeTables.imagSwa),
-                TornadoTensorLoader.fromFloats(ropeTables.realFull),
-                TornadoTensorLoader.fromFloats(ropeTables.imagFull),
-                loadOutput(
-                        retain,
-                        tensorEntries.containsKey("output.weight")
-                                ? tensorEntries.get("output.weight")
-                                : tokenEmbeddings),
-                weightType);
+        Gemma4TornadoWeights weights =
+                new Gemma4TornadoWeights(
+                        loadTornadoTensor(tokenEmbeddings),
+                        loadArrayOfTornadoTensors(
+                                nl, i -> tensorEntries.get("blk." + i + ".attn_norm.weight")),
+                        packQ4(
+                                loadProjections(
+                                        retain,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_q.weight"),
+                                retain),
+                        packQ4(
+                                loadProjections(
+                                        retain,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_k.weight"),
+                                retain),
+                        // Absent on the 31B's global layers, whose values are their keys.
+                        packQ4(
+                                loadOptionalProjections(
+                                        retain,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_v.weight"),
+                                retain),
+                        packQ4(
+                                loadProjections(
+                                        retain,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
+                                i -> tensorEntries.get("blk." + i + ".attn_output.weight"),
+                                retain),
+                        loadArrayOfTornadoTensors(
+                                nl, i -> tensorEntries.get("blk." + i + ".attn_q_norm.weight")),
+                        loadArrayOfTornadoTensors(
+                                nl, i -> tensorEntries.get("blk." + i + ".attn_k_norm.weight")),
+                        loadArrayOfTornadoTensors(
+                                nl,
+                                i -> tensorEntries.get("blk." + i + ".post_attention_norm.weight")),
+                        loadArrayOfTornadoTensors(
+                                nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")),
+                        packQ4(
+                                loadProjections(
+                                        retain,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
+                                i -> tensorEntries.get("blk." + i + ".ffn_gate.weight"),
+                                retain),
+                        packQ4(
+                                loadProjections(
+                                        retain,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
+                                i -> tensorEntries.get("blk." + i + ".ffn_up.weight"),
+                                retain),
+                        packQ4(
+                                loadProjections(
+                                        retain,
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
+                                i -> tensorEntries.get("blk." + i + ".ffn_down.weight"),
+                                retain),
+                        loadArrayOfTornadoTensors(
+                                nl, i -> tensorEntries.get("blk." + i + ".post_ffw_norm.weight")),
+                        ple
+                                ? loadArrayOfTornadoTensors(
+                                        nl, i -> tensorEntries.get("blk." + i + ".inp_gate.weight"))
+                                : new TornadoTensor[nl],
+                        ple
+                                ? loadArrayOfTornadoTensors(
+                                        nl, i -> tensorEntries.get("blk." + i + ".proj.weight"))
+                                : new TornadoTensor[nl],
+                        ple
+                                ? loadArrayOfTornadoTensors(
+                                        nl,
+                                        i -> tensorEntries.get("blk." + i + ".post_norm.weight"))
+                                : new TornadoTensor[nl],
+                        loadArrayOfTornadoTensorsNullable(
+                                nl,
+                                i -> tensorEntries.get("blk." + i + ".layer_output_scale.weight")),
+                        ple
+                                ? longIndexed(
+                                        stripTornadoArrayHeader(
+                                                tensorEntries.get("per_layer_token_embd.weight")))
+                                : null,
+                        ple
+                                ? loadTornadoTensor(
+                                        tensorEntries.get("per_layer_model_proj.weight"))
+                                : null,
+                        ple
+                                ? loadTornadoTensor(tensorEntries.get("per_layer_proj_norm.weight"))
+                                : null,
+                        loadTornadoTensor(tensorEntries.get("output_norm.weight")),
+                        TornadoTensorLoader.fromFloats(ropeTables.realSwa),
+                        TornadoTensorLoader.fromFloats(ropeTables.imagSwa),
+                        TornadoTensorLoader.fromFloats(ropeTables.realFull),
+                        TornadoTensorLoader.fromFloats(ropeTables.imagFull),
+                        loadOutput(
+                                retain,
+                                tensorEntries.containsKey("output.weight")
+                                        ? tensorEntries.get("output.weight")
+                                        : tokenEmbeddings),
+                        weightType);
+        return weights;
     }
 
     // @formatter:on

@@ -97,20 +97,23 @@ public class LlamaQ8_0FFNLayers
         Object[] layerWeights = {
             // Copy-in weights per layer for batched-layered layout (Q8 format)
             weights.rms_att_weightLayered[layerIndex].asFloatArray(),
-            weights.wqLayered[layerIndex].asByteArray(),
-            weights.wkLayered[layerIndex].asByteArray(),
-            weights.wvLayered[layerIndex].asByteArray(),
-            weights.woLayered[layerIndex].asByteArray(),
+            weights.wqLayered[layerIndex],
+            weights.wkLayered[layerIndex],
+            weights.wvLayered[layerIndex],
+            weights.woLayered[layerIndex],
             weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
-            weights.w1Layered[layerIndex].asByteArray(),
-            weights.w2Layered[layerIndex].asByteArray(),
-            weights.w3Layered[layerIndex].asByteArray()
+            weights.w1Layered[layerIndex],
+            weights.w2Layered[layerIndex],
+            weights.w3Layered[layerIndex]
         };
         String weightSrc = weightSourceGraphName(layerIndex);
         if (weightSrc != null) {
-            unifiedLayer.consumeFromDevice(weightSrc, layerWeights);
+            unifiedLayer.consumeFromDevice(
+                    weightSrc,
+                    org.beehive.jitllm.backend.tornado.plan.PackedRepack.deviceArrays(
+                            layerWeights));
         } else {
-            unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, layerWeights);
+            state.workspace.packedRepack.upload(unifiedLayer, layerWeights);
         }
         unifiedLayer = configureLayerDataTransfers(unifiedLayer, layerIndex);
 
@@ -241,6 +244,15 @@ public class LlamaQ8_0FFNLayers
         return null;
     }
 
+    /** {@code objects} consumed from {@code source}, or from the previous graph when it is null. */
+    protected static void consume(TaskGraph graph, String source, Object... objects) {
+        if (source != null) {
+            graph.consumeFromDevice(source, objects);
+        } else {
+            graph.consumeFromDevice(objects);
+        }
+    }
+
     protected TaskGraph configureLayerDataTransfers(TaskGraph unifiedLayer, int layerIndex) {
         Object keyCache = keyCache();
         Object valueCache = valueCache();
@@ -276,8 +288,13 @@ public class LlamaQ8_0FFNLayers
                         DataTransferMode.FIRST_EXECUTION, state.workspace.wrapAttSplit);
             }
         } else {
-            // Subsequent layers: Consume data already on device from previous layer
-            unifiedLayer.consumeFromDevice(
+            // Subsequent layers: Consume data already on device from previous layer. Named when
+            // the layer names its producer: a graph that consumes anything by name gets nothing
+            // from an unnamed consume.
+            String pred = predecessorGraphName(layerIndex);
+            consume(
+                    unifiedLayer,
+                    pred,
                     context,
                     state.workspace.wrapXb,
                     state.workspace.wrapXb2, //
@@ -292,9 +309,9 @@ public class LlamaQ8_0FFNLayers
                     ,
                     weights.freq_cis_realFlat.asFloatArray(),
                     weights.freq_cis_imagFlat.asFloatArray());
-            unifiedLayer.consumeFromDevice(state.workspace.wrapBlockTable);
+            consume(unifiedLayer, pred, state.workspace.wrapBlockTable);
             if (attentionSplits() > 0) {
-                unifiedLayer.consumeFromDevice(state.workspace.wrapAttSplit);
+                consume(unifiedLayer, pred, state.workspace.wrapAttSplit);
             }
         }
         return unifiedLayer;

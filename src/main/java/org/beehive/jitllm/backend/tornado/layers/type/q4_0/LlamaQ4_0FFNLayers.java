@@ -2,10 +2,13 @@ package org.beehive.jitllm.backend.tornado.layers.type.q4_0;
 
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_1;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LlamaQ8_0FFNLayers;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
+import org.beehive.jitllm.backend.tornado.tensor.PackedWeights;
+import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
 import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
 import org.beehive.jitllm.model.llama.LlamaConfiguration;
@@ -85,6 +88,17 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
      * </pre>
      */
     // @formatter:on
+    /**
+     * Each layer names the graph it consumes from: the packed projections are consumed by name from
+     * their repack graph, and a graph that consumes anything by name takes nothing through an
+     * unnamed consume. The first layer takes its input from the activation graph, which is also the
+     * name of a later pipeline stage's receiving graph.
+     */
+    @Override
+    protected String predecessorGraphName(int layerIndex) {
+        return layerIndex > firstLayer ? "layer_" + (layerIndex - 1) : "activationUpdate";
+    }
+
     @Override
     protected TaskGraph createFFNLayerTaskGraph(int layerIndex) {
         var layerTaskGraphName = "layer_" + layerIndex;
@@ -96,22 +110,27 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
         } else {
             unifiedLayer.consumeFromDevice(state.workspace.wrapX);
         }
+        // The projections as tensors: a packed one reaches the device through its repack graph,
+        // which turns the uploaded blocks into tiles before any kernel reads them.
         Object[] layerWeights = {
             weights.rms_att_weightLayered[layerIndex].asFloatArray(),
-            weights.wqLayered[layerIndex].asByteArray(),
-            weights.wkLayered[layerIndex].asByteArray(),
-            weights.wvLayered[layerIndex].asByteArray(),
-            weights.woLayered[layerIndex].asByteArray(),
+            weights.wqLayered[layerIndex],
+            weights.wkLayered[layerIndex],
+            weights.wvLayered[layerIndex],
+            weights.woLayered[layerIndex],
             weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
-            weights.w1Layered[layerIndex].asByteArray(),
-            weights.w2Layered[layerIndex].asByteArray(),
-            weights.w3Layered[layerIndex].asByteArray()
+            weights.w1Layered[layerIndex],
+            weights.w2Layered[layerIndex],
+            weights.w3Layered[layerIndex]
         };
         String weightSrc = weightSourceGraphName(layerIndex);
         if (weightSrc != null) {
-            unifiedLayer.consumeFromDevice(weightSrc, layerWeights);
+            unifiedLayer.consumeFromDevice(
+                    weightSrc,
+                    org.beehive.jitllm.backend.tornado.plan.PackedRepack.deviceArrays(
+                            layerWeights));
         } else {
-            unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, layerWeights);
+            state.workspace.packedRepack.upload(unifiedLayer, layerWeights);
         }
         unifiedLayer = configureLayerDataTransfers(unifiedLayer, layerIndex);
         if (DP4A) {
@@ -123,7 +142,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
             if (layerIndex == firstLayer) {
                 unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, packed);
             } else {
-                unifiedLayer.consumeFromDevice(packed);
+                consume(unifiedLayer, predecessorGraphName(layerIndex), packed);
             }
         }
 
@@ -160,21 +179,26 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                     unifiedLayer,
                     "q_proj",
                     state.workspace.wrapQ,
-                    weights.wqLayered[layerIndex].asByteArray(),
+                    weights.wqLayered[layerIndex],
                     config.dim());
             packedProjection(
                     unifiedLayer,
                     "k_proj",
                     state.workspace.wrapK,
-                    weights.wkLayered[layerIndex].asByteArray(),
+                    weights.wkLayered[layerIndex],
                     config.kvDim());
             packedProjection(
                     unifiedLayer,
                     "v_proj",
                     state.workspace.wrapV,
-                    weights.wvLayered[layerIndex].asByteArray(),
+                    weights.wvLayered[layerIndex],
                     config.kvDim());
         } else {
+            if (weights.wqLayered[layerIndex].isPackedQ4()) {
+                // Packed weights have only the integer-dot kernels.
+                throw PackedWeights.noPackedKernel(
+                        "llama decode without packed integer dot products");
+            }
             // Llama's query width is dim; the kernel takes it explicitly so the same code serves a
             // family whose head dimension is stated independently.
             unifiedLayer.task(
@@ -205,7 +229,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                     unifiedLayer,
                     "attn_output_proj",
                     TransformerComputeKernelsQ4_0::matrixVectorGenericWithResidualQ4_0DP4A,
-                    weights.woLayered[layerIndex].asByteArray(),
+                    weights.woLayered[layerIndex],
                     config.dim(),
                     config.dim());
         } else {
@@ -249,7 +273,19 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
                 state.workspace.tempFFN);
 
-        if (DP4A) {
+        if (DP4A && weights.w1Layered[layerIndex].isPackedQ4()) {
+            unifiedLayer.task(
+                    "ffn_gate_up",
+                    TransformerComputeKernelsQ4_0Packed::fusedFFNGateUpSiLUQ4_0Packed,
+                    context,
+                    state.workspace.wrapXbQuants,
+                    state.workspace.wrapXbScales,
+                    state.workspace.wrapHb,
+                    weights.w1Layered[layerIndex].asByteArray(),
+                    weights.w3Layered[layerIndex].asByteArray(),
+                    config.dim(),
+                    config.hiddenDim());
+        } else if (DP4A) {
             unifiedLayer.task(
                     "ffn_gate_up",
                     TransformerComputeKernelsQ4_0::fusedFFNGateUpSiLUQ4_0DP4A,
@@ -288,7 +324,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                             ? TransformerComputeKernelsQ4_1::matrixVectorGenericWithResidualQ4_1DP4A
                             : TransformerComputeKernelsQ4_0
                                     ::matrixVectorGenericWithResidualQ4_0DP4A,
-                    weights.w2Layered[layerIndex].asByteArray(),
+                    weights.w2Layered[layerIndex],
                     config.hiddenDim(),
                     config.dim());
         } else {
@@ -368,7 +404,21 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
     }
 
     private void packedProjection(
-            TaskGraph graph, String name, FloatArray out, ByteArray w, int rows) {
+            TaskGraph graph, String name, FloatArray out, TornadoTensor w, int rows) {
+        if (w.isPackedQ4()) {
+            graph.task(
+                    name,
+                    TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0Packed,
+                    context,
+                    state.workspace.wrapXbQuants,
+                    state.workspace.wrapXbScales,
+                    out,
+                    w.asByteArray(),
+                    config.dim(),
+                    rows,
+                    0);
+            return;
+        }
         graph.task(
                 name,
                 TransformerComputeKernelsQ4_0::matrixVectorGenericQ4_0DP4A,
@@ -377,7 +427,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 state.workspace.wrapXbScales,
                 state.workspace.wrapXbSums,
                 out,
-                w,
+                w.asByteArray(),
                 config.dim(),
                 rows,
                 PACKED_LOCAL);
@@ -397,9 +447,23 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                             Integer,
                             Integer>
                     kernel,
-            ByteArray w,
+            TornadoTensor w,
             int n,
             int rows) {
+        if (w.isPackedQ4()) {
+            graph.task(
+                    name,
+                    TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0Packed,
+                    context,
+                    state.workspace.wrapXbQuants,
+                    state.workspace.wrapXbScales,
+                    state.workspace.wrapX,
+                    w.asByteArray(),
+                    n,
+                    rows,
+                    1);
+            return;
+        }
         graph.task(
                 name,
                 kernel,
@@ -408,7 +472,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 state.workspace.wrapXbScales,
                 state.workspace.wrapXbSums,
                 state.workspace.wrapX,
-                w,
+                w.asByteArray(),
                 n,
                 rows,
                 PACKED_LOCAL);
@@ -416,6 +480,18 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
 
     private static WorkerGrid packedWorker(int rows) {
         return WorkerGridFactory.genericWorker(rows * PACKED_LOCAL, PACKED_LOCAL);
+    }
+
+    /** The grid for a projection over {@code w}: a 16-row group per workgroup when it is packed. */
+    private static WorkerGrid packedWorker(int rows, TornadoTensor w, boolean fused) {
+        if (w.isPackedQ4()) {
+            int local =
+                    fused
+                            ? TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL
+                            : TransformerComputeKernelsQ4_0Packed.LOCAL;
+            return WorkerGridFactory.genericWorker(rows / 16 * local, local);
+        }
+        return packedWorker(rows);
     }
 
     /** One 32-lane workgroup per block of 32 activations. */
@@ -461,11 +537,14 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 tornadoForwardScheduler.addWorkerGrid(layer + "attn_rms_reduce", rmsReduceWorker);
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "attn_rms_apply", quantizeWorker(config.dim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "q_proj", packedWorker(config.dim()));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "k_proj", packedWorker(config.kvDim()));
+                        layer + "q_proj", packedWorker(config.dim(), weights.wqLayered[i], false));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "v_proj", packedWorker(config.kvDim()));
+                        layer + "k_proj",
+                        packedWorker(config.kvDim(), weights.wkLayered[i], false));
+                tornadoForwardScheduler.addWorkerGrid(
+                        layer + "v_proj",
+                        packedWorker(config.kvDim(), weights.wvLayered[i], false));
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "rope_and_kv_cache", ropeWithCacheWorker);
                 tornadoForwardScheduler.addWorkerGrid(layer + "attention", parallelAttentionWorker);
@@ -473,16 +552,19 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "attn_out_quantize", quantizeWorker(config.dim()));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "attn_output_proj", packedWorker(config.dim()));
+                        layer + "attn_output_proj",
+                        packedWorker(config.dim(), weights.woLayered[i], false));
                 tornadoForwardScheduler.addWorkerGrid(layer + "ffn_rms_reduce", rmsReduceWorker);
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "ffn_rms_apply", quantizeWorker(config.dim()));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "ffn_gate_up", packedWorker(config.hiddenDim()));
+                        layer + "ffn_gate_up",
+                        packedWorker(config.hiddenDim(), weights.w1Layered[i], true));
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "ffn_down_quantize", quantizeWorker(config.hiddenDim()));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "ffn_down_proj", packedWorker(config.dim()));
+                        layer + "ffn_down_proj",
+                        packedWorker(config.dim(), weights.w2Layered[i], false));
                 continue;
             }
             tornadoForwardScheduler.addWorkerGrid(
