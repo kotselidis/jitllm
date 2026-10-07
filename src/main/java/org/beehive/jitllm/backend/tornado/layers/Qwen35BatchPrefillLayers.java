@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.IntStream;
 import org.beehive.jitllm.backend.tornado.TensorCoreSupport;
+import org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35BatchKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35Int8Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35MMAKernels;
@@ -366,6 +367,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         case RESIDUAL -> Qwen35Int8Kernels.EPILOGUE_RESIDUAL;
                         case SWIGLU -> Qwen35Int8Kernels.EPILOGUE_SWIGLU;
                     };
+            boolean packedWeights = PackedQ8_0.isPacked(w);
             int splits = epilogue == Epilogue.SWIGLU ? 1 : gemmSplits(n, k);
             FloatArray target = epilogue == Epilogue.SWIGLU ? hb : out;
             // Unsplit, the partial-sum parameter is never read; it is bound to the output.
@@ -373,24 +375,45 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             if (splits > 1) {
                 gemmSplitCounts.put(qualified, splits);
             }
-            graph.task(
-                    task,
-                    q8 ? Qwen35Int8Kernels::gemmInt8Q8_0 : Qwen35Int8Kernels::gemmInt8Q4_0,
-                    context,
-                    state.workspace.wrapQ8ActBatch,
-                    state.workspace.wrapQ8ActScales,
-                    w,
-                    target,
-                    epilogue == Epilogue.SWIGLU ? gate : out,
-                    batchSize,
-                    n,
-                    k,
-                    mode,
-                    partial,
-                    splits,
-                    state.workspace.batchStartPosHolder,
-                    n,
-                    0);
+            if (packedWeights) {
+                graph.task(
+                        task,
+                        Qwen35Int8Kernels::gemmInt8Q8_0Packed,
+                        context,
+                        state.workspace.wrapQ8ActBatch,
+                        state.workspace.wrapQ8ActScales,
+                        w,
+                        target,
+                        epilogue == Epilogue.SWIGLU ? gate : out,
+                        batchSize,
+                        n,
+                        k,
+                        mode,
+                        partial,
+                        splits,
+                        state.workspace.batchStartPosHolder,
+                        n,
+                        0);
+            } else {
+                graph.task(
+                        task,
+                        q8 ? Qwen35Int8Kernels::gemmInt8Q8_0 : Qwen35Int8Kernels::gemmInt8Q4_0,
+                        context,
+                        state.workspace.wrapQ8ActBatch,
+                        state.workspace.wrapQ8ActScales,
+                        w,
+                        target,
+                        epilogue == Epilogue.SWIGLU ? gate : out,
+                        batchSize,
+                        n,
+                        k,
+                        mode,
+                        partial,
+                        splits,
+                        state.workspace.batchStartPosHolder,
+                        n,
+                        0);
+            }
             if (splits > 1) {
                 // The splits' partial sums added in order, then stored or added to the residual.
                 splitReduceTasks.put(qualified + "_reduce", batchSize * n);
@@ -1050,6 +1073,10 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     residual ? Epilogue.RESIDUAL : Epilogue.STORE,
                     true);
             return;
+        }
+        if (PackedQ8_0.isPacked(w.asByteArray())) {
+            throw PackedQ8_0.noPackedKernel(
+                    "qwen35 batch-prefill layer " + layer + " task '" + task + "' (shape not tiled by the int8 GEMM)");
         }
         FloatArray scratch = state.workspace.wrapDequantScratchF32;
         if (scratch == null) {
