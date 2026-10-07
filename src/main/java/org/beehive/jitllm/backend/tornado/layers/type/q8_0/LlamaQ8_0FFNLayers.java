@@ -110,7 +110,7 @@ public class LlamaQ8_0FFNLayers
         if (weightSrc != null) {
             unifiedLayer.consumeFromDevice(weightSrc, layerWeights);
         } else {
-            unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, layerWeights);
+            org.beehive.jitllm.backend.tornado.kernels.PackedRepack.upload(unifiedLayer, layerWeights);
         }
         unifiedLayer = configureLayerDataTransfers(unifiedLayer, layerIndex);
 

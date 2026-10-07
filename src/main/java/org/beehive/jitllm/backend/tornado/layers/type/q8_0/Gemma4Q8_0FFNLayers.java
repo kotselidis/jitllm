@@ -696,7 +696,26 @@ public class Gemma4Q8_0FFNLayers
         // Gate and up share one pass over one local array and one tree reduction, so the pair has
         // to be dispatched together rather than tensor by tensor. They are the same representation
         // in every file this family loads -- projectionType() refuses a trunk that disagrees.
-        if (packed && weights.w1Layered[layerIndex].dataType() == DataType.Q8_0) {
+        if (packedQ4(weights.w1Layered[layerIndex]) || packedQ4(weights.w3Layered[layerIndex])) {
+            if (!packed
+                    || !packedQ4(weights.w1Layered[layerIndex])
+                    || !packedQ4(weights.w3Layered[layerIndex])) {
+                throw org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.noPackedKernel(
+                        "gemma4 layer " + layerIndex + " fused gate/up");
+            }
+            unifiedLayer.task(
+                    tn(layerIndex, "ffn_gate_up"),
+                    org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed
+                            ::fusedFFNGateUpGeGLUQ4_0Packed,
+                    context,
+                    gemma4State.workspace.wrapXbQuants,
+                    gemma4State.workspace.wrapXbScales,
+                    gemma4State.workspace.wrapHb,
+                    weights.w1Layered[layerIndex].asByteArray(),
+                    weights.w3Layered[layerIndex].asByteArray(),
+                    dim,
+                    ffnLen);
+        } else if (packed && weights.w1Layered[layerIndex].dataType() == DataType.Q8_0) {
             unifiedLayer.task(
                     tn(layerIndex, "ffn_gate_up"),
                     org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ8_0DP4A
@@ -944,7 +963,7 @@ public class Gemma4Q8_0FFNLayers
             own.add(weightArray(weights.perLayerInpGate[layerIndex]));
             own.add(weightArray(weights.perLayerProj[layerIndex]));
         }
-        unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, own.toArray());
+        org.beehive.jitllm.backend.tornado.kernels.PackedRepack.upload(unifiedLayer, own.toArray());
     }
 
     /** Which RoPE pairs the graph being built has bound already: sliding, full. */
@@ -1230,6 +1249,33 @@ public class Gemma4Q8_0FFNLayers
             int n,
             int d,
             boolean packedActivation) {
+        if (packedQ4(w)) {
+            if (packedActivation) {
+                tg.task(
+                        taskName,
+                        org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0Packed,
+                        context,
+                        gemma4State.workspace.wrapXbQuants,
+                        gemma4State.workspace.wrapXbScales,
+                        out,
+                        w.asByteArray(),
+                        n,
+                        d,
+                        0);
+            } else {
+                tg.task(
+                        taskName,
+                        org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0PackedF32,
+                        context,
+                        in,
+                        out,
+                        w.asByteArray(),
+                        n,
+                        d,
+                        0);
+            }
+            return;
+        }
         if (packedActivation && w.dataType() == DataType.Q8_0) {
             tg.task(
                     taskName,
@@ -1367,6 +1413,11 @@ public class Gemma4Q8_0FFNLayers
      * every non-NVIDIA device. CUDA holds the capability, so its selection does not change.
      */
     // @formatter:on
+    /** Whether {@code w} holds packed Q4_0 tiles ({@code -Djitllm.q4.packed=true}). */
+    private static boolean packedQ4(TornadoTensor w) {
+        return w != null && w.dataType() == DataType.Q4_0 && org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(w.asByteArray());
+    }
+
     private boolean warpProjection(TornadoTensor w) {
         // A Q8_0 projection takes the packed-integer kernel instead wherever that one runs.
         return w.dataType() == DataType.Q8_0
@@ -1377,6 +1428,11 @@ public class Gemma4Q8_0FFNLayers
 
     /** The worker grid of a projection of {@code rows} outputs, matching its kernel. */
     private WorkerGrid projectionGrid(TornadoTensor w, int rows) {
+        if (packedQ4(w)) {
+            return WorkerGridFactory.genericWorker(
+                    rows / 16 * org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.LOCAL,
+                    org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.LOCAL);
+        }
         if (warpProjection(w)) {
             int groups =
                     (rows + Gemma4Kernels.WARP_ROWS_PER_GROUP - 1)
@@ -1459,8 +1515,12 @@ public class Gemma4Q8_0FFNLayers
             WorkerGrid ropeWorker = WorkerGridFactory.createRoPEWorker(nHead, headDim);
             WorkerGrid attentionWorker = WorkerGridFactory.createAttentionWorker(nHead, headDim);
             WorkerGrid ffnGateUpWorker =
-                    WorkerGridFactory.genericWorker(
-                            ffnLen * LOCAL_WORK_GROUP_SIZE_ALLOC, LOCAL_WORK_GROUP_SIZE_ALLOC);
+                    packedQ4(weights.w1Layered[i])
+                            ? WorkerGridFactory.genericWorker(
+                                    ffnLen / 16 * org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL,
+                                    org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL)
+                            : WorkerGridFactory.genericWorker(
+                                    ffnLen * LOCAL_WORK_GROUP_SIZE_ALLOC, LOCAL_WORK_GROUP_SIZE_ALLOC);
 
             gridScheduler.addWorkerGrid(prefix + "attn_norm_reduce", rmsReduceWorker);
             gridScheduler.addWorkerGrid(prefix + "attn_norm_apply", normApplyWorker);

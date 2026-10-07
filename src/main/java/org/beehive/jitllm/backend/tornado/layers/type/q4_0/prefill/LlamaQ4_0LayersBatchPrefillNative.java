@@ -287,8 +287,8 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                     state.workspace.wrapBlockTable);
         }
 
-        layer.transferToDevice(
-                DataTransferMode.FIRST_EXECUTION,
+        org.beehive.jitllm.backend.tornado.kernels.PackedRepack.upload(
+                layer,
                 weights.rms_att_weightLayered[layerIndex].asFloatArray(),
                 weights.wqLayered[layerIndex].asByteArray(),
                 weights.wkLayered[layerIndex].asByteArray(),
@@ -300,7 +300,6 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                 weights.w3Layered[layerIndex].asByteArray(),
                 weights.freq_cis_realFlat.asFloatArray(),
                 weights.freq_cis_imagFlat.asFloatArray());
-
         int dim = config.dim();
         int kvDim = config.kvDim();
         int hidDim = config.hiddenDim();
@@ -732,7 +731,9 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
         FloatArray partial = splits > 1 ? splitPartial : out;
         layer.task(
                 name,
-                Qwen35Int8Kernels::gemmInt8Q4_0,
+                org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(w.asByteArray())
+                        ? Qwen35Int8Kernels::gemmInt8Q4_0Packed
+                        : Qwen35Int8Kernels::gemmInt8Q4_0,
                 context,
                 q8,
                 q8Scales,
@@ -773,6 +774,10 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
 
     /** Decodes {@code w} into the scratch at {@code offset}, by the tensor's own representation. */
     private void dequantize(TaskGraph layer, String name, TornadoTensor w, int offset) {
+        if (org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(w.asByteArray())) {
+            // A packed weight has only the int8 GEMM.
+            throw org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.noPackedKernel("llama batch-prefill task '" + name + "'");
+        }
         DataType type = w.dataType();
         if (type == DataType.Q4_0) {
             layer.task(
