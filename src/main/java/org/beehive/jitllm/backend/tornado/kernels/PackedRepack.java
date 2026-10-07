@@ -1,10 +1,14 @@
 package org.beehive.jitllm.backend.tornado.kernels;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.KernelContext;
@@ -22,12 +26,13 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  * and its disk cache ({@code cache}, the default).
  *
  * <p>The loader keeps a packed weight's GGUF bytes on the host and records it here ({@link
- * #register}). The layer graph that uploads it names itself as its owner ({@link #owner}). Each
- * execution plan then gets one more graph ({@link #appendGraph}) that takes the plan's registered
- * weights from their owners with {@code consumeFromDevice}, copies each into one scratch buffer
- * and repacks it from there over the weight's own device buffer. The plan runs it once after the
- * warm-up has uploaded the weights ({@link #run}); a flag on the device makes any later run a
- * no-op, as the weights are packed only once.
+ * #register}). A layer graph hands its weights to {@link #upload} instead of uploading them: the
+ * registered ones are uploaded by a repack graph of their own, {@code packedRepack_<layer graph>},
+ * which the layer graph consumes them from. {@link #appendGraphs} adds those graphs to the plan;
+ * {@link #run} runs them once, before the plan's warm-up, so no layer graph ever computes on the
+ * GGUF bytes. Each repack graph copies a weight into one scratch buffer shared by the plan and
+ * repacks it from there over the weight's own device buffer; a flag on the device makes a later
+ * run of any of them a no-op.
  */
 // @formatter:on
 public final class PackedRepack {
@@ -35,25 +40,29 @@ public final class PackedRepack {
     /** Whether packed weights are repacked on the GPU at load rather than read from the cache. */
     public static final boolean ENABLED = "gpu".equalsIgnoreCase(System.getProperty("jitllm.packed.mode", "cache"));
 
+    /** Diagnostic: {@code -Djitllm.packed.verify=true} reads weights back after the repack. */
+    private static final boolean VERIFY = Boolean.getBoolean("jitllm.packed.verify");
+
+    private static final String PREFIX = "packedRepack_";
+
     private record Weight(ByteArray bytes, int rows, int cols, boolean q4) {
         int size() {
             return rows * (cols / 32) * (q4 ? 18 : 34);
         }
     }
 
+    /** The repack graphs appended to one plan: indices {@code first .. first + count - 1}. */
+    public record Graphs(int first, int count, GridScheduler scheduler, List<Consumer<TornadoExecutionPlan>> checks) {}
+
     private static final Map<ByteArray, Weight> REGISTERED = new IdentityHashMap<>();
 
-    /** Owner graph name to the registered weights it uploads, not yet given a repack graph. */
+    /** Registered weights already uploaded by some graph: each is uploaded, and repacked, once. */
+    private static final Set<ByteArray> ASSIGNED = Collections.newSetFromMap(new IdentityHashMap<>());
+
+    /** Layer graph name to the registered weights it consumes, not yet given repack graphs. */
     private static final Map<String, List<Weight>> OWNED = new LinkedHashMap<>();
 
-    /** Registered weights already given an owner: each is uploaded, and repacked, once. */
-    private static final java.util.Set<ByteArray> ASSIGNED = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-
     private PackedRepack() {}
-
-    private static ByteArray b(Object o) {
-        return (ByteArray) o;
-    }
 
     /** Records the GGUF weight {@code w} for repacking on the device, and as packed. */
     static synchronized ByteArray register(ByteArray w, int rows, int cols, boolean q4) {
@@ -62,28 +71,36 @@ public final class PackedRepack {
     }
 
     /**
-     * Names {@code graph} as the owner of whichever of {@code uploaded} are registered: called by
-     * a layer graph right after it uploads its weights.
+     * Uploads {@code objects} to {@code graph} once ({@code FIRST_EXECUTION}), except the weights
+     * registered for a GPU repack, which {@code graph} consumes from its repack graph instead.
      */
-    public static synchronized void owner(TaskGraph graph, Object... uploaded) {
-        if (!ENABLED) {
-            return;
-        }
-        for (Object o : uploaded) {
-            Weight w = o instanceof ByteArray b ? REGISTERED.get(b) : null;
-            if (w != null && ASSIGNED.add(b(o))) {
+    public static synchronized void upload(TaskGraph graph, Object... objects) {
+        List<Object> plain = new ArrayList<>();
+        List<Object> repacked = new ArrayList<>();
+        for (Object o : objects) {
+            Weight w = ENABLED && o instanceof ByteArray b ? REGISTERED.get(b) : null;
+            if (w != null && ASSIGNED.add(w.bytes())) {
+                repacked.add(o);
                 OWNED.computeIfAbsent(graph.getTaskGraphName(), k -> new ArrayList<>()).add(w);
+            } else {
+                plain.add(o);
             }
+        }
+        if (!plain.isEmpty()) {
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, plain.toArray());
+        }
+        if (!repacked.isEmpty()) {
+            graph.consumeFromDevice(PREFIX + graph.getTaskGraphName(), repacked.toArray());
         }
     }
 
     /**
-     * Appends to {@code graphs} the repack graph for the weights owned since the last call, with
-     * its grids in {@code scheduler}, and returns its index; -1 when there is nothing to repack.
+     * Appends to {@code graphs} the repack graphs of the layer graphs built since the last call,
+     * with their grids in {@code scheduler}; null when there is nothing to repack.
      */
-    public static synchronized int appendGraph(List<ImmutableTaskGraph> graphs, GridScheduler scheduler, String name) {
+    public static synchronized Graphs appendGraphs(List<ImmutableTaskGraph> graphs, GridScheduler scheduler) {
         if (!ENABLED || OWNED.isEmpty()) {
-            return -1;
+            return null;
         }
         int scratchBytes = 0;
         for (List<Weight> ws : OWNED.values()) {
@@ -93,17 +110,22 @@ public final class PackedRepack {
         }
         ByteArray scratch = new ByteArray(scratchBytes);
         IntArray done = new IntArray(1);
-        TaskGraph g = new TaskGraph(name);
-        List<Object> all = new ArrayList<>();
+        List<String> names = new ArrayList<>();
+        List<Weight> firsts = new ArrayList<>();
+        int first = graphs.size();
+        int remaining = OWNED.size();
         for (Map.Entry<String, List<Weight>> e : OWNED.entrySet()) {
-            Object[] bytes = e.getValue().stream().map(Weight::bytes).toArray();
-            g.consumeFromDevice(e.getKey(), bytes);
-            all.addAll(List.of(bytes));
-        }
-        g.transferToDevice(DataTransferMode.FIRST_EXECUTION, scratch, done);
-        int i = 0;
-        for (List<Weight> ws : OWNED.values()) {
-            for (Weight w : ws) {
+            String name = PREFIX + e.getKey();
+            List<Weight> ws = e.getValue();
+            Object[] bytes = ws.stream().map(Weight::bytes).toArray();
+            TaskGraph g = new TaskGraph(name).transferToDevice(DataTransferMode.FIRST_EXECUTION, bytes);
+            if (names.isEmpty()) {
+                g.transferToDevice(DataTransferMode.FIRST_EXECUTION, scratch, done);
+            } else {
+                g.consumeFromDevice(names.get(0), scratch, done);
+            }
+            for (int i = 0; i < ws.size(); i++) {
+                Weight w = ws.get(i);
                 String copy = "copy" + i;
                 String repack = "repack" + i;
                 g.task(copy, PackedRepackKernels::copyOnce, new KernelContext(), w.bytes(), scratch, w.size(), done);
@@ -117,71 +139,64 @@ public final class PackedRepack {
                 scheduler.addWorkerGrid(
                         name + "." + repack,
                         grid(tiles * (w.q4() ? PackedRepackKernels.Q4_0_LANES_PER_TILE : PackedRepackKernels.Q8_0_LANES_PER_TILE)));
-                i++;
             }
+            if (--remaining == 0) {
+                g.task("markDone", PackedRepackKernels::markDone, new KernelContext(), done);
+                scheduler.addWorkerGrid(name + ".markDone", grid(1));
+            }
+            g.persistOnDevice(bytes);
+            g.persistOnDevice(scratch, done);
+            graphs.add(g.snapshot());
+            names.add(name);
+            firsts.add(ws.get(0));
         }
-        g.task("markDone", PackedRepackKernels::markDone, new KernelContext(), done);
-        scheduler.addWorkerGrid(name + ".markDone", grid(1));
-        g.persistOnDevice(all.toArray());
-        graphs.add(g.snapshot());
-        int index = graphs.size() - 1;
-        if (VERIFY) {
-            // Reads back the first and last weight from their owners after the repack.
-            List<Weight> flat = new ArrayList<>();
-            List<String> owners = new ArrayList<>();
-            for (Map.Entry<String, List<Weight>> e : OWNED.entrySet()) {
-                for (Weight w : e.getValue()) {
-                    flat.add(w);
-                    owners.add(e.getKey());
-                }
-            }
-            int[] picks = {0, flat.size() - 1};
-            TaskGraph v = new TaskGraph(name + "Verify");
-            List<Probe> probes = new ArrayList<>();
-            for (int p = 0; p < picks.length; p++) {
-                Weight w = flat.get(picks[p]);
-                ByteArray probe = new ByteArray(w.size());
-                v.consumeFromDevice(owners.get(picks[p]), w.bytes());
-                v.task("probe" + p, PackedRepackKernels::copy, new KernelContext(), w.bytes(), probe, w.size());
-                v.transferToHost(DataTransferMode.EVERY_EXECUTION, probe);
-                scheduler.addWorkerGrid(name + "Verify.probe" + p, grid((w.size() + 7) / 8));
-                probes.add(new Probe(w, owners.get(picks[p]), probe));
-            }
-            graphs.add(v.snapshot());
-            VERIFIERS.put(index, probes);
-        }
+        int count = OWNED.size();
         OWNED.clear();
-        return index;
+        List<Consumer<TornadoExecutionPlan>> checks = new ArrayList<>();
+        if (VERIFY) {
+            checks.add(verifier(graphs, scheduler, names.get(0), firsts.get(0)));
+            checks.add(verifier(graphs, scheduler, names.get(count - 1), firsts.get(count - 1)));
+        }
+        return new Graphs(first, count, scheduler, checks);
     }
 
-    /** Diagnostic: {@code -Djitllm.packed.verify=true} reads weights back after the repack. */
-    private static final boolean VERIFY = Boolean.getBoolean("jitllm.packed.verify");
-
-    private record Probe(Weight weight, String owner, ByteArray bytes) {}
-
-    private static final Map<Integer, List<Probe>> VERIFIERS = new java.util.HashMap<>();
-
-    /** Runs the repack graph {@code index} of {@code plan} once, when there is one. */
-    public static void run(TornadoExecutionPlan plan, int index, GridScheduler scheduler) {
-        if (index < 0) {
+    /** Runs the repack graphs of {@code plan} once: before its warm-up. */
+    public static void run(TornadoExecutionPlan plan, Graphs repack) {
+        if (repack == null) {
             return;
         }
         long t0 = System.nanoTime();
-        plan.withGraph(index).withGridScheduler(scheduler).execute();
-        List<Probe> probes = VERIFIERS.get(index);
-        if (probes != null) {
-            plan.withGraph(index + 1).withGridScheduler(scheduler).execute();
-            for (Probe p : probes) {
-                Weight w = p.weight();
-                byte[] device = p.bytes().toHeapArray();
-                byte[] raw = w.bytes().toHeapArray();
-                byte[] packed = w.q4() ? PackedTilePacker.packQ4_0(w.bytes(), w.rows(), w.cols()) : PackedTilePacker.packQ8_0(w.bytes(), w.rows(), w.cols());
-                String verdict = java.util.Arrays.equals(device, packed) ? "PACKED" : java.util.Arrays.equals(device, raw) ? "RAW (not repacked)" : "NEITHER";
-                System.err.printf("[jitllm] packed verify: %s %dx%d owner %s -> %s%n", w.q4() ? "Q4_0" : "Q8_0", w.rows(), w.cols(), p.owner(), verdict);
-            }
+        for (int i = 0; i < repack.count(); i++) {
+            plan.withGraph(repack.first() + i).withGridScheduler(repack.scheduler()).execute();
+        }
+        System.err.printf("[jitllm] packed weights repacked on the GPU in %.1f ms (%d graphs)%n", (System.nanoTime() - t0) / 1e6, repack.count());
+        for (Consumer<TornadoExecutionPlan> check : repack.checks()) {
+            check.accept(plan);
         }
         plan.withAllGraphs();
-        System.err.printf("[jitllm] packed weights repacked on the GPU in %.1f ms%n", (System.nanoTime() - t0) / 1e6);
+    }
+
+    /**
+     * Appends a graph that reads {@code w} back from repack graph {@code owner}, and returns the
+     * check that runs it and compares it with the host packer.
+     */
+    private static Consumer<TornadoExecutionPlan> verifier(List<ImmutableTaskGraph> graphs, GridScheduler scheduler, String owner, Weight w) {
+        String name = owner + "Verify";
+        ByteArray probe = new ByteArray(w.size());
+        TaskGraph v = new TaskGraph(name)
+                .consumeFromDevice(owner, w.bytes())
+                .task("probe", PackedRepackKernels::copy, new KernelContext(), w.bytes(), probe, w.size())
+                .transferToHost(DataTransferMode.EVERY_EXECUTION, probe);
+        scheduler.addWorkerGrid(name + ".probe", grid((w.size() + 7) / 8));
+        graphs.add(v.snapshot());
+        int index = graphs.size() - 1;
+        return plan -> {
+            plan.withGraph(index).withGridScheduler(scheduler).execute();
+            byte[] device = probe.toHeapArray();
+            byte[] packed = w.q4() ? PackedTilePacker.packQ4_0(w.bytes(), w.rows(), w.cols()) : PackedTilePacker.packQ8_0(w.bytes(), w.rows(), w.cols());
+            String verdict = Arrays.equals(device, packed) ? "PACKED" : Arrays.equals(device, w.bytes().toHeapArray()) ? "RAW (not repacked)" : "NEITHER";
+            System.err.printf("[jitllm] packed verify: %s %dx%d %s -> %s%n", w.q4() ? "Q4_0" : "Q8_0", w.rows(), w.cols(), owner, verdict);
+        };
     }
 
     private static WorkerGrid grid(int lanes) {

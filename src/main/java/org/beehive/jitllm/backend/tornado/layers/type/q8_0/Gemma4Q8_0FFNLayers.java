@@ -963,8 +963,7 @@ public class Gemma4Q8_0FFNLayers
             own.add(weightArray(weights.perLayerInpGate[layerIndex]));
             own.add(weightArray(weights.perLayerProj[layerIndex]));
         }
-        unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, own.toArray());
-        org.beehive.jitllm.backend.tornado.kernels.PackedRepack.owner(unifiedLayer, own.toArray());
+        org.beehive.jitllm.backend.tornado.kernels.PackedRepack.upload(unifiedLayer, own.toArray());
     }
 
     /** Which RoPE pairs the graph being built has bound already: sliding, full. */

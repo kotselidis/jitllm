@@ -1047,8 +1047,7 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 weights.w3Layered[layerIndex].asByteArray(),
                 weights.w2Layered[layerIndex].asByteArray()
             };
-            layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, projections);
-            org.beehive.jitllm.backend.tornado.kernels.PackedRepack.owner(layer, projections);
+            org.beehive.jitllm.backend.tornado.kernels.PackedRepack.upload(layer, projections);
         }
         if (hasOwnKv) {
             requireDecodable(weights.wkLayered[layerIndex], "blk." + layerIndex + ".attn_k");
