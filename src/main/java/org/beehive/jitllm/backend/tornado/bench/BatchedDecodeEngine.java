@@ -395,8 +395,10 @@ public class BatchedDecodeEngine {
         MemorySegment embTable = weights.getTokenEmbeddingTable().asHalfFloatArray().getSegment();
         long dimBytes = (long) dim * Short.BYTES;
 
+        var packedRepack = org.beehive.jitllm.backend.tornado.kernels.PackedRepack.appendGraphs(all, gs);
         try (TornadoExecutionPlan plan =
                 new TornadoExecutionPlan(all.toArray(new ImmutableTaskGraph[0]))) {
+            org.beehive.jitllm.backend.tornado.kernels.PackedRepack.run(plan, packedRepack);
 
             if (options.continuous()) {
                 return runContinuous(
