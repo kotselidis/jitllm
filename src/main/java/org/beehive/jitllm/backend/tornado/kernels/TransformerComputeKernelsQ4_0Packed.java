@@ -310,4 +310,61 @@ public final class TransformerComputeKernelsQ4_0Packed {
             }
         }
     }
+
+    /** {@code hb[row] = gelu(w1[row]·x) * (w3[row]·x)} (Gemma's GeGLU), both against the same quantized activation. */
+    public static void fusedFFNGateUpGeGLUQ4_0Packed(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            FloatArray hb,
+            ByteArray w1,
+            ByteArray w3,
+            int n,
+            int d) {
+        int wg = context.groupIdx;
+        int lane = context.localIdx & 31;
+        if ((wg << 4) < d) {
+            float[] gateSums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] upSums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] gate = new float[4];
+            float[] up = new float[4];
+            for (int i = 0; i < 4; i++) {
+                gate[i] = 0.0f;
+                up[i] = 0.0f;
+            }
+            int firstRound = context.localIdx >> 5;
+            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, gate);
+            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, up);
+            float g0 = reduceOctet(context, gate[0]);
+            float g1 = reduceOctet(context, gate[1]);
+            float g2 = reduceOctet(context, gate[2]);
+            float g3 = reduceOctet(context, gate[3]);
+            float u0 = reduceOctet(context, up[0]);
+            float u1 = reduceOctet(context, up[1]);
+            float u2 = reduceOctet(context, up[2]);
+            float u3 = reduceOctet(context, up[3]);
+            if ((lane & 7) == 0) {
+                int slot = ((context.localIdx >> 5) << 4) + ((lane >> 3) << 2);
+                gateSums[slot] = g0;
+                gateSums[slot + 1] = g1;
+                gateSums[slot + 2] = g2;
+                gateSums[slot + 3] = g3;
+                upSums[slot] = u0;
+                upSums[slot + 1] = u1;
+                upSums[slot + 2] = u2;
+                upSums[slot + 3] = u3;
+            }
+            context.localBarrier();
+            int r = context.localIdx;
+            if (r < 16) {
+                float g = 0.0f;
+                float u = 0.0f;
+                for (int wi = 0; wi < WARPS; wi++) {
+                    g += gateSums[(wi << 4) + r];
+                    u += upSums[(wi << 4) + r];
+                }
+                hb.set(rowOf(wg, r), TransformerComputeKernelsLayered.geluActivation(g) * u);
+            }
+        }
+    }
 }

@@ -5,6 +5,7 @@ import static org.beehive.jitllm.model.loader.ModelLoader.*;
 import java.nio.channels.FileChannel;
 import java.util.Map;
 import org.beehive.jitllm.auxiliary.Pair;
+import org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0Cache;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensorLoader;
 import org.beehive.jitllm.format.DataTypeMapping;
 import org.beehive.jitllm.format.GGMLTensorEntry;
@@ -153,32 +154,56 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
                     "Type: " + weightType + " currently not supported for TornadoVM weights.");
         }
 
+        PackedQ8_0Cache packedCache =
+                retainQ4_0 ? PackedProjections.openQ4(fileChannel, gguf.getTensorDataOffset()) : null;
+
         // Load all tensors uniformly as TornadoTensor hierarchy
-        return new LlamaTornadoWeights(
+        LlamaTornadoWeights weights = new LlamaTornadoWeights(
                 loadTornadoTensor(tokenEmbeddings),
                 loadArrayOfTornadoTensors(
                         nl, i -> tensorEntries.get("blk." + i + ".attn_norm.weight")), // fp32
-                perLayerQuantized(
+                PackedProjections.packQ4(
+                        perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
-                perLayerQuantized(
+                        i -> tensorEntries.get("blk." + i + ".attn_q.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
-                perLayerQuantized(
+                        i -> tensorEntries.get("blk." + i + ".attn_k.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
-                perLayerQuantized(
+                        i -> tensorEntries.get("blk." + i + ".attn_v.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
+                        i -> tensorEntries.get("blk." + i + ".attn_output.weight"),
+                        packedCache),
                 loadArrayOfTornadoTensors(
                         nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")), // fp32
-                perLayerQuantized(
+                PackedProjections.packQ4(
+                        perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
+                        i -> tensorEntries.get("blk." + i + ".ffn_gate.weight"),
+                        packedCache),
                 // ffn_down keeps its own type: llama.cpp's Q4_0 recipe writes some layers' down
                 // projection as Q4_1, and the layer graph picks the kernel per layer.
-                retainQ4_0
-                        ? loadArrayOfTornadoTensorsNative(
-                                nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight"))
-                        : loadArrayOfTornadoTensors(
-                                nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
-                perLayerQuantized(
+                PackedProjections.packQ4(
+                        retainQ4_0
+                                ? loadArrayOfTornadoTensorsNative(
+                                        nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight"))
+                                : loadArrayOfTornadoTensors(
+                                        nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
+                        i -> tensorEntries.get("blk." + i + ".ffn_down.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        perLayerQuantized(
                         retainQ4_0, nl, i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
+                        i -> tensorEntries.get("blk." + i + ".ffn_up.weight"),
+                        packedCache),
                 loadTornadoTensor(tensorEntries.get("output_norm.weight")), // fp32
                 TornadoTensorLoader.fromFloats(ropeFreqs.first()),
                 TornadoTensorLoader.fromFloats(ropeFreqs.second()),
@@ -189,6 +214,8 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
                         ? loadTornadoTensorNative(outputWeight)
                         : loadTornadoTensor(outputWeight),
                 weightType);
+        PackedProjections.finish(packedCache);
+        return weights;
     }
 
     // @formatter:on

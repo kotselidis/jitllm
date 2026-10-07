@@ -732,7 +732,9 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
         FloatArray partial = splits > 1 ? splitPartial : out;
         layer.task(
                 name,
-                Qwen35Int8Kernels::gemmInt8Q4_0,
+                org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(w.asByteArray())
+                        ? Qwen35Int8Kernels::gemmInt8Q4_0Packed
+                        : Qwen35Int8Kernels::gemmInt8Q4_0,
                 context,
                 q8,
                 q8Scales,
@@ -773,6 +775,10 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
 
     /** Decodes {@code w} into the scratch at {@code offset}, by the tensor's own representation. */
     private void dequantize(TaskGraph layer, String name, TornadoTensor w, int offset) {
+        if (org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(w.asByteArray())) {
+            // A packed weight has only the int8 GEMM.
+            throw org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.noPackedKernel("llama batch-prefill task '" + name + "'");
+        }
         DataType type = w.dataType();
         if (type == DataType.Q4_0) {
             layer.task(

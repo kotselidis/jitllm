@@ -560,9 +560,11 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         String graph = layer.getTaskGraphName() + ".";
         layer.task(
                 task,
-                w.dataType() == DataType.Q4_0
-                        ? Qwen35Int8Kernels::gemmInt8Q4_0
-                        : Qwen35Int8Kernels::gemmInt8Q8_0,
+                org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(w.asByteArray())
+                        ? Qwen35Int8Kernels::gemmInt8Q4_0Packed
+                        : w.dataType() == DataType.Q4_0
+                                ? Qwen35Int8Kernels::gemmInt8Q4_0
+                                : Qwen35Int8Kernels::gemmInt8Q8_0,
                 context,
                 state.workspace.wrapQ8ActBatch,
                 state.workspace.wrapQ8ActScales,
@@ -728,6 +730,11 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
      */
     // @formatter:on
     private void addDequant(TaskGraph layer, String taskName, TornadoTensor w, int destOffset) {
+        if (org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(w.asByteArray())) {
+            // A packed weight has only the int8 GEMM (-Djitllm.gemma4.noInt8Prefill and native
+            // projections are not open to it).
+            throw org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.noPackedKernel("gemma4 batch-prefill task '" + taskName + "'");
+        }
         switch (w.dataType()) {
             case Q8_0 ->
                     layer.task(

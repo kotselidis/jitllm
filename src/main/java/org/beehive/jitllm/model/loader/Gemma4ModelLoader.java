@@ -12,6 +12,7 @@ import java.nio.channels.FileChannel;
 import java.util.Map;
 import java.util.function.IntFunction;
 import org.beehive.jitllm.auxiliary.Pair;
+import org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0Cache;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensorLoader;
 import org.beehive.jitllm.format.DataTypeMapping;
@@ -217,18 +218,32 @@ public class Gemma4ModelLoader extends AbstractModelLoader<Gemma4, Gemma4Configu
                         : DataTypeMapping.materializedType(
                                 outputWeight.ggmlType(), ExecutionTarget.GPU);
         RopeTables ropeTables = computeRopeTables(tensorEntries, config);
+        PackedQ8_0Cache packedCache =
+                retain ? PackedProjections.openQ4(fileChannel, gguf.getTensorDataOffset()) : null;
 
-        return new Gemma4TornadoWeights(
+        Gemma4TornadoWeights weights = new Gemma4TornadoWeights(
                 loadTornadoTensor(tokenEmbeddings),
                 loadArrayOfTornadoTensors(
                         nl, i -> tensorEntries.get("blk." + i + ".attn_norm.weight")),
-                loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
-                loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
+                PackedProjections.packQ4(
+                        loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
+                        i -> tensorEntries.get("blk." + i + ".attn_q.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
+                        i -> tensorEntries.get("blk." + i + ".attn_k.weight"),
+                        packedCache),
                 // Absent on the 31B's global layers, whose values are their keys.
-                loadOptionalProjections(
+                PackedProjections.packQ4(
+                        loadOptionalProjections(
                         retain, nl, i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
-                loadProjections(
+                        i -> tensorEntries.get("blk." + i + ".attn_v.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        loadProjections(
                         retain, nl, i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
+                        i -> tensorEntries.get("blk." + i + ".attn_output.weight"),
+                        packedCache),
                 loadArrayOfTornadoTensors(
                         nl, i -> tensorEntries.get("blk." + i + ".attn_q_norm.weight")),
                 loadArrayOfTornadoTensors(
@@ -237,11 +252,20 @@ public class Gemma4ModelLoader extends AbstractModelLoader<Gemma4, Gemma4Configu
                         nl, i -> tensorEntries.get("blk." + i + ".post_attention_norm.weight")),
                 loadArrayOfTornadoTensors(
                         nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")),
-                loadProjections(
+                PackedProjections.packQ4(
+                        loadProjections(
                         retain, nl, i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
-                loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
-                loadProjections(
+                        i -> tensorEntries.get("blk." + i + ".ffn_gate.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        loadProjections(retain, nl, i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
+                        i -> tensorEntries.get("blk." + i + ".ffn_up.weight"),
+                        packedCache),
+                PackedProjections.packQ4(
+                        loadProjections(
                         retain, nl, i -> tensorEntries.get("blk." + i + ".ffn_down.weight")),
+                        i -> tensorEntries.get("blk." + i + ".ffn_down.weight"),
+                        packedCache),
                 loadArrayOfTornadoTensors(
                         nl, i -> tensorEntries.get("blk." + i + ".post_ffw_norm.weight")),
                 ple
@@ -276,6 +300,8 @@ public class Gemma4ModelLoader extends AbstractModelLoader<Gemma4, Gemma4Configu
                                 ? tensorEntries.get("output.weight")
                                 : tokenEmbeddings),
                 weightType);
+        PackedProjections.finish(packedCache);
+        return weights;
     }
 
     // @formatter:on

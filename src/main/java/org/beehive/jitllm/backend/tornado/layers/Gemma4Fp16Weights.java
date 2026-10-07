@@ -45,6 +45,9 @@ final class Gemma4Fp16Weights {
             if (!decodable(t)) {
                 throw new IllegalArgumentException("no FP16 decode for " + type);
             }
+            if (org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.isPackedQ4(t.asByteArray())) {
+                throw org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0.noPackedKernel("gemma4 native (cuBLAS) projections");
+            }
             final int rowBase = base;
             final int blockBytes = type == DataType.Q8_0 ? 34 : type == DataType.Q4_0 ? 18 : 20;
             final ByteArray src = t.asByteArray();
