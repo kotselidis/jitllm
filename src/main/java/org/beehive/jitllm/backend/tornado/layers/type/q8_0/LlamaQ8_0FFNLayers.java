@@ -22,7 +22,24 @@ public class LlamaQ8_0FFNLayers
             LlamaTornadoWeights weights,
             LlamaConfiguration config,
             SchedulerType schedulerType) {
+        this(taskGraphName, state, weights, config, schedulerType, 0, config.numberOfLayers());
+    }
+
+    /**
+     * The layers {@code [firstLayer, endLayer)} only: one stage of a model split across devices.
+     * The first layer of the range uploads the shared buffers that layer 0 uploads otherwise, and
+     * the key/value cache of {@code state} holds just these layers.
+     */
+    public LlamaQ8_0FFNLayers(
+            String taskGraphName,
+            LlamaState state,
+            LlamaTornadoWeights weights,
+            LlamaConfiguration config,
+            SchedulerType schedulerType,
+            int firstLayer,
+            int endLayer) {
         super(taskGraphName, state, weights, config, schedulerType);
+        restrictToLayers(firstLayer, endLayer);
         setupFFNLayers();
     }
 
@@ -228,7 +245,7 @@ public class LlamaQ8_0FFNLayers
         Object keyCache = keyCache();
         Object valueCache = valueCache();
         // First layer: Transfer initial data to device (one-time transfer)
-        if (layerIndex == 0) {
+        if (layerIndex == firstLayer) {
             // Transfer all attention-related data: query, key, value matrices and their caches
             unifiedLayer.transferToDevice(
                     DataTransferMode.EVERY_EXECUTION,
@@ -304,7 +321,7 @@ public class LlamaQ8_0FFNLayers
                 WorkerGridFactory.createAttentionWorker(config.numberOfHeads(), config.headSize());
 
         // === Per-Layer Grid Assignments (ordered by TaskGraph flow) ===
-        for (int i = 0; i < config.numberOfLayers(); i++) {
+        for (int i = firstLayer; i < endLayer(config.numberOfLayers()); i++) {
             // --- Attention Block ---
             // RMS Normalization
             tornadoForwardScheduler.addWorkerGrid(
@@ -354,7 +371,7 @@ public class LlamaQ8_0FFNLayers
                     weights.freq_cis_imagFlat.asFloatArray(),
                     config.kvDim(),
                     config.headSize(),
-                    layerIndex,
+                    keyValueLayer(layerIndex),
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride);
@@ -373,7 +390,7 @@ public class LlamaQ8_0FFNLayers
                     weights.freq_cis_imagFlat.asFloatArray(),
                     config.kvDim(),
                     config.headSize(),
-                    layerIndex,
+                    keyValueLayer(layerIndex),
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride);
@@ -409,7 +426,7 @@ public class LlamaQ8_0FFNLayers
                     config.kvDim(),
                     config.kvMul(),
                     state.workspace.positionHolder,
-                    layerIndex,
+                    keyValueLayer(layerIndex),
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride);
@@ -428,7 +445,7 @@ public class LlamaQ8_0FFNLayers
                     config.kvDim(),
                     config.kvMul(),
                     state.workspace.positionHolder,
-                    layerIndex,
+                    keyValueLayer(layerIndex),
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride);
@@ -447,7 +464,7 @@ public class LlamaQ8_0FFNLayers
                     config.contextLength(),
                     state.workspace.positionHolder,
                     state.workspace.wrapAtt,
-                    layerIndex,
+                    keyValueLayer(layerIndex),
                     state.workspace.wrapBlockTable,
                     state.kvBlockCfg,
                     state.kvBlockStride);
