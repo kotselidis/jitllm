@@ -123,10 +123,43 @@ public final class PackedRepack {
         g.task("markDone", PackedRepackKernels::markDone, new KernelContext(), done);
         scheduler.addWorkerGrid(name + ".markDone", grid(1));
         g.persistOnDevice(all.toArray());
-        OWNED.clear();
         graphs.add(g.snapshot());
-        return graphs.size() - 1;
+        int index = graphs.size() - 1;
+        if (VERIFY) {
+            // Reads back the first and last weight from their owners after the repack.
+            List<Weight> flat = new ArrayList<>();
+            List<String> owners = new ArrayList<>();
+            for (Map.Entry<String, List<Weight>> e : OWNED.entrySet()) {
+                for (Weight w : e.getValue()) {
+                    flat.add(w);
+                    owners.add(e.getKey());
+                }
+            }
+            int[] picks = {0, flat.size() - 1};
+            TaskGraph v = new TaskGraph(name + "Verify");
+            List<Probe> probes = new ArrayList<>();
+            for (int p = 0; p < picks.length; p++) {
+                Weight w = flat.get(picks[p]);
+                ByteArray probe = new ByteArray(w.size());
+                v.consumeFromDevice(owners.get(picks[p]), w.bytes());
+                v.task("probe" + p, PackedRepackKernels::copy, new KernelContext(), w.bytes(), probe, w.size());
+                v.transferToHost(DataTransferMode.EVERY_EXECUTION, probe);
+                scheduler.addWorkerGrid(name + "Verify.probe" + p, grid((w.size() + 7) / 8));
+                probes.add(new Probe(w, owners.get(picks[p]), probe));
+            }
+            graphs.add(v.snapshot());
+            VERIFIERS.put(index, probes);
+        }
+        OWNED.clear();
+        return index;
     }
+
+    /** Diagnostic: {@code -Djitllm.packed.verify=true} reads weights back after the repack. */
+    private static final boolean VERIFY = Boolean.getBoolean("jitllm.packed.verify");
+
+    private record Probe(Weight weight, String owner, ByteArray bytes) {}
+
+    private static final Map<Integer, List<Probe>> VERIFIERS = new java.util.HashMap<>();
 
     /** Runs the repack graph {@code index} of {@code plan} once, when there is one. */
     public static void run(TornadoExecutionPlan plan, int index, GridScheduler scheduler) {
@@ -135,6 +168,18 @@ public final class PackedRepack {
         }
         long t0 = System.nanoTime();
         plan.withGraph(index).withGridScheduler(scheduler).execute();
+        List<Probe> probes = VERIFIERS.get(index);
+        if (probes != null) {
+            plan.withGraph(index + 1).withGridScheduler(scheduler).execute();
+            for (Probe p : probes) {
+                Weight w = p.weight();
+                byte[] device = p.bytes().toHeapArray();
+                byte[] raw = w.bytes().toHeapArray();
+                byte[] packed = w.q4() ? PackedTilePacker.packQ4_0(w.bytes(), w.rows(), w.cols()) : PackedTilePacker.packQ8_0(w.bytes(), w.rows(), w.cols());
+                String verdict = java.util.Arrays.equals(device, packed) ? "PACKED" : java.util.Arrays.equals(device, raw) ? "RAW (not repacked)" : "NEITHER";
+                System.err.printf("[jitllm] packed verify: %s %dx%d owner %s -> %s%n", w.q4() ? "Q4_0" : "Q8_0", w.rows(), w.cols(), p.owner(), verdict);
+            }
+        }
         plan.withAllGraphs();
         System.err.printf("[jitllm] packed weights repacked on the GPU in %.1f ms%n", (System.nanoTime() - t0) / 1e6);
     }
