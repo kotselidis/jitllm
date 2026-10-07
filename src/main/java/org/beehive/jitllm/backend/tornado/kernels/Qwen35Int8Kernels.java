@@ -966,39 +966,7 @@ public final class Qwen35Int8Kernels {
 
     /** The bytes of {@link #packQ8_0Tiles}, on the heap. */
     public static byte[] packQ8_0TileBytes(ByteArray w, int n, int k) {
-        int kBlocks = k / Q8_BLOCK;
-        int rowBytes = kBlocks * Q8_0_BLOCK_BYTES;
-        int rounds = k / I8_BK;
-        int tiles = (n / I8_BN) * rounds;
-        byte[] raw = w.toHeapArray();
-        byte[] out = new byte[tiles * PACKED_TILE_BYTES];
-        for (int colTile = 0; colTile < n / I8_BN; colTile++) {
-            for (int round = 0; round < rounds; round++) {
-                int base = (colTile * rounds + round) * PACKED_TILE_BYTES;
-                for (int word = 0; word < 2 * TILE_WORDS; word++) {
-                    int block = round * 2 + (word >> 10);
-                    int half = (word >> 9) & 1;
-                    int slotIndex = word & 511;
-                    int colPair = ((slotIndex >> 6) << 2) | (slotIndex & 3);
-                    int kRow = (slotIndex >> 2) & 15;
-                    int col = colTile * I8_BN + half * 64 + 2 * colPair;
-                    int src = col * rowBytes + block * Q8_0_BLOCK_BYTES + 2 + 2 * kRow;
-                    out[base + word * 4] = raw[src];
-                    out[base + word * 4 + 1] = raw[src + 1];
-                    out[base + word * 4 + 2] = raw[src + rowBytes];
-                    out[base + word * 4 + 3] = raw[src + rowBytes + 1];
-                }
-                for (int j = 0; j < 2 * I8_BN; j++) {
-                    int col = colTile * I8_BN + (j & 127);
-                    int block = round * 2 + (j >> 7);
-                    int src = col * rowBytes + block * Q8_0_BLOCK_BYTES;
-                    int dst = base + PACKED_QUANT_BYTES + j * 2;
-                    out[dst] = raw[src];
-                    out[dst + 1] = raw[src + 1];
-                }
-            }
-        }
-        return out;
+        return PackedTilePacker.packQ8_0(w, n, k);
     }
 
     // @formatter:off
@@ -1499,44 +1467,7 @@ public final class Qwen35Int8Kernels {
 
     /** The bytes of {@link #packQ4_0Tiles}, on the heap. */
     public static byte[] packQ4_0TileBytes(ByteArray w, int n, int k) {
-        int kBlocks = k / Q8_BLOCK;
-        int rowBytes = kBlocks * Q4_0_BLOCK_BYTES;
-        int rounds = k / I8_BK;
-        byte[] raw = w.toHeapArray();
-        byte[] out = new byte[(n / I8_BN) * rounds * PACKED_Q4_TILE_BYTES];
-        for (int colTile = 0; colTile < n / I8_BN; colTile++) {
-            for (int round = 0; round < rounds; round++) {
-                int base = (colTile * rounds + round) * PACKED_Q4_TILE_BYTES;
-                for (int t = 0; t < 512; t++) {
-                    int kRow = t & 15;
-                    int colPair = (t >> 4) & 31;
-                    long nibbles = 0L;
-                    for (int s = 0; s < 4; s++) {
-                        int block = round * 2 + (s >> 1);
-                        int col = colTile * I8_BN + (s & 1) * 64 + (colPair << 1);
-                        int q = kRow << 1; // quants q and q + 1 of the block
-                        long group = 0L;
-                        for (int e = 0; e < 4; e++) {
-                            int c = col + (e >> 1);
-                            int qi = q + (e & 1);
-                            int b = raw[c * rowBytes + block * Q4_0_BLOCK_BYTES + 2 + (qi & 15)] & 0xFF;
-                            int nibble = qi < 16 ? b & 0xF : b >>> 4;
-                            group |= (long) nibble << (e << 2);
-                        }
-                        nibbles |= group << (s << 4);
-                    }
-                    for (int i = 0; i < 8; i++) {
-                        out[base + (t << 3) + i] = (byte) (nibbles >>> (i << 3));
-                    }
-                }
-                for (int j = 0; j < 2 * I8_BN; j++) {
-                    int src = (colTile * I8_BN + (j & 127)) * rowBytes + (round * 2 + (j >> 7)) * Q4_0_BLOCK_BYTES;
-                    out[base + PACKED_Q4_QUANT_BYTES + 2 * j] = raw[src];
-                    out[base + PACKED_Q4_QUANT_BYTES + 2 * j + 1] = raw[src + 1];
-                }
-            }
-        }
-        return out;
+        return PackedTilePacker.packQ4_0(w, n, k);
     }
 
     // @formatter:off
