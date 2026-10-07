@@ -166,7 +166,7 @@ public class Q8_0PackedDecodeAccelTest {
                         .transferToHost(DataTransferMode.EVERY_EXECUTION, ref, got);
         GridScheduler s = new GridScheduler();
         s.addWorkerGrid("pg.r", grid(d * MATVEC_LOCAL, MATVEC_LOCAL));
-        s.addWorkerGrid("pg.p", grid(d / 8 * TransformerComputeKernelsQ8_0Packed.LOCAL, TransformerComputeKernelsQ8_0Packed.LOCAL));
+        s.addWorkerGrid("pg.p", grid(d / 8 * TransformerComputeKernelsQ8_0Packed.FUSED_LOCAL, TransformerComputeKernelsQ8_0Packed.FUSED_LOCAL));
         try (TornadoExecutionPlan plan = new TornadoExecutionPlan(g.snapshot())) {
             plan.withGridScheduler(s).execute();
         }

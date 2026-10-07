@@ -22,17 +22,27 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  * 1) + 3} of the eight. Each lane scales its integer products by the weight and activation block
  * scales and accumulates in FP32; the lanes of a row are summed by shuffles at the end.
  *
- * <p>Worker: {@code d * 32} lanes (a workgroup per eight rows), local {@link #LOCAL}. Requires
- * {@code d % 128 == 0} and {@code n % 64 == 0}, as the packing does.
+ * <p>Worker: a workgroup per eight rows, {@code d / 8 * LOCAL} lanes with local {@link #LOCAL}
+ * ({@code d / 8 * FUSED_LOCAL} and {@link #FUSED_LOCAL} for the fused gate/up). Requires {@code
+ * d % 128 == 0} and {@code n % 64 == 0}, as the packing does.
  */
 // @formatter:on
 public final class TransformerComputeKernelsQ8_0Packed {
 
-    /** Warps of a workgroup, all on the same eight rows. */
-    public static final int WARPS = 8;
+    /** Warps of a matrix-vector workgroup, all on the same eight rows. */
+    public static final int WARPS = 16;
 
-    /** Threads of a workgroup. */
+    /** Threads of a matrix-vector workgroup. */
     public static final int LOCAL = WARPS * 32;
+
+    /**
+     * Warps of a fused gate/up workgroup. Each reads both weights and two rounds per step, so
+     * eight warps keep as many loads in flight as sixteen do on one weight.
+     */
+    public static final int FUSED_WARPS = 8;
+
+    /** Threads of a fused gate/up workgroup. */
+    public static final int FUSED_LOCAL = FUSED_WARPS * 32;
 
     private static final int TILE_BYTES = Qwen35Int8Kernels.PACKED_TILE_BYTES;
 
@@ -113,6 +123,37 @@ public final class TransformerComputeKernelsQ8_0Packed {
                 acc[3] += w.getHalfFloat(scales + 6).getFloat32() * (signedByte(w1, 2) * x0 + signedByte(w1, 3) * x1);
             }
         }
+    }
+
+    /**
+     * One 32-block of one weight into {@code acc[o..o + 3]}: block {@code b} of the round whose
+     * tile starts at byte {@code tile}, the lane's two words in one 64-bit load.
+     */
+    private static void accumulateBlock(
+            ByteArray w,
+            IntArray xQuants,
+            FloatArray xScales,
+            int tile,
+            int b,
+            int block,
+            int wordInBlock,
+            int scaleColumn,
+            int kRow,
+            int shift,
+            float[] acc,
+            int o) {
+        long pair = w.getLong(tile + (((b << 10) + wordInBlock) << 2));
+        int w0 = (int) pair;
+        int w1 = (int) (pair >>> 32);
+        int xw = xQuants.get((block << 3) + (kRow >> 1));
+        int x0 = signedByte(xw, shift);
+        int x1 = signedByte(xw, shift + 1);
+        float xScale = xScales.get(block);
+        int scales = tile + QUANT_BYTES + (((b << 7) + scaleColumn) << 1);
+        acc[o] += (signedByte(w0, 0) * x0 + signedByte(w0, 1) * x1) * (w.getHalfFloat(scales).getFloat32() * xScale);
+        acc[o + 1] += (signedByte(w0, 2) * x0 + signedByte(w0, 3) * x1) * (w.getHalfFloat(scales + 2).getFloat32() * xScale);
+        acc[o + 2] += (signedByte(w1, 0) * x0 + signedByte(w1, 1) * x1) * (w.getHalfFloat(scales + 4).getFloat32() * xScale);
+        acc[o + 3] += (signedByte(w1, 2) * x0 + signedByte(w1, 3) * x1) * (w.getHalfFloat(scales + 6).getFloat32() * xScale);
     }
 
     /** Sums a value over the lanes of this warp with the same parity (shuffles by even offsets). */
@@ -231,26 +272,50 @@ public final class TransformerComputeKernelsQ8_0Packed {
         int rowBase = context.groupIdx << 3;
         int lane = context.localIdx & 31;
         if (rowBase < d) {
-            float[] gateSums = context.allocateFloatLocalArray(WARPS * 8);
-            float[] upSums = context.allocateFloatLocalArray(WARPS * 8);
-            float[] gate = new float[4];
-            float[] up = new float[4];
-            for (int i = 0; i < 4; i++) {
+            float[] gateSums = context.allocateFloatLocalArray(FUSED_WARPS * 8);
+            float[] upSums = context.allocateFloatLocalArray(FUSED_WARPS * 8);
+            float[] gate = new float[8];
+            float[] up = new float[8];
+            for (int i = 0; i < 8; i++) {
                 gate[i] = 0.0f;
                 up[i] = 0.0f;
             }
-            int firstRound = context.localIdx >> 5;
-            accumulate(w1, xQuants, xScales, n, rowBase, lane, firstRound, gate);
-            accumulate(w3, xQuants, xScales, n, rowBase, lane, firstRound, up);
+            // Both weights and two rounds per step, so that eight loads are in flight per lane
+            // (inline: as a helper this exceeds TornadoVM's inlining limit). Rounds go to [0..3] and
+            // [4..7] by parity of the step, summed at the end.
+            int rounds = n >> 6;
+            int wordInBlock = (((rowBase >> 6) & 1) << 9) + (((rowBase >> 3) & 7) << 6) + (lane << 1);
+            int scaleColumn = (rowBase & 127) + ((lane & 1) << 2);
+            int kRow = lane >> 1;
+            int shift = (kRow & 1) << 1;
+            int tileBase = (rowBase >> 7) * rounds * TILE_BYTES;
+            int round = context.localIdx >> 5;
+            for (; round + FUSED_WARPS < rounds; round += 2 * FUSED_WARPS) {
+                int t0 = tileBase + round * TILE_BYTES;
+                int t1 = t0 + FUSED_WARPS * TILE_BYTES;
+                for (int b = 0; b < 2; b++) {
+                    accumulateBlock(w1, xQuants, xScales, t0, b, (round << 1) + b, wordInBlock, scaleColumn, kRow, shift, gate, 0);
+                    accumulateBlock(w3, xQuants, xScales, t0, b, (round << 1) + b, wordInBlock, scaleColumn, kRow, shift, up, 0);
+                    accumulateBlock(w1, xQuants, xScales, t1, b, ((round + FUSED_WARPS) << 1) + b, wordInBlock, scaleColumn, kRow, shift, gate, 4);
+                    accumulateBlock(w3, xQuants, xScales, t1, b, ((round + FUSED_WARPS) << 1) + b, wordInBlock, scaleColumn, kRow, shift, up, 4);
+                }
+            }
+            for (; round < rounds; round += FUSED_WARPS) {
+                int t0 = tileBase + round * TILE_BYTES;
+                for (int b = 0; b < 2; b++) {
+                    accumulateBlock(w1, xQuants, xScales, t0, b, (round << 1) + b, wordInBlock, scaleColumn, kRow, shift, gate, 0);
+                    accumulateBlock(w3, xQuants, xScales, t0, b, (round << 1) + b, wordInBlock, scaleColumn, kRow, shift, up, 0);
+                }
+            }
             int warp = context.localIdx >> 5;
-            float g0 = reduceParity(context, gate[0]);
-            float g1 = reduceParity(context, gate[1]);
-            float g2 = reduceParity(context, gate[2]);
-            float g3 = reduceParity(context, gate[3]);
-            float u0 = reduceParity(context, up[0]);
-            float u1 = reduceParity(context, up[1]);
-            float u2 = reduceParity(context, up[2]);
-            float u3 = reduceParity(context, up[3]);
+            float g0 = reduceParity(context, gate[0] + gate[4]);
+            float g1 = reduceParity(context, gate[1] + gate[5]);
+            float g2 = reduceParity(context, gate[2] + gate[6]);
+            float g3 = reduceParity(context, gate[3] + gate[7]);
+            float u0 = reduceParity(context, up[0] + up[4]);
+            float u1 = reduceParity(context, up[1] + up[5]);
+            float u2 = reduceParity(context, up[2] + up[6]);
+            float u3 = reduceParity(context, up[3] + up[7]);
             if (lane < 2) {
                 int slot = (warp << 3) + (lane << 2);
                 gateSums[slot] = g0;
@@ -267,7 +332,7 @@ public final class TransformerComputeKernelsQ8_0Packed {
             if (row < 8) {
                 float g = 0.0f;
                 float u = 0.0f;
-                for (int wi = 0; wi < WARPS; wi++) {
+                for (int wi = 0; wi < FUSED_WARPS; wi++) {
                     g += gateSums[(wi << 3) + row];
                     u += upSums[(wi << 3) + row];
                 }
