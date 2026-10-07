@@ -82,10 +82,11 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 float xScale = xScales.get(block);
                 int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
                 for (int h = 0; h < 2; h++) {
-                    int w0 = q4Word(g0 >>> (h << 4));
-                    int w1 = q4Word(g1 >>> (h << 4));
+                    int w0 = q4Word(g0 >> (h << 4));
+                    int w1 = q4Word(g1 >> (h << 4));
                     int even = (w0 & 0xFFFF) | (w1 << 16);
-                    int odd = (w0 >>> 16) | (w1 & 0xFFFF0000);
+                    // (w0 >> 16) & 0xFFFF rather than w0 >>> 16: the unsigned shift compiles as a signed one here.
+                    int odd = ((w0 >> 16) & 0xFFFF) | (w1 & 0xFFFF0000);
                     int sc = scales + (h << 7);
                     acc[h << 1] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(sc).getFloat32() * xScale);
                     acc[(h << 1) + 1] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(sc + 2).getFloat32() * xScale);
@@ -124,8 +125,8 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 float x3 = x.get(k + 3);
                 int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
                 for (int h = 0; h < 2; h++) {
-                    int w0 = q4Word(g0 >>> (h << 4));
-                    int w1 = q4Word(g1 >>> (h << 4));
+                    int w0 = q4Word(g0 >> (h << 4));
+                    int w1 = q4Word(g1 >> (h << 4));
                     float even = signedByte(w0, 0) * x0 + signedByte(w0, 1) * x1 + signedByte(w1, 0) * x2 + signedByte(w1, 1) * x3;
                     float odd = signedByte(w0, 2) * x0 + signedByte(w0, 3) * x1 + signedByte(w1, 2) * x2 + signedByte(w1, 3) * x3;
                     int sc = scales + (h << 7);

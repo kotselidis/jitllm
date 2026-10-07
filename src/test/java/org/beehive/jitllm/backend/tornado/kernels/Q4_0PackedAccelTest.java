@@ -134,6 +134,31 @@ public class Q4_0PackedAccelTest {
         return s;
     }
 
+    /** The quantized product on the host, from the Q4_0 blocks. */
+    private static FloatArray hostProduct(ByteArray w, IntArray xq, FloatArray xs, int d, int n) {
+        FloatArray out = new FloatArray(d);
+        int rowBytes = n / 32 * 18;
+        for (int c = 0; c < d; c++) {
+            double sum = 0;
+            for (int blk = 0; blk < n / 32; blk++) {
+                int o = c * rowBytes + blk * 18;
+                short bits = (short) ((w.get(o) & 0xFF) | ((w.get(o + 1) & 0xFF) << 8));
+                double scale = Float.float16ToFloat(bits) * xs.get(blk);
+                long dot = 0;
+                for (int k = 0; k < 32; k++) {
+                    int b = w.get(o + 2 + (k & 15)) & 0xFF;
+                    int q = (k < 16 ? b & 0xF : b >>> 4) - 8;
+                    int xi = xq.get(blk * 8 + (k >> 2));
+                    int xv = (byte) (xi >> ((k & 3) << 3));
+                    dot += (long) q * xv;
+                }
+                sum += dot * scale;
+            }
+            out.set(c, (float) sum);
+        }
+        return out;
+    }
+
     private static WorkerGrid packedGrid(int d) {
         return grid(d / 16 * TransformerComputeKernelsQ4_0Packed.LOCAL, TransformerComputeKernelsQ4_0Packed.LOCAL);
     }
@@ -182,6 +207,8 @@ public class Q4_0PackedAccelTest {
             try (TornadoExecutionPlan plan = new TornadoExecutionPlan(g.snapshot())) {
                 plan.withGridScheduler(s).execute();
             }
+            FloatArray host = hostProduct(w, xq, xs, d, n);
+            assertTrue(d + "x" + n + " store vs host: " + worst(host, got), worst(host, got) < 1e-5);
             assertTrue(d + "x" + n + " store: " + worst(ref, got), worst(ref, got) < 1e-5);
             assertTrue(d + "x" + n + " residual: " + worst(refRes, gotRes), worst(refRes, gotRes) < 1e-5);
             assertTrue(d + "x" + n + " fp32: " + worst(refF, gotF), worst(refF, gotF) < 1e-5);
