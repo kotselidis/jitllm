@@ -471,9 +471,9 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
     }
 
     /** The grid for a projection over {@code w}: a 16-row group per workgroup when it is packed. */
-    private static WorkerGrid packedWorker(int rows, TornadoTensor w) {
+    private static WorkerGrid packedWorker(int rows, TornadoTensor w, boolean fused) {
         if (PackedQ8_0.isPackedQ4(w.asByteArray())) {
-            int local = TransformerComputeKernelsQ4_0Packed.LOCAL;
+            int local = fused ? TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL : TransformerComputeKernelsQ4_0Packed.LOCAL;
             return WorkerGridFactory.genericWorker(rows / 16 * local, local);
         }
         return packedWorker(rows);
@@ -522,11 +522,11 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 tornadoForwardScheduler.addWorkerGrid(layer + "attn_rms_reduce", rmsReduceWorker);
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "attn_rms_apply", quantizeWorker(config.dim()));
-                tornadoForwardScheduler.addWorkerGrid(layer + "q_proj", packedWorker(config.dim(), weights.wqLayered[i]));
+                tornadoForwardScheduler.addWorkerGrid(layer + "q_proj", packedWorker(config.dim(), weights.wqLayered[i], false));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "k_proj", packedWorker(config.kvDim(), weights.wkLayered[i]));
+                        layer + "k_proj", packedWorker(config.kvDim(), weights.wkLayered[i], false));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "v_proj", packedWorker(config.kvDim(), weights.wvLayered[i]));
+                        layer + "v_proj", packedWorker(config.kvDim(), weights.wvLayered[i], false));
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "rope_and_kv_cache", ropeWithCacheWorker);
                 tornadoForwardScheduler.addWorkerGrid(layer + "attention", parallelAttentionWorker);
@@ -534,16 +534,16 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "attn_out_quantize", quantizeWorker(config.dim()));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "attn_output_proj", packedWorker(config.dim(), weights.woLayered[i]));
+                        layer + "attn_output_proj", packedWorker(config.dim(), weights.woLayered[i], false));
                 tornadoForwardScheduler.addWorkerGrid(layer + "ffn_rms_reduce", rmsReduceWorker);
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "ffn_rms_apply", quantizeWorker(config.dim()));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "ffn_gate_up", packedWorker(config.hiddenDim(), weights.w1Layered[i]));
+                        layer + "ffn_gate_up", packedWorker(config.hiddenDim(), weights.w1Layered[i], true));
                 tornadoForwardScheduler.addWorkerGrid(
                         layer + "ffn_down_quantize", quantizeWorker(config.hiddenDim()));
                 tornadoForwardScheduler.addWorkerGrid(
-                        layer + "ffn_down_proj", packedWorker(config.dim(), weights.w2Layered[i]));
+                        layer + "ffn_down_proj", packedWorker(config.dim(), weights.w2Layered[i], false));
                 continue;
             }
             tornadoForwardScheduler.addWorkerGrid(

@@ -27,11 +27,24 @@ import uk.ac.manchester.tornado.api.utils.QuantizationUtils;
 // @formatter:on
 public final class TransformerComputeKernelsQ4_0Packed {
 
-    /** Warps of a workgroup, all on the same sixteen rows. */
-    public static final int WARPS = 8;
+    /**
+     * Warps of a matrix-vector workgroup, all on the same sixteen rows ({@code
+     * -Djitllm.q4.packed.decodeWarps}, 1 to {@link #MAX_WARPS}). The kernels read it from the
+     * launch's local size.
+     */
+    public static final int WARPS = Integer.getInteger("jitllm.q4.packed.decodeWarps", 8);
 
-    /** Threads of a workgroup. */
+    /** Threads of a matrix-vector workgroup. */
     public static final int LOCAL = WARPS * 32;
+
+    /** Warps of a fused gate/up workgroup ({@code -Djitllm.q4.packed.fusedWarps}). */
+    public static final int FUSED_WARPS = Integer.getInteger("jitllm.q4.packed.fusedWarps", 8);
+
+    /** Threads of a fused gate/up workgroup. */
+    public static final int FUSED_LOCAL = FUSED_WARPS * 32;
+
+    /** The most warps a workgroup may have: the size of the shared partial sums. */
+    private static final int MAX_WARPS = 16;
 
     private static final int TILE_BYTES = Qwen35Int8Kernels.PACKED_Q4_TILE_BYTES;
 
@@ -59,7 +72,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
      * firstRound, firstRound + WARPS, ...}, the activation quantized.
      */
     private static void accumulate(
-            ByteArray w, IntArray xQuants, FloatArray xScales, int n, int wg, int lane, int firstRound, float[] acc) {
+            ByteArray w, IntArray xQuants, FloatArray xScales, int n, int wg, int lane, int firstRound, int warps, float[] acc) {
         int rounds = n >> 6;
         int colTile = wg >> 3;
         int group = wg & 7;
@@ -68,7 +81,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
         int column = (group << 3) + (pair << 1);
         int laneBytes = (group << 9) + (lane << 4);
         int tileBase = colTile * rounds * TILE_BYTES;
-        for (int round = firstRound; round < rounds; round += WARPS) {
+        for (int round = firstRound; round < rounds; round += warps) {
             int tile = tileBase + round * TILE_BYTES;
             long n0 = w.getLong(tile + laneBytes);
             long n1 = w.getLong(tile + laneBytes + 8);
@@ -103,7 +116,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
     }
 
     /** {@link #accumulate} against an FP32 activation. */
-    private static void accumulateF32(ByteArray w, FloatArray x, int n, int wg, int lane, int firstRound, float[] acc) {
+    private static void accumulateF32(ByteArray w, FloatArray x, int n, int wg, int lane, int firstRound, int warps, float[] acc) {
         int rounds = n >> 6;
         int colTile = wg >> 3;
         int group = wg & 7;
@@ -112,7 +125,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
         int column = (group << 3) + (pair << 1);
         int laneBytes = (group << 9) + (lane << 4);
         int tileBase = colTile * rounds * TILE_BYTES;
-        for (int round = firstRound; round < rounds; round += WARPS) {
+        for (int round = firstRound; round < rounds; round += warps) {
             int tile = tileBase + round * TILE_BYTES;
             long n0 = w.getLong(tile + laneBytes);
             long n1 = w.getLong(tile + laneBytes + 8);
@@ -174,12 +187,12 @@ public final class TransformerComputeKernelsQ4_0Packed {
         int wg = context.groupIdx;
         int lane = context.localIdx & 31;
         if ((wg << 4) < d) {
-            float[] sums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] sums = context.allocateFloatLocalArray(MAX_WARPS * 16);
             float[] acc = new float[4];
             for (int i = 0; i < 4; i++) {
                 acc[i] = 0.0f;
             }
-            accumulate(w, xQuants, xScales, n, wg, lane, context.localIdx >> 5, acc);
+            accumulate(w, xQuants, xScales, n, wg, lane, context.localIdx >> 5, context.localGroupSizeX >> 5, acc);
             float r0 = reduceOctet(context, acc[0]);
             float r1 = reduceOctet(context, acc[1]);
             float r2 = reduceOctet(context, acc[2]);
@@ -195,7 +208,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
             int r = context.localIdx;
             if (r < 16) {
                 float total = 0.0f;
-                for (int wi = 0; wi < WARPS; wi++) {
+                for (int wi = 0; wi < (context.localGroupSizeX >> 5); wi++) {
                     total += sums[(wi << 4) + r];
                 }
                 int row = rowOf(wg, r);
@@ -220,12 +233,12 @@ public final class TransformerComputeKernelsQ4_0Packed {
         int wg = context.groupIdx;
         int lane = context.localIdx & 31;
         if ((wg << 4) < d) {
-            float[] sums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] sums = context.allocateFloatLocalArray(MAX_WARPS * 16);
             float[] acc = new float[4];
             for (int i = 0; i < 4; i++) {
                 acc[i] = 0.0f;
             }
-            accumulateF32(w, x, n, wg, lane, context.localIdx >> 5, acc);
+            accumulateF32(w, x, n, wg, lane, context.localIdx >> 5, context.localGroupSizeX >> 5, acc);
             float r0 = reduceOctet(context, acc[0]);
             float r1 = reduceOctet(context, acc[1]);
             float r2 = reduceOctet(context, acc[2]);
@@ -241,7 +254,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
             int r = context.localIdx;
             if (r < 16) {
                 float total = 0.0f;
-                for (int wi = 0; wi < WARPS; wi++) {
+                for (int wi = 0; wi < (context.localGroupSizeX >> 5); wi++) {
                     total += sums[(wi << 4) + r];
                 }
                 int row = rowOf(wg, r);
@@ -267,8 +280,8 @@ public final class TransformerComputeKernelsQ4_0Packed {
         int wg = context.groupIdx;
         int lane = context.localIdx & 31;
         if ((wg << 4) < d) {
-            float[] gateSums = context.allocateFloatLocalArray(WARPS * 16);
-            float[] upSums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] gateSums = context.allocateFloatLocalArray(MAX_WARPS * 16);
+            float[] upSums = context.allocateFloatLocalArray(MAX_WARPS * 16);
             float[] gate = new float[4];
             float[] up = new float[4];
             for (int i = 0; i < 4; i++) {
@@ -276,8 +289,8 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 up[i] = 0.0f;
             }
             int firstRound = context.localIdx >> 5;
-            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, gate);
-            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, up);
+            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, gate);
+            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, up);
             float g0 = reduceOctet(context, gate[0]);
             float g1 = reduceOctet(context, gate[1]);
             float g2 = reduceOctet(context, gate[2]);
@@ -302,7 +315,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
             if (r < 16) {
                 float g = 0.0f;
                 float u = 0.0f;
-                for (int wi = 0; wi < WARPS; wi++) {
+                for (int wi = 0; wi < (context.localGroupSizeX >> 5); wi++) {
                     g += gateSums[(wi << 4) + r];
                     u += upSums[(wi << 4) + r];
                 }
@@ -324,8 +337,8 @@ public final class TransformerComputeKernelsQ4_0Packed {
         int wg = context.groupIdx;
         int lane = context.localIdx & 31;
         if ((wg << 4) < d) {
-            float[] gateSums = context.allocateFloatLocalArray(WARPS * 16);
-            float[] upSums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] gateSums = context.allocateFloatLocalArray(MAX_WARPS * 16);
+            float[] upSums = context.allocateFloatLocalArray(MAX_WARPS * 16);
             float[] gate = new float[4];
             float[] up = new float[4];
             for (int i = 0; i < 4; i++) {
@@ -333,8 +346,8 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 up[i] = 0.0f;
             }
             int firstRound = context.localIdx >> 5;
-            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, gate);
-            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, up);
+            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, gate);
+            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, up);
             float g0 = reduceOctet(context, gate[0]);
             float g1 = reduceOctet(context, gate[1]);
             float g2 = reduceOctet(context, gate[2]);
@@ -359,7 +372,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
             if (r < 16) {
                 float g = 0.0f;
                 float u = 0.0f;
-                for (int wi = 0; wi < WARPS; wi++) {
+                for (int wi = 0; wi < (context.localGroupSizeX >> 5); wi++) {
                     g += gateSums[(wi << 4) + r];
                     u += upSums[(wi << 4) + r];
                 }

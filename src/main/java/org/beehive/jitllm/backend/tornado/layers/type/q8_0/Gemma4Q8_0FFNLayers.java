@@ -1517,8 +1517,8 @@ public class Gemma4Q8_0FFNLayers
             WorkerGrid ffnGateUpWorker =
                     packedQ4(weights.w1Layered[i])
                             ? WorkerGridFactory.genericWorker(
-                                    ffnLen / 16 * org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.LOCAL,
-                                    org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.LOCAL)
+                                    ffnLen / 16 * org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL,
+                                    org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL)
                             : WorkerGridFactory.genericWorker(
                                     ffnLen * LOCAL_WORK_GROUP_SIZE_ALLOC, LOCAL_WORK_GROUP_SIZE_ALLOC);
 

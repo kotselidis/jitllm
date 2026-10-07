@@ -2244,9 +2244,11 @@ public class Qwen35FFNLayers
     /** {@link #matVecWorker}, or a workgroup per eight rows where the task's weight is packed. */
     private WorkerGrid projWorker(int layer, String task, int rows) {
         if (packedQ4Tasks().contains(layer + "." + task)) {
-            return WorkerGridFactory.genericWorker(
-                    rows / 16 * TransformerComputeKernelsQ4_0Packed.LOCAL,
-                    TransformerComputeKernelsQ4_0Packed.LOCAL);
+            int local =
+                    task.equals("ffn_gate_up")
+                            ? TransformerComputeKernelsQ4_0Packed.FUSED_LOCAL
+                            : TransformerComputeKernelsQ4_0Packed.LOCAL;
+            return WorkerGridFactory.genericWorker(rows / 16 * local, local);
         }
         if (packedTasks().contains(layer + "." + task)) {
             int local =
