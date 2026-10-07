@@ -45,8 +45,10 @@ public final class TransformerComputeKernelsQ4_0Packed {
         return ((x | 0x80808080) - 0x08080808) ^ 0x80808080;
     }
 
+    /** Signed byte {@code i} of {@code v}, without relying on an arithmetic shift (see accumulate). */
     private static int signedByte(int v, int i) {
-        return (v << (24 - (i << 3))) >> 24;
+        int b = (v >> (i << 3)) & 0xFF;
+        return b - ((b & 0x80) << 1);
     }
 
     /**
@@ -87,14 +89,16 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 int w0 = q4Word(g0);
                 int w1 = q4Word(g1);
                 int even = (w0 & 0xFFFF) | (w1 << 16);
-                // (w0 >> 16) & 0xFFFF rather than w0 >>> 16: the unsigned shift compiles as a signed one here.
-                int odd = ((w0 >> 16) & 0xFFFF) | (w1 & 0xFFFF0000);
+                // Built from shifts and a low mask only: here an int >> may compile as a logical
+                // shift, and an & with 0xFFFF0000 loses the sign bit; these forms give the same bits
+                // either way.
+                int odd = ((w0 >> 16) & 0xFFFF) | ((w1 >> 16) << 16);
                 acc[0] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(sc).getFloat32() * xScale);
                 acc[1] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(sc + 2).getFloat32() * xScale);
                 w0 = q4Word(g0 >> 16);
                 w1 = q4Word(g1 >> 16);
                 even = (w0 & 0xFFFF) | (w1 << 16);
-                odd = ((w0 >> 16) & 0xFFFF) | (w1 & 0xFFFF0000);
+                odd = ((w0 >> 16) & 0xFFFF) | ((w1 >> 16) << 16);
                 acc[2] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(sc + 128).getFloat32() * xScale);
                 acc[3] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(sc + 130).getFloat32() * xScale);
             }
