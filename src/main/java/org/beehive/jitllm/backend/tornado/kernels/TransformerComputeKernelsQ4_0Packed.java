@@ -83,24 +83,19 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 int x = xQuants.get((block << 3) + quad);
                 float xScale = xScales.get(block);
                 int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
-                // The two column halves unrolled, so that every accumulator index is a constant
-                // (a variable index into the private array loses the odd rows' sums here).
-                int sc = scales;
-                int w0 = q4Word(g0);
-                int w1 = q4Word(g1);
-                int even = (w0 & 0xFFFF) | (w1 << 16);
-                // Built from shifts and a low mask only: here an int >> may compile as a logical
-                // shift, and an & with 0xFFFF0000 loses the sign bit; these forms give the same bits
-                // either way.
-                int odd = ((w0 >> 16) & 0xFFFF) | ((w1 >> 16) << 16);
-                acc[0] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(sc).getFloat32() * xScale);
-                acc[1] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(sc + 2).getFloat32() * xScale);
-                w0 = q4Word(g0 >> 16);
-                w1 = q4Word(g1 >> 16);
-                even = (w0 & 0xFFFF) | (w1 << 16);
-                odd = ((w0 >> 16) & 0xFFFF) | ((w1 >> 16) << 16);
-                acc[2] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(sc + 128).getFloat32() * xScale);
-                acc[3] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(sc + 130).getFloat32() * xScale);
+                // Each row's four nibbles gathered while they are a small 16-bit group, then expanded:
+                // no step masks or shifts a word with its top bit set (TornadoVM miscompiles such
+                // masks here). Group g holds (c, k), (c, k + 1), (c + 1, k), (c + 1, k + 1).
+                int g0h = g0 >> 16;
+                int g1h = g1 >> 16;
+                int even = q4Word((g0 & 0xFF) | ((g1 & 0xFF) << 8));
+                int odd = q4Word(((g0 >> 8) & 0xFF) | (((g1 >> 8) & 0xFF) << 8));
+                acc[0] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(scales).getFloat32() * xScale);
+                acc[1] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(scales + 2).getFloat32() * xScale);
+                even = q4Word((g0h & 0xFF) | ((g1h & 0xFF) << 8));
+                odd = q4Word(((g0h >> 8) & 0xFF) | (((g1h >> 8) & 0xFF) << 8));
+                acc[2] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(scales + 128).getFloat32() * xScale);
+                acc[3] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(scales + 130).getFloat32() * xScale);
             }
         }
     }
@@ -134,19 +129,21 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 float x2 = x.get(k + 2);
                 float x3 = x.get(k + 3);
                 int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
-                // The two column halves unrolled, every accumulator index a constant (as above).
-                int w0 = q4Word(g0);
-                int w1 = q4Word(g1);
+                // Rows gathered as nibble groups before expansion, as above.
+                int g0h = g0 >> 16;
+                int g1h = g1 >> 16;
+                int even = q4Word((g0 & 0xFF) | ((g1 & 0xFF) << 8));
+                int odd = q4Word(((g0 >> 8) & 0xFF) | (((g1 >> 8) & 0xFF) << 8));
                 acc[0] += w.getHalfFloat(scales).getFloat32()
-                        * (signedByte(w0, 0) * x0 + signedByte(w0, 1) * x1 + signedByte(w1, 0) * x2 + signedByte(w1, 1) * x3);
+                        * (signedByte(even, 0) * x0 + signedByte(even, 1) * x1 + signedByte(even, 2) * x2 + signedByte(even, 3) * x3);
                 acc[1] += w.getHalfFloat(scales + 2).getFloat32()
-                        * (signedByte(w0, 2) * x0 + signedByte(w0, 3) * x1 + signedByte(w1, 2) * x2 + signedByte(w1, 3) * x3);
-                w0 = q4Word(g0 >> 16);
-                w1 = q4Word(g1 >> 16);
+                        * (signedByte(odd, 0) * x0 + signedByte(odd, 1) * x1 + signedByte(odd, 2) * x2 + signedByte(odd, 3) * x3);
+                even = q4Word((g0h & 0xFF) | ((g1h & 0xFF) << 8));
+                odd = q4Word(((g0h >> 8) & 0xFF) | (((g1h >> 8) & 0xFF) << 8));
                 acc[2] += w.getHalfFloat(scales + 128).getFloat32()
-                        * (signedByte(w0, 0) * x0 + signedByte(w0, 1) * x1 + signedByte(w1, 0) * x2 + signedByte(w1, 1) * x3);
+                        * (signedByte(even, 0) * x0 + signedByte(even, 1) * x1 + signedByte(even, 2) * x2 + signedByte(even, 3) * x3);
                 acc[3] += w.getHalfFloat(scales + 130).getFloat32()
-                        * (signedByte(w0, 2) * x0 + signedByte(w0, 3) * x1 + signedByte(w1, 2) * x2 + signedByte(w1, 3) * x3);
+                        * (signedByte(odd, 0) * x0 + signedByte(odd, 1) * x1 + signedByte(odd, 2) * x2 + signedByte(odd, 3) * x3);
             }
         }
     }
