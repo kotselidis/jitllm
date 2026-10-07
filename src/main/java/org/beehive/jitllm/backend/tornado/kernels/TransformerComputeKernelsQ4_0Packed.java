@@ -68,15 +68,22 @@ public final class TransformerComputeKernelsQ4_0Packed {
             int tile = tileBase + round * TILE_BYTES;
             long n0 = w.getLong(tile + laneBytes);
             long n1 = w.getLong(tile + laneBytes + 8);
+            // Block 0's two nibble groups are the low 32 bits, block 1's the high: a 64-bit value is
+            // only ever shifted by the constant 32 (a variable 64-bit shift miscompiles here).
+            int lo0 = (int) n0;
+            int hi0 = (int) (n0 >>> 32);
+            int lo1 = (int) n1;
+            int hi1 = (int) (n1 >>> 32);
             for (int b = 0; b < 2; b++) {
+                int g0 = b == 0 ? lo0 : hi0;
+                int g1 = b == 0 ? lo1 : hi1;
                 int block = (round << 1) + b;
                 int x = xQuants.get((block << 3) + quad);
                 float xScale = xScales.get(block);
                 int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
                 for (int h = 0; h < 2; h++) {
-                    int s = ((b << 1) + h) << 4;
-                    int w0 = q4Word((int) (n0 >>> s));
-                    int w1 = q4Word((int) (n1 >>> s));
+                    int w0 = q4Word(g0 >>> (h << 4));
+                    int w1 = q4Word(g1 >>> (h << 4));
                     int even = (w0 & 0xFFFF) | (w1 << 16);
                     int odd = (w0 >>> 16) | (w1 & 0xFFFF0000);
                     int sc = scales + (h << 7);
@@ -101,7 +108,15 @@ public final class TransformerComputeKernelsQ4_0Packed {
             int tile = tileBase + round * TILE_BYTES;
             long n0 = w.getLong(tile + laneBytes);
             long n1 = w.getLong(tile + laneBytes + 8);
+            // Block 0's two nibble groups are the low 32 bits, block 1's the high: a 64-bit value is
+            // only ever shifted by the constant 32 (a variable 64-bit shift miscompiles here).
+            int lo0 = (int) n0;
+            int hi0 = (int) (n0 >>> 32);
+            int lo1 = (int) n1;
+            int hi1 = (int) (n1 >>> 32);
             for (int b = 0; b < 2; b++) {
+                int g0 = b == 0 ? lo0 : hi0;
+                int g1 = b == 0 ? lo1 : hi1;
                 int k = (((round << 1) + b) << 5) + (quad << 2);
                 float x0 = x.get(k);
                 float x1 = x.get(k + 1);
@@ -109,9 +124,8 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 float x3 = x.get(k + 3);
                 int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
                 for (int h = 0; h < 2; h++) {
-                    int s = ((b << 1) + h) << 4;
-                    int w0 = q4Word((int) (n0 >>> s));
-                    int w1 = q4Word((int) (n1 >>> s));
+                    int w0 = q4Word(g0 >>> (h << 4));
+                    int w1 = q4Word(g1 >>> (h << 4));
                     float even = signedByte(w0, 0) * x0 + signedByte(w0, 1) * x1 + signedByte(w1, 0) * x2 + signedByte(w1, 1) * x3;
                     float odd = signedByte(w0, 2) * x0 + signedByte(w0, 3) * x1 + signedByte(w1, 2) * x2 + signedByte(w1, 3) * x3;
                     int sc = scales + (h << 7);
