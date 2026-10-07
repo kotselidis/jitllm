@@ -38,13 +38,14 @@ public final class NativeLibrarySupport {
                 c.architecture().equals("gemma4")
                         && (c.weights() == DataType.Q8_0 || c.weights() == DataType.Q4_0);
         boolean llamaQ4 = c.architecture().equals("llama") && c.weights() == DataType.Q4_0;
-        if (!qwen3 && !gemma4 && !llamaQ4) {
+        boolean qwen35Q8 = c.architecture().equals("qwen35") && c.weights() == DataType.Q8_0;
+        if (!qwen3 && !gemma4 && !llamaQ4 && !qwen35Q8) {
             return Optional.of(
                     "no native-library path is implemented for "
                             + c.architecture()
                             + " / "
                             + c.weights()
-                            + " yet (Qwen3 F16, Gemma 4 Q8_0/Q4_0 and Llama Q4_0 only)");
+                            + " yet (Qwen3 F16, Gemma 4 Q8_0/Q4_0, Llama Q4_0 and qwen35 Q8_0 only)");
         }
         if (c.mode() != ExecutionMode.BATCH_PREFILL_DECODE) {
             return Optional.of(

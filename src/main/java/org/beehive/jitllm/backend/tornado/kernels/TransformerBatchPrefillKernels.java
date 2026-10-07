@@ -2774,6 +2774,50 @@ public final class TransformerBatchPrefillKernels {
         }
     }
 
+    /**
+     * {@code out[b][row] (+)= w[row] · x[b]} over Q8_0 weights, one warp per (batch row, output
+     * row). The warp walks the row's blocks together, lane {@code l} taking element {@code l} of
+     * each, so every load of the activation and of the quants is one coalesced 128- or 32-byte
+     * line, and the block's FP16 scale is a broadcast. For the projections too narrow for the int8
+     * GEMM's 128-column tiles.
+     *
+     * <p>Worker: {@code activeRows * d * 32} lanes, local 128 (four outputs per block).
+     */
+    public static void batchedMatVecQ8_0Warp(
+            KernelContext context,
+            FloatArray inputBatch,
+            FloatArray outputBatch,
+            ByteArray w,
+            int n,
+            int d,
+            int activeRows,
+            int accumulate) {
+        int lane = context.localIdx & 31;
+        int output = (context.groupIdx << 2) + (context.localIdx >> 5);
+        int batchIdx = output / d;
+        int rowIdx = output - batchIdx * d;
+        if (batchIdx < activeRows) {
+            int inputOff = batchIdx * n + lane;
+            int blocks = n >> 5;
+            int rowOff = rowIdx * blocks * 34;
+            float partial = 0.0f;
+            for (int b = 0; b < blocks; b++) {
+                int blockOff = rowOff + b * 34;
+                float scale = w.getHalfFloat(blockOff).getFloat32();
+                partial += scale * w.get(blockOff + 2 + lane) * inputBatch.get(inputOff + (b << 5));
+            }
+            partial += context.simdShuffleDown(partial, 16);
+            partial += context.simdShuffleDown(partial, 8);
+            partial += context.simdShuffleDown(partial, 4);
+            partial += context.simdShuffleDown(partial, 2);
+            partial += context.simdShuffleDown(partial, 1);
+            if (lane == 0) {
+                int out = batchIdx * d + rowIdx;
+                outputBatch.set(out, accumulate != 0 ? outputBatch.get(out) + partial : partial);
+            }
+        }
+    }
+
     /** Rows and outputs of one warp's tile in {@link #batchedMatVecF32WarpTile}. */
     public static final int MATVEC_TILE = 4;
 

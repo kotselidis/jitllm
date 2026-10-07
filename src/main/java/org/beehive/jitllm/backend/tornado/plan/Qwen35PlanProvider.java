@@ -41,7 +41,8 @@ public final class Qwen35PlanProvider implements TornadoPlanProvider {
 
     @Override
     public Set<DataType> supportedDataTypes() {
-        return Set.of(DataType.Q4_0);
+        // Q8_0: the decode layers read it directly, and the batched prefill decodes it for cuBLAS.
+        return Set.of(DataType.Q4_0, DataType.Q8_0);
     }
 
     @Override
