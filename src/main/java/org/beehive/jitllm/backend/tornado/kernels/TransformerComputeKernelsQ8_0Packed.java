@@ -40,12 +40,6 @@ public final class TransformerComputeKernelsQ8_0Packed {
 
     private TransformerComputeKernelsQ8_0Packed() {}
 
-    /** A 32-bit little-endian word of {@code w} at a 4-byte-aligned byte offset. */
-    private static int word(ByteArray w, int offset) {
-        return (w.getHalfFloat(offset).getHalfFloatValue() & 0xFFFF)
-                | ((w.getHalfFloat(offset + 2).getHalfFloatValue() & 0xFFFF) << 16);
-    }
-
     /** Signed byte {@code i} of {@code v}. */
     private static int signedByte(int v, int i) {
         return (v << (24 - (i << 3))) >> 24;
@@ -70,9 +64,10 @@ public final class TransformerComputeKernelsQ8_0Packed {
             int tile = tileBase + round * TILE_BYTES;
             for (int b = 0; b < 2; b++) {
                 int block = round * 2 + b;
-                int offset = tile + (((b << 10) + wordInBlock) << 2);
-                int w0 = word(w, offset);
-                int w1 = word(w, offset + 4);
+                // The lane's two words are adjacent and 8-byte aligned: one 64-bit load.
+                long pair = w.getLong(tile + (((b << 10) + wordInBlock) << 2));
+                int w0 = (int) pair;
+                int w1 = (int) (pair >>> 32);
                 int xw = xQuants.get((block << 3) + (kRow >> 1));
                 int x0 = signedByte(xw, shift);
                 int x1 = signedByte(xw, shift + 1);
@@ -104,9 +99,10 @@ public final class TransformerComputeKernelsQ8_0Packed {
             int tile = tileBase + round * TILE_BYTES;
             for (int b = 0; b < 2; b++) {
                 int block = round * 2 + b;
-                int offset = tile + (((b << 10) + wordInBlock) << 2);
-                int w0 = word(w, offset);
-                int w1 = word(w, offset + 4);
+                // The lane's two words are adjacent and 8-byte aligned: one 64-bit load.
+                long pair = w.getLong(tile + (((b << 10) + wordInBlock) << 2));
+                int w0 = (int) pair;
+                int w1 = (int) (pair >>> 32);
                 int k = (block << 5) + kInBlock;
                 float x0 = x.get(k);
                 float x1 = x.get(k + 1);
