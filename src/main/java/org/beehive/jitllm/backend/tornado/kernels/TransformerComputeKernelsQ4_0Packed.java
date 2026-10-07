@@ -45,10 +45,12 @@ public final class TransformerComputeKernelsQ4_0Packed {
         return ((x | 0x80808080) - 0x08080808) ^ 0x80808080;
     }
 
-    /** Signed byte {@code i} of {@code v}, without relying on an arithmetic shift (see accumulate). */
-    private static int signedByte(int v, int i) {
-        int b = (v >> (i << 3)) & 0xFF;
-        return b - ((b & 0x80) << 1);
+    /** The four weights of a 16-bit nibble group, each its nibble minus eight, against four activations. */
+    private static float nibbleDot(int group, float x0, float x1, float x2, float x3) {
+        return ((group & 0xF) - 8) * x0
+                + (((group >> 4) & 0xF) - 8) * x1
+                + (((group >> 8) & 0xF) - 8) * x2
+                + (((group >> 12) & 0xF) - 8) * x3;
     }
 
     /**
@@ -129,21 +131,18 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 float x2 = x.get(k + 2);
                 float x3 = x.get(k + 3);
                 int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
-                // Rows gathered as nibble groups before expansion, as above.
+                // Rows gathered as nibble groups, as above, and each weight read as its nibble minus
+                // eight: no byte is sign-extended (the shifts that would do it miscompile here).
                 int g0h = g0 >> 16;
                 int g1h = g1 >> 16;
-                int even = q4Word((g0 & 0xFF) | ((g1 & 0xFF) << 8));
-                int odd = q4Word(((g0 >> 8) & 0xFF) | (((g1 >> 8) & 0xFF) << 8));
-                acc[0] += w.getHalfFloat(scales).getFloat32()
-                        * (signedByte(even, 0) * x0 + signedByte(even, 1) * x1 + signedByte(even, 2) * x2 + signedByte(even, 3) * x3);
-                acc[1] += w.getHalfFloat(scales + 2).getFloat32()
-                        * (signedByte(odd, 0) * x0 + signedByte(odd, 1) * x1 + signedByte(odd, 2) * x2 + signedByte(odd, 3) * x3);
-                even = q4Word((g0h & 0xFF) | ((g1h & 0xFF) << 8));
-                odd = q4Word(((g0h >> 8) & 0xFF) | (((g1h >> 8) & 0xFF) << 8));
-                acc[2] += w.getHalfFloat(scales + 128).getFloat32()
-                        * (signedByte(even, 0) * x0 + signedByte(even, 1) * x1 + signedByte(even, 2) * x2 + signedByte(even, 3) * x3);
-                acc[3] += w.getHalfFloat(scales + 130).getFloat32()
-                        * (signedByte(odd, 0) * x0 + signedByte(odd, 1) * x1 + signedByte(odd, 2) * x2 + signedByte(odd, 3) * x3);
+                int even = (g0 & 0xFF) | ((g1 & 0xFF) << 8);
+                int odd = ((g0 >> 8) & 0xFF) | (((g1 >> 8) & 0xFF) << 8);
+                acc[0] += w.getHalfFloat(scales).getFloat32() * nibbleDot(even, x0, x1, x2, x3);
+                acc[1] += w.getHalfFloat(scales + 2).getFloat32() * nibbleDot(odd, x0, x1, x2, x3);
+                even = (g0h & 0xFF) | ((g1h & 0xFF) << 8);
+                odd = ((g0h >> 8) & 0xFF) | (((g1h >> 8) & 0xFF) << 8);
+                acc[2] += w.getHalfFloat(scales + 128).getFloat32() * nibbleDot(even, x0, x1, x2, x3);
+                acc[3] += w.getHalfFloat(scales + 130).getFloat32() * nibbleDot(odd, x0, x1, x2, x3);
             }
         }
     }
