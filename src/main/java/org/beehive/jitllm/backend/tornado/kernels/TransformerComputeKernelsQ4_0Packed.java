@@ -98,6 +98,31 @@ public final class TransformerComputeKernelsQ4_0Packed {
         }
     }
 
+    /**
+     * {@link #accumulate} over two weights of the same shape at once (gate and up): each step loads
+     * both weights' words of a round before using either.
+     */
+    private static void accumulatePair(
+            ByteArray w1, ByteArray w3, IntArray xQuants, FloatArray xScales, int n, int wg, int lane, int firstRound, int warps, float[] gate, float[] up) {
+        int rounds = n >> 6;
+        int colTile = wg >> 3;
+        int group = wg & 7;
+        int pair = lane >> 3;
+        int quad = lane & 7;
+        int column = (group << 3) + (pair << 1);
+        int laneBytes = (group << 9) + (lane << 4);
+        int tileBase = colTile * rounds * TILE_BYTES;
+        for (int round = firstRound; round < rounds; round += warps) {
+            int tile = tileBase + round * TILE_BYTES;
+            long g0 = w1.getLong(tile + laneBytes);
+            long g1 = w1.getLong(tile + laneBytes + 8);
+            long u0 = w3.getLong(tile + laneBytes);
+            long u1 = w3.getLong(tile + laneBytes + 8);
+            roundDot(w1, xQuants, xScales, tile, round, g0, g1, quad, column, gate);
+            roundDot(w3, xQuants, xScales, tile, round, u0, u1, quad, column, up);
+        }
+    }
+
     /** One round's products of this lane: its two loaded nibble words {@code n0}, {@code n1}. */
     private static void roundDot(
             ByteArray w, IntArray xQuants, FloatArray xScales, int tile, int round, long n0, long n1, int quad, int column, float[] acc) {
@@ -304,8 +329,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 up[i] = 0.0f;
             }
             int firstRound = context.localIdx >> 5;
-            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, gate);
-            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, up);
+            accumulatePair(w1, w3, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, gate, up);
             float g0 = reduceOctet(context, gate[0]);
             float g1 = reduceOctet(context, gate[1]);
             float g2 = reduceOctet(context, gate[2]);
@@ -361,8 +385,7 @@ public final class TransformerComputeKernelsQ4_0Packed {
                 up[i] = 0.0f;
             }
             int firstRound = context.localIdx >> 5;
-            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, gate);
-            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, up);
+            accumulatePair(w1, w3, xQuants, xScales, n, wg, lane, firstRound, context.localGroupSizeX >> 5, gate, up);
             float g0 = reduceOctet(context, gate[0]);
             float g1 = reduceOctet(context, gate[1]);
             float g2 = reduceOctet(context, gate[2]);
