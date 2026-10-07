@@ -74,6 +74,7 @@ public class TornadoVMMasterPlanSingleToken implements TornadoVMMasterPlan {
         executionPlan.withPreCompilation();
         long warmupTime = System.nanoTime();
 
+        org.beehive.jitllm.backend.tornado.plan.PackedRepack.run(executionPlan, packedRepack);
         forceCopyInReadOnlyData();
         long copyTime = System.nanoTime();
 
@@ -112,9 +113,15 @@ public class TornadoVMMasterPlanSingleToken implements TornadoVMMasterPlan {
         DataType weightType = model.weights().dataType();
         this.tornadoVMForwardPlan = ForwardPlanFactory.createSingleToken(weightType, state, model);
         this.taskGraphLayout = tornadoVMForwardPlan.getTaskGraphLayout();
-        var taskGraphs = tornadoVMForwardPlan.getImmutableTaskGraphs();
+        var taskGraphs = new java.util.ArrayList<>(tornadoVMForwardPlan.getImmutableTaskGraphs());
+        packedRepack =
+                state.workspace.packedRepack.appendGraphs(
+                        taskGraphs, tornadoVMForwardPlan.getGridScheduler());
         return new TornadoExecutionPlan(taskGraphs.toArray(new ImmutableTaskGraph[0]));
     }
+
+    /** The graphs that repack the packed weights on the GPU before the warm-up, or null. */
+    private org.beehive.jitllm.backend.tornado.plan.PackedRepack.Graphs packedRepack;
 
     // @formatter:off
     @Override

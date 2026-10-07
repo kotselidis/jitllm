@@ -257,7 +257,9 @@ public final class TornadoBatchExecutor implements BatchExecutor, AutoCloseable 
         all.add(logits.snapshot());
         this.layerCount = layerGraphs.size();
         this.logitsGraphIndex = 1 + layerCount;
+        var packedRepack = state.workspace.packedRepack.appendGraphs(all, schedule);
         this.plan = new TornadoExecutionPlan(all.toArray(new ImmutableTaskGraph[0]));
+        org.beehive.jitllm.backend.tornado.plan.PackedRepack.run(plan, packedRepack);
         var roles = new java.util.HashMap<Integer, String>();
         roles.put(0, "batch activation");
         org.beehive.jitllm.backend.tornado.TaskGraphChainPrinter.label(
