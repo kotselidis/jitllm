@@ -70,4 +70,44 @@ public class PackedRepackAccelTest {
             assertArrayEquals(shape[0] + "x" + shape[1], expected, repackOnDevice(raw, shape[0], shape[1], true));
         }
     }
+
+    /**
+     * The loader's arrangement: graph "owner" uploads the weight once and keeps it on the device; a
+     * second graph of the same plan takes it with consumeFromDevice and repacks it in place; the
+     * owner's next run reads the packed bytes without uploading again.
+     */
+    @Test
+    public void aConsumingGraphRepacksTheOwnersBuffer() throws Exception {
+        int n = 384, k = 640;
+        byte[] raw = new byte[n * (k / 32) * 18];
+        new Random(7).nextBytes(raw);
+        byte[] expected = Qwen35Int8Kernels.packQ4_0TileBytes(ByteArray.fromArray(raw), n, k);
+        ByteArray w = ByteArray.fromArray(raw);
+        ByteArray seen = new ByteArray(raw.length);
+        ByteArray scratch = new ByteArray(raw.length);
+        TaskGraph owner = new TaskGraph("owner")
+                .transferToDevice(DataTransferMode.FIRST_EXECUTION, w)
+                .task("c", PackedRepackKernels::copy, new KernelContext(), w, seen, raw.length)
+                .persistOnDevice(w)
+                .transferToHost(DataTransferMode.EVERY_EXECUTION, seen);
+        TaskGraph repack = new TaskGraph("repack")
+                .consumeFromDevice("owner", w)
+                .transferToDevice(DataTransferMode.FIRST_EXECUTION, scratch)
+                .task("c", PackedRepackKernels::copy, new KernelContext(), w, scratch, raw.length)
+                .task("r", PackedRepackKernels::repackQ4_0, new KernelContext(), scratch, w, n, k)
+                .persistOnDevice(w);
+        GridScheduler s = new GridScheduler();
+        s.addWorkerGrid("owner.c", grid((raw.length + 7) / 8));
+        s.addWorkerGrid("repack.c", grid((raw.length + 7) / 8));
+        s.addWorkerGrid("repack.r", grid((n / 128) * (k / 64) * PackedRepackKernels.Q4_0_LANES_PER_TILE));
+        try (TornadoExecutionPlan plan = new TornadoExecutionPlan(owner.snapshot(), repack.snapshot())) {
+            plan.withGridScheduler(s);
+            plan.withGraph(0).execute();
+            assertArrayEquals("before", raw, seen.toHeapArray());
+            plan.withGraph(1).execute();
+            plan.withGraph(0).execute();
+            assertArrayEquals("after", expected, seen.toHeapArray());
+            assertArrayEquals("host keeps the GGUF bytes", raw, w.toHeapArray());
+        }
+    }
 }
