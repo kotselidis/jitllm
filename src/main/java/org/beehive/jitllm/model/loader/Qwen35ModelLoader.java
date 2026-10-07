@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.function.IntFunction;
 import org.beehive.jitllm.auxiliary.Pair;
 import org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0;
+import org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0Cache;
 import org.beehive.jitllm.backend.tornado.tensor.Q8_0TornadoTensor;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensorLoader;
@@ -511,16 +512,20 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         TornadoTensor[] ssmNorm = new TornadoTensor[trunk];
         TornadoTensor[] ssmOut = new TornadoTensor[trunk];
 
+        PackedQ8_0Cache packedCache =
+                PackedQ8_0.ENABLED
+                        ? PackedQ8_0Cache.open(fileChannel, gguf.getTensorDataOffset())
+                        : null;
         for (int l = 0; l < blocks; l++) {
             String blk = "blk." + l + ".";
             if (!config.isMixtureOfExperts()) {
-                ffnGate[l] = projectionTensor(tensorEntries, blk + "ffn_gate.weight");
-                ffnDown[l] = projectionTensor(tensorEntries, blk + "ffn_down.weight");
-                ffnUp[l] = projectionTensor(tensorEntries, blk + "ffn_up.weight");
+                ffnGate[l] = projectionTensor(tensorEntries, blk + "ffn_gate.weight", packedCache);
+                ffnDown[l] = projectionTensor(tensorEntries, blk + "ffn_down.weight", packedCache);
+                ffnUp[l] = projectionTensor(tensorEntries, blk + "ffn_up.weight", packedCache);
             }
             if (config.isRecurrentLayer(l)) {
-                ssmQkv[l] = projectionTensor(tensorEntries, blk + "attn_qkv.weight");
-                ssmGate[l] = projectionTensor(tensorEntries, blk + "attn_gate.weight");
+                ssmQkv[l] = projectionTensor(tensorEntries, blk + "attn_qkv.weight", packedCache);
+                ssmGate[l] = projectionTensor(tensorEntries, blk + "attn_gate.weight", packedCache);
                 // The SSM parameters are F32 in every file that carries them, and are read by
                 // dtype-independent kernels; retention does not apply to them.
                 ssmConv1d[l] = deviceTensor(tensorEntries, blk + "ssm_conv1d.weight");
@@ -529,15 +534,19 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
                 ssmDtBias[l] = deviceTensor(tensorEntries, blk + "ssm_dt.bias");
                 ssmA[l] = deviceTensor(tensorEntries, blk + "ssm_a");
                 ssmNorm[l] = deviceTensor(tensorEntries, blk + "ssm_norm.weight");
-                ssmOut[l] = projectionTensor(tensorEntries, blk + "ssm_out.weight");
+                ssmOut[l] = projectionTensor(tensorEntries, blk + "ssm_out.weight", packedCache);
             } else {
-                wq[l] = projectionTensor(tensorEntries, blk + "attn_q.weight");
-                wk[l] = projectionTensor(tensorEntries, blk + "attn_k.weight");
-                wv[l] = projectionTensor(tensorEntries, blk + "attn_v.weight");
-                wo[l] = projectionTensor(tensorEntries, blk + "attn_output.weight");
+                wq[l] = projectionTensor(tensorEntries, blk + "attn_q.weight", packedCache);
+                wk[l] = projectionTensor(tensorEntries, blk + "attn_k.weight", packedCache);
+                wv[l] = projectionTensor(tensorEntries, blk + "attn_v.weight", packedCache);
+                wo[l] = projectionTensor(tensorEntries, blk + "attn_output.weight", packedCache);
                 attnQNorm[l] = deviceTensor(tensorEntries, blk + "attn_q_norm.weight");
                 attnKNorm[l] = deviceTensor(tensorEntries, blk + "attn_k_norm.weight");
             }
+        }
+
+        if (packedCache != null) {
+            packedCache.finish();
         }
 
         DataType weightType = projectionType(tensorEntries, config);
@@ -619,15 +628,16 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
     }
 
     /**
-     * A trunk projection: {@link #deviceTensor}, packed for the tile-layout kernels when {@code
-     * -Djitllm.q8.packed=true} and it is a Q8_0 weight whose shape packs (see {@link
-     * PackedQ8_0}).
+     * A trunk projection: {@link #deviceTensor}, packed for the tile-layout kernels (through the
+     * on-disk cache) when {@code -Djitllm.q8.packed=true} and it is a Q8_0 weight whose shape
+     * packs (see {@link PackedQ8_0}).
      */
-    private static TornadoTensor projectionTensor(Map<String, GGMLTensorEntry> entries, String name) {
+    private static TornadoTensor projectionTensor(
+            Map<String, GGMLTensorEntry> entries, String name, PackedQ8_0Cache packedCache) {
         TornadoTensor tensor = deviceTensor(entries, name);
         GGMLTensorEntry entry = entries.get(name);
         int[] shape = entry.shape();
-        if (!PackedQ8_0.ENABLED || entry.ggmlType() != GGMLType.Q8_0 || shape.length != 2) {
+        if (packedCache == null || entry.ggmlType() != GGMLType.Q8_0 || shape.length != 2) {
             return tensor;
         }
         int cols = shape[0];
@@ -635,7 +645,7 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         if (!PackedQ8_0.eligible(rows, cols)) {
             return tensor;
         }
-        return new Q8_0TornadoTensor(PackedQ8_0.pack(tensor.asByteArray(), rows, cols));
+        return new Q8_0TornadoTensor(packedCache.tensor(name, tensor.asByteArray(), rows, cols));
     }
 
     private static TornadoTensor[] perBlockDevice(int blocks, IntFunction<GGMLTensorEntry> entry) {

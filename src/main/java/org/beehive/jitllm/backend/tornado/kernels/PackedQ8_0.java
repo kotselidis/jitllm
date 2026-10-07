@@ -14,7 +14,8 @@ import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
  * packed bytes are the same size as the blocks, so the model is held once.
  *
  * <p>Off by default; {@code -Djitllm.q8.packed=true} packs every qwen35 projection whose rows
- * divide by 128 and whose inputs divide by 64. A packed weight is recorded here by identity, and
+ * divide by 128 and whose inputs divide by 64, once per model: the packed weights are cached on
+ * disk and memory-mapped on later loads ({@link PackedQ8_0Cache}). A packed weight is recorded here by identity, and
  * every kernel choice consults this record: a kernel that reads Q8_0 blocks must never be handed
  * packed bytes, so the paths without a packed kernel refuse one by name.
  */
@@ -34,9 +35,8 @@ public final class PackedQ8_0 {
         return rows % Qwen35Int8Kernels.I8_BN == 0 && cols % Qwen35Int8Kernels.I8_BK == 0;
     }
 
-    /** The packed copy of a {@code rows x cols} Q8_0 weight, recorded as packed. */
-    public static ByteArray pack(ByteArray q8_0, int rows, int cols) {
-        ByteArray packed = Qwen35Int8Kernels.packQ8_0Tiles(q8_0, rows, cols);
+    /** Records {@code packed} as holding packed tiles, and returns it. */
+    static ByteArray record(ByteArray packed) {
         PACKED.add(packed);
         return packed;
     }

@@ -961,6 +961,11 @@ public final class Qwen35Int8Kernels {
      */
     // @formatter:on
     public static ByteArray packQ8_0Tiles(ByteArray w, int n, int k) {
+        return ByteArray.fromArray(packQ8_0TileBytes(w, n, k));
+    }
+
+    /** The bytes of {@link #packQ8_0Tiles}, on the heap. */
+    public static byte[] packQ8_0TileBytes(ByteArray w, int n, int k) {
         int kBlocks = k / Q8_BLOCK;
         int rowBytes = kBlocks * Q8_0_BLOCK_BYTES;
         int rounds = k / I8_BK;
@@ -993,7 +998,7 @@ public final class Qwen35Int8Kernels {
                 }
             }
         }
-        return ByteArray.fromArray(out);
+        return out;
     }
 
     // @formatter:off
