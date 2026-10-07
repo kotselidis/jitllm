@@ -26,6 +26,13 @@ public class PackedQ8_0CacheTest {
         return ByteArray.fromArray(raw);
     }
 
+    private static ByteArray randomQ4_0(int rows, int cols, long seed) {
+        Random rng = new Random(seed);
+        byte[] raw = new byte[rows * (cols / 32) * 18];
+        rng.nextBytes(raw);
+        return ByteArray.fromArray(raw);
+    }
+
     private static Path model(Path dir) throws Exception {
         Path model = dir.resolve("model.gguf");
         byte[] bytes = new byte[3 << 20];
@@ -49,10 +56,15 @@ public class PackedQ8_0CacheTest {
         ByteArray b = randomQ8_0(128, 192, 2);
         byte[] packedA = Qwen35Int8Kernels.packQ8_0TileBytes(a, 256, 128);
         byte[] packedB = Qwen35Int8Kernels.packQ8_0TileBytes(b, 128, 192);
+        ByteArray c = randomQ4_0(256, 192, 3);
+        byte[] packedC = Qwen35Int8Kernels.packQ4_0TileBytes(c, 256, 192);
         try (FileChannel channel = FileChannel.open(model, StandardOpenOption.READ)) {
             PackedQ8_0Cache miss = PackedQ8_0Cache.open(channel, 4096);
-            ByteArray mappedA = miss.tensor("a", a, 256, 128);
-            ByteArray mappedB = miss.tensor("b", b, 128, 192);
+            ByteArray mappedA = miss.tensor("a", a, 256, 128, PackedQ8_0Cache.FORMAT_Q8_0);
+            ByteArray mappedB = miss.tensor("b", b, 128, 192, PackedQ8_0Cache.FORMAT_Q8_0);
+            ByteArray mappedC = miss.tensor("c", c, 256, 192, PackedQ8_0Cache.FORMAT_Q4_0);
+            assertArrayEquals(packedC, mappedC.toHeapArray());
+            assertTrue(PackedQ8_0.isPackedQ4(mappedC));
             assertArrayEquals(packedA, mappedA.toHeapArray());
             assertArrayEquals(packedB, mappedB.toHeapArray());
             assertTrue(PackedQ8_0.isPacked(mappedA));
@@ -62,8 +74,10 @@ public class PackedQ8_0CacheTest {
         try (FileChannel channel = FileChannel.open(model, StandardOpenOption.READ)) {
             PackedQ8_0Cache hit = PackedQ8_0Cache.open(channel, 4096);
             // The hit never reads the Q8_0 bytes it is handed: zeros in place of them change nothing.
-            ByteArray mappedB = hit.tensor("b", new ByteArray(b.getSize()), 128, 192);
-            ByteArray mappedA = hit.tensor("a", new ByteArray(a.getSize()), 256, 128);
+            ByteArray mappedB = hit.tensor("b", new ByteArray(b.getSize()), 128, 192, PackedQ8_0Cache.FORMAT_Q8_0);
+            ByteArray mappedA = hit.tensor("a", new ByteArray(a.getSize()), 256, 128, PackedQ8_0Cache.FORMAT_Q8_0);
+            ByteArray mappedC = hit.tensor("c", new ByteArray(c.getSize()), 256, 192, PackedQ8_0Cache.FORMAT_Q4_0);
+            assertArrayEquals(packedC, mappedC.toHeapArray());
             assertArrayEquals(packedA, mappedA.toHeapArray());
             assertArrayEquals(packedB, mappedB.toHeapArray());
             assertTrue(PackedQ8_0.isPacked(mappedB));
@@ -78,7 +92,7 @@ public class PackedQ8_0CacheTest {
         ByteArray a = randomQ8_0(128, 64, 3);
         try (FileChannel channel = FileChannel.open(model, StandardOpenOption.READ)) {
             PackedQ8_0Cache miss = PackedQ8_0Cache.open(channel, 4096);
-            miss.tensor("a", a, 128, 64);
+            miss.tensor("a", a, 128, 64, PackedQ8_0Cache.FORMAT_Q8_0);
             miss.finish();
         }
         Path cache;
@@ -91,13 +105,13 @@ public class PackedQ8_0CacheTest {
         }
         try (FileChannel channel = FileChannel.open(model, StandardOpenOption.READ)) {
             PackedQ8_0Cache again = PackedQ8_0Cache.open(channel, 4096);
-            ByteArray mapped = again.tensor("a", a, 128, 64);
+            ByteArray mapped = again.tensor("a", a, 128, 64, PackedQ8_0Cache.FORMAT_Q8_0);
             assertArrayEquals(Qwen35Int8Kernels.packQ8_0TileBytes(a, 128, 64), mapped.toHeapArray());
             again.finish();
         }
         try (FileChannel channel = FileChannel.open(model, StandardOpenOption.READ)) {
             PackedQ8_0Cache hit = PackedQ8_0Cache.open(channel, 4096);
-            assertArrayEquals(Qwen35Int8Kernels.packQ8_0TileBytes(a, 128, 64), hit.tensor("a", new ByteArray(a.getSize()), 128, 64).toHeapArray());
+            assertArrayEquals(Qwen35Int8Kernels.packQ8_0TileBytes(a, 128, 64), hit.tensor("a", new ByteArray(a.getSize()), 128, 64, PackedQ8_0Cache.FORMAT_Q8_0).toHeapArray());
         }
     }
 }

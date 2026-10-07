@@ -8,6 +8,7 @@ import java.util.function.IntFunction;
 import org.beehive.jitllm.auxiliary.Pair;
 import org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0;
 import org.beehive.jitllm.backend.tornado.kernels.PackedQ8_0Cache;
+import org.beehive.jitllm.backend.tornado.tensor.Q4_0TornadoTensor;
 import org.beehive.jitllm.backend.tornado.tensor.Q8_0TornadoTensor;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensorLoader;
@@ -513,7 +514,7 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         TornadoTensor[] ssmOut = new TornadoTensor[trunk];
 
         PackedQ8_0Cache packedCache =
-                PackedQ8_0.ENABLED
+                PackedQ8_0.ENABLED || PackedQ8_0.Q4_ENABLED
                         ? PackedQ8_0Cache.open(fileChannel, gguf.getTensorDataOffset())
                         : null;
         for (int l = 0; l < blocks; l++) {
@@ -637,7 +638,9 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         TornadoTensor tensor = deviceTensor(entries, name);
         GGMLTensorEntry entry = entries.get(name);
         int[] shape = entry.shape();
-        if (packedCache == null || entry.ggmlType() != GGMLType.Q8_0 || shape.length != 2) {
+        boolean q8 = PackedQ8_0.ENABLED && entry.ggmlType() == GGMLType.Q8_0;
+        boolean q4 = PackedQ8_0.Q4_ENABLED && entry.ggmlType() == GGMLType.Q4_0;
+        if (packedCache == null || !(q8 || q4) || shape.length != 2) {
             return tensor;
         }
         int cols = shape[0];
@@ -645,7 +648,12 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
         if (!PackedQ8_0.eligible(rows, cols)) {
             return tensor;
         }
-        return new Q8_0TornadoTensor(packedCache.tensor(name, tensor.asByteArray(), rows, cols));
+        if (q4) {
+            return new Q4_0TornadoTensor(
+                    packedCache.tensor(name, tensor.asByteArray(), rows, cols, PackedQ8_0Cache.FORMAT_Q4_0));
+        }
+        return new Q8_0TornadoTensor(
+                packedCache.tensor(name, tensor.asByteArray(), rows, cols, PackedQ8_0Cache.FORMAT_Q8_0));
     }
 
     private static TornadoTensor[] perBlockDevice(int blocks, IntFunction<GGMLTensorEntry> entry) {

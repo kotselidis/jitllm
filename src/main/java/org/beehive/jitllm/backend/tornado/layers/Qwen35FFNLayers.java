@@ -10,6 +10,7 @@ import org.beehive.jitllm.backend.tornado.kernels.Qwen3Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0Packed;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_1;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_K;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ5_K;
@@ -373,7 +374,38 @@ public class Qwen35FFNLayers
                 }
             }
             case Q4_0 -> {
-                if (residual && x == state.workspace.wrapHb && hiddenActivationQuantized) {
+                if (PackedQ8_0.isPackedQ4(w.asByteArray())) {
+                    // A packed weight: the quantized activation where the branch made one (the two
+                    // DP4A conditions below), otherwise the FP32 one.
+                    boolean quantized =
+                            (residual && x == state.workspace.wrapHb && hiddenActivationQuantized)
+                                    || (!residual && x == state.workspace.wrapXb && normedActivationQuantized);
+                    packedQ4Tasks().add(layer + "." + task);
+                    if (quantized) {
+                        graph.task(
+                                tn(task),
+                                TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0Packed,
+                                context,
+                                state.workspace.wrapXbQuants,
+                                state.workspace.wrapXbScales,
+                                out,
+                                w.asByteArray(),
+                                n,
+                                d,
+                                residual ? 1 : 0);
+                    } else {
+                        graph.task(
+                                tn(task),
+                                TransformerComputeKernelsQ4_0Packed::matrixVectorQ4_0PackedF32,
+                                context,
+                                x,
+                                out,
+                                w.asByteArray(),
+                                n,
+                                d,
+                                residual ? 1 : 0);
+                    }
+                } else if (residual && x == state.workspace.wrapHb && hiddenActivationQuantized) {
                     graph.task(
                             tn(task),
                             TransformerComputeKernelsQ4_0::matrixVectorGenericWithResidualQ4_0DP4A,
@@ -681,6 +713,26 @@ public class Qwen35FFNLayers
                     config.dim(),
                     config.hiddenDim(),
                     MATVEC_LOCAL);
+            return;
+        }
+        if (PackedQ8_0.isPackedQ4(gate.asByteArray()) || PackedQ8_0.isPackedQ4(up.asByteArray())) {
+            if (!packed
+                    || !PackedQ8_0.isPackedQ4(gate.asByteArray())
+                    || !PackedQ8_0.isPackedQ4(up.asByteArray())) {
+                throw PackedQ8_0.noPackedKernel("qwen35 layer " + layer + " fused gate/up");
+            }
+            packedQ4Tasks().add(layer + ".ffn_gate_up");
+            graph.task(
+                    tn("ffn_gate_up"),
+                    TransformerComputeKernelsQ4_0Packed::fusedFFNGateUpSiLUQ4_0Packed,
+                    context,
+                    qwen35State.workspace.wrapXbQuants,
+                    qwen35State.workspace.wrapXbScales,
+                    qwen35State.workspace.wrapHb,
+                    gate.asByteArray(),
+                    up.asByteArray(),
+                    config.dim(),
+                    config.hiddenDim());
             return;
         }
         if (packed) {
@@ -2179,8 +2231,23 @@ public class Qwen35FFNLayers
         return packedTasks;
     }
 
+    /** The decode tasks whose weight is packed Q4_0, with their workgroup-per-16-rows grid. */
+    private java.util.Set<String> packedQ4Tasks;
+
+    private java.util.Set<String> packedQ4Tasks() {
+        if (packedQ4Tasks == null) {
+            packedQ4Tasks = new java.util.HashSet<>();
+        }
+        return packedQ4Tasks;
+    }
+
     /** {@link #matVecWorker}, or a workgroup per eight rows where the task's weight is packed. */
     private WorkerGrid projWorker(int layer, String task, int rows) {
+        if (packedQ4Tasks().contains(layer + "." + task)) {
+            return WorkerGridFactory.genericWorker(
+                    rows / 16 * TransformerComputeKernelsQ4_0Packed.LOCAL,
+                    TransformerComputeKernelsQ4_0Packed.LOCAL);
+        }
         if (packedTasks().contains(layer + "." + task)) {
             int local =
                     task.equals("ffn_gate_up")

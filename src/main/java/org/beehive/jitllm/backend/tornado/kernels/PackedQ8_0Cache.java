@@ -26,7 +26,7 @@ import uk.ac.manchester.tornado.api.types.arrays.TornadoNativeArray;
 
 // @formatter:off
 /**
- * An on-disk cache of a model's packed Q8_0 weights ({@link PackedQ8_0}), so that packing, which
+ * An on-disk cache of a model's packed Q8_0 and Q4_0 weights ({@link PackedQ8_0}), so that packing, which
  * reads and rewrites every projection, happens once per model rather than on every load.
  *
  * <p>The cache is one file per model. Each packed tensor is stored 4 KB-aligned with the native
@@ -50,7 +50,7 @@ public final class PackedQ8_0Cache {
     private static final long MAGIC = 0x50385130_4D4C5449L; // "ITLM0Q8P", little-endian
 
     /** Bumped whenever the packed layout of {@link Qwen35Int8Kernels#packQ8_0Tiles} changes. */
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
 
     private static final long ALIGNMENT = 4096;
 
@@ -60,7 +60,12 @@ public final class PackedQ8_0Cache {
 
     private static final long HEADER = TornadoNativeArray.ARRAY_HEADER;
 
-    private record Entry(String name, int rows, int cols, long offset, long length) {}
+    /** The packed formats a cache holds. */
+    public static final int FORMAT_Q8_0 = 0;
+
+    public static final int FORMAT_Q4_0 = 1;
+
+    private record Entry(String name, int format, int rows, int cols, long offset, long length) {}
 
     private enum Mode {
         READ,
@@ -123,34 +128,40 @@ public final class PackedQ8_0Cache {
         return new PackedQ8_0Cache(Mode.MEMORY, null, null, null, Map.of());
     }
 
-    /** The packed form of the {@code rows x cols} Q8_0 weight {@code name}, recorded as packed. */
-    public ByteArray tensor(String name, ByteArray q8_0, int rows, int cols) {
+    /** The packed form of the {@code rows x cols} weight {@code name} in {@code format}, recorded as packed. */
+    public ByteArray tensor(String name, ByteArray weights, int rows, int cols, int format) {
         try {
             ByteArray packed =
                     switch (mode) {
                         case READ -> {
                             Entry entry = index.get(name);
-                            if (entry == null || entry.rows() != rows || entry.cols() != cols) {
+                            if (entry == null || entry.format() != format || entry.rows() != rows || entry.cols() != cols) {
                                 throw new IOException("the cache has no " + rows + " x " + cols + " entry for " + name);
                             }
                             yield map(entry);
                         }
                         case WRITE -> {
-                            byte[] bytes = Qwen35Int8Kernels.packQ8_0TileBytes(q8_0, rows, cols);
+                            byte[] bytes =
+                                    format == FORMAT_Q4_0
+                                            ? Qwen35Int8Kernels.packQ4_0TileBytes(weights, rows, cols)
+                                            : Qwen35Int8Kernels.packQ8_0TileBytes(weights, rows, cols);
                             long offset = align(next + HEADER) ;
                             ByteBuffer buffer = ByteBuffer.wrap(bytes);
                             long position = offset;
                             while (buffer.hasRemaining()) {
                                 position += channel.write(buffer, position);
                             }
-                            Entry entry = new Entry(name, rows, cols, offset, bytes.length);
+                            Entry entry = new Entry(name, format, rows, cols, offset, bytes.length);
                             written.add(entry);
                             next = offset + bytes.length;
                             yield map(entry);
                         }
-                        case MEMORY -> Qwen35Int8Kernels.packQ8_0Tiles(q8_0, rows, cols);
+                        case MEMORY ->
+                                format == FORMAT_Q4_0
+                                        ? Qwen35Int8Kernels.packQ4_0Tiles(weights, rows, cols)
+                                        : Qwen35Int8Kernels.packQ8_0Tiles(weights, rows, cols);
                     };
-            return PackedQ8_0.record(packed);
+            return format == FORMAT_Q4_0 ? PackedQ8_0.recordQ4(packed) : PackedQ8_0.record(packed);
         } catch (IOException e) {
             throw new UncheckedIOException("packed Q8_0 weights: " + (file == null ? "" : file + ": ") + e.getMessage(), e);
         }
@@ -167,7 +178,7 @@ public final class PackedQ8_0Cache {
             out.putInt(written.size());
             for (Entry entry : written) {
                 byte[] name = entry.name().getBytes(StandardCharsets.UTF_8);
-                out.putInt(name.length).put(name).putInt(entry.rows()).putInt(entry.cols()).putLong(entry.offset()).putLong(entry.length());
+                out.putInt(name.length).put(name).putInt(entry.format()).putInt(entry.rows()).putInt(entry.cols()).putLong(entry.offset()).putLong(entry.length());
             }
             out.putLong(indexOffset).putLong(MAGIC).putInt(VERSION);
             out.flip();
@@ -191,7 +202,7 @@ public final class PackedQ8_0Cache {
     private int indexBytes() {
         int bytes = Integer.BYTES + FOOTER_BYTES;
         for (Entry entry : written) {
-            bytes += Integer.BYTES + entry.name().getBytes(StandardCharsets.UTF_8).length + 2 * Integer.BYTES + 2 * Long.BYTES;
+            bytes += Integer.BYTES + entry.name().getBytes(StandardCharsets.UTF_8).length + 3 * Integer.BYTES + 2 * Long.BYTES;
         }
         return bytes;
     }
@@ -230,7 +241,7 @@ public final class PackedQ8_0Cache {
         for (int i = 0; i < count; i++) {
             byte[] name = new byte[in.getInt()];
             in.get(name);
-            Entry entry = new Entry(new String(name, StandardCharsets.UTF_8), in.getInt(), in.getInt(), in.getLong(), in.getLong());
+            Entry entry = new Entry(new String(name, StandardCharsets.UTF_8), in.getInt(), in.getInt(), in.getInt(), in.getLong(), in.getLong());
             if (entry.offset() < HEADER || entry.offset() + entry.length() > indexOffset) {
                 return null;
             }

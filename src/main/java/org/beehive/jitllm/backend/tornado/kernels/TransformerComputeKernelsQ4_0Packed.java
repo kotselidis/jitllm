@@ -1,0 +1,288 @@
+package org.beehive.jitllm.backend.tornado.kernels;
+
+import uk.ac.manchester.tornado.api.KernelContext;
+import uk.ac.manchester.tornado.api.math.TornadoMath;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
+import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.api.utils.QuantizationUtils;
+
+// @formatter:off
+/**
+ * Single-token matrix-vector products over Q4_0 weights packed by {@link
+ * Qwen35Int8Kernels#packQ4_0Tiles}, against the activation quantized per 32-block or in FP32.
+ *
+ * <p>A workgroup computes sixteen output rows: columns {@code 8g .. 8g + 7} and {@code 64 + 8g ..
+ * 64 + 8g + 7} of a 128-column tile, whose nibbles of a round are 512 contiguous bytes (the GEMM
+ * lanes {@code 64g .. 64g + 63}). Lane {@code L} of a warp reads two of those lanes' eight bytes,
+ * one aligned 64-bit load each: column pair {@code L >> 3} of the group, quants {@code 4 (L & 7)}
+ * to {@code 4 (L & 7) + 3} of both blocks of the round, in both column halves. Its nibbles expand
+ * to signed bytes, four per row, multiplied by DP4A against one activation word; each product is
+ * scaled by its weight and activation block scales and summed in FP32. The {@link #WARPS} warps
+ * split the rounds between them and meet in shared memory.
+ *
+ * <p>Worker: {@code d / 16 * LOCAL} lanes, local {@link #LOCAL}. Requires {@code d % 128 == 0}
+ * and {@code n % 64 == 0}, as the packing does.
+ */
+// @formatter:on
+public final class TransformerComputeKernelsQ4_0Packed {
+
+    /** Warps of a workgroup, all on the same sixteen rows. */
+    public static final int WARPS = 8;
+
+    /** Threads of a workgroup. */
+    public static final int LOCAL = WARPS * 32;
+
+    private static final int TILE_BYTES = Qwen35Int8Kernels.PACKED_Q4_TILE_BYTES;
+
+    private static final int QUANT_BYTES = Qwen35Int8Kernels.PACKED_Q4_QUANT_BYTES;
+
+    private TransformerComputeKernelsQ4_0Packed() {}
+
+    /** The int8 word of a 16-bit group of four nibbles (see Qwen35Int8Kernels#q4Word). */
+    private static int q4Word(int group) {
+        int x = (group & 0xF) | ((group & 0xF0) << 4) | ((group & 0xF00) << 8) | ((group & 0xF000) << 12);
+        return ((x | 0x80808080) - 0x08080808) ^ 0x80808080;
+    }
+
+    private static int signedByte(int v, int i) {
+        return (v << (24 - (i << 3))) >> 24;
+    }
+
+    /**
+     * This lane's sums of its four rows (column pair {@code L >> 3}, both halves: acc[0], acc[1]
+     * the pair in the low half, acc[2], acc[3] in the high half) over the rounds {@code
+     * firstRound, firstRound + WARPS, ...}, the activation quantized.
+     */
+    private static void accumulate(
+            ByteArray w, IntArray xQuants, FloatArray xScales, int n, int wg, int lane, int firstRound, float[] acc) {
+        int rounds = n >> 6;
+        int colTile = wg >> 3;
+        int group = wg & 7;
+        int pair = lane >> 3;
+        int quad = lane & 7;
+        int column = (group << 3) + (pair << 1);
+        int laneBytes = (group << 9) + (lane << 4);
+        int tileBase = colTile * rounds * TILE_BYTES;
+        for (int round = firstRound; round < rounds; round += WARPS) {
+            int tile = tileBase + round * TILE_BYTES;
+            long n0 = w.getLong(tile + laneBytes);
+            long n1 = w.getLong(tile + laneBytes + 8);
+            for (int b = 0; b < 2; b++) {
+                int block = (round << 1) + b;
+                int x = xQuants.get((block << 3) + quad);
+                float xScale = xScales.get(block);
+                int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
+                for (int h = 0; h < 2; h++) {
+                    int s = ((b << 1) + h) << 4;
+                    int w0 = q4Word((int) (n0 >>> s));
+                    int w1 = q4Word((int) (n1 >>> s));
+                    int even = (w0 & 0xFFFF) | (w1 << 16);
+                    int odd = (w0 >>> 16) | (w1 & 0xFFFF0000);
+                    int sc = scales + (h << 7);
+                    acc[h << 1] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(sc).getFloat32() * xScale);
+                    acc[(h << 1) + 1] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(sc + 2).getFloat32() * xScale);
+                }
+            }
+        }
+    }
+
+    /** {@link #accumulate} against an FP32 activation. */
+    private static void accumulateF32(ByteArray w, FloatArray x, int n, int wg, int lane, int firstRound, float[] acc) {
+        int rounds = n >> 6;
+        int colTile = wg >> 3;
+        int group = wg & 7;
+        int pair = lane >> 3;
+        int quad = lane & 7;
+        int column = (group << 3) + (pair << 1);
+        int laneBytes = (group << 9) + (lane << 4);
+        int tileBase = colTile * rounds * TILE_BYTES;
+        for (int round = firstRound; round < rounds; round += WARPS) {
+            int tile = tileBase + round * TILE_BYTES;
+            long n0 = w.getLong(tile + laneBytes);
+            long n1 = w.getLong(tile + laneBytes + 8);
+            for (int b = 0; b < 2; b++) {
+                int k = (((round << 1) + b) << 5) + (quad << 2);
+                float x0 = x.get(k);
+                float x1 = x.get(k + 1);
+                float x2 = x.get(k + 2);
+                float x3 = x.get(k + 3);
+                int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
+                for (int h = 0; h < 2; h++) {
+                    int s = ((b << 1) + h) << 4;
+                    int w0 = q4Word((int) (n0 >>> s));
+                    int w1 = q4Word((int) (n1 >>> s));
+                    float even = signedByte(w0, 0) * x0 + signedByte(w0, 1) * x1 + signedByte(w1, 0) * x2 + signedByte(w1, 1) * x3;
+                    float odd = signedByte(w0, 2) * x0 + signedByte(w0, 3) * x1 + signedByte(w1, 2) * x2 + signedByte(w1, 3) * x3;
+                    int sc = scales + (h << 7);
+                    acc[h << 1] += even * w.getHalfFloat(sc).getFloat32();
+                    acc[(h << 1) + 1] += odd * w.getHalfFloat(sc + 2).getFloat32();
+                }
+            }
+        }
+    }
+
+    /** Sums over the eight lanes of this warp that share {@code lane >> 3}. */
+    private static float reduceOctet(KernelContext context, float v) {
+        float s = v;
+        s += context.simdShuffleDown(s, 4);
+        s += context.simdShuffleDown(s, 2);
+        s += context.simdShuffleDown(s, 1);
+        return s;
+    }
+
+    /** Output row of slot {@code r} (0..15) of workgroup {@code wg}: pair {@code r >> 2}, then low/high half, then even/odd. */
+    private static int rowOf(int wg, int r) {
+        return ((wg >> 3) << 7) + (((r >> 1) & 1) << 6) + ((wg & 7) << 3) + ((r >> 2) << 1) + (r & 1);
+    }
+
+    /** {@code output[row] = w[row]·x} (or {@code +=} with {@code residual} 1). */
+    public static void matrixVectorQ4_0Packed(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            FloatArray output,
+            ByteArray w,
+            int n,
+            int d,
+            int residual) {
+        int wg = context.groupIdx;
+        int lane = context.localIdx & 31;
+        if ((wg << 4) < d) {
+            float[] sums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] acc = new float[4];
+            for (int i = 0; i < 4; i++) {
+                acc[i] = 0.0f;
+            }
+            accumulate(w, xQuants, xScales, n, wg, lane, context.localIdx >> 5, acc);
+            float r0 = reduceOctet(context, acc[0]);
+            float r1 = reduceOctet(context, acc[1]);
+            float r2 = reduceOctet(context, acc[2]);
+            float r3 = reduceOctet(context, acc[3]);
+            if ((lane & 7) == 0) {
+                int slot = ((context.localIdx >> 5) << 4) + ((lane >> 3) << 2);
+                sums[slot] = r0;
+                sums[slot + 1] = r1;
+                sums[slot + 2] = r2;
+                sums[slot + 3] = r3;
+            }
+            context.localBarrier();
+            int r = context.localIdx;
+            if (r < 16) {
+                float total = 0.0f;
+                for (int wi = 0; wi < WARPS; wi++) {
+                    total += sums[(wi << 4) + r];
+                }
+                int row = rowOf(wg, r);
+                if (residual != 0) {
+                    output.set(row, output.get(row) + total);
+                } else {
+                    output.set(row, total);
+                }
+            }
+        }
+    }
+
+    /** {@code output[row] = w[row]·x} (or {@code +=} with {@code residual} 1), {@code x} in FP32. */
+    public static void matrixVectorQ4_0PackedF32(
+            KernelContext context,
+            FloatArray x,
+            FloatArray output,
+            ByteArray w,
+            int n,
+            int d,
+            int residual) {
+        int wg = context.groupIdx;
+        int lane = context.localIdx & 31;
+        if ((wg << 4) < d) {
+            float[] sums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] acc = new float[4];
+            for (int i = 0; i < 4; i++) {
+                acc[i] = 0.0f;
+            }
+            accumulateF32(w, x, n, wg, lane, context.localIdx >> 5, acc);
+            float r0 = reduceOctet(context, acc[0]);
+            float r1 = reduceOctet(context, acc[1]);
+            float r2 = reduceOctet(context, acc[2]);
+            float r3 = reduceOctet(context, acc[3]);
+            if ((lane & 7) == 0) {
+                int slot = ((context.localIdx >> 5) << 4) + ((lane >> 3) << 2);
+                sums[slot] = r0;
+                sums[slot + 1] = r1;
+                sums[slot + 2] = r2;
+                sums[slot + 3] = r3;
+            }
+            context.localBarrier();
+            int r = context.localIdx;
+            if (r < 16) {
+                float total = 0.0f;
+                for (int wi = 0; wi < WARPS; wi++) {
+                    total += sums[(wi << 4) + r];
+                }
+                int row = rowOf(wg, r);
+                if (residual != 0) {
+                    output.set(row, output.get(row) + total);
+                } else {
+                    output.set(row, total);
+                }
+            }
+        }
+    }
+
+    /** {@code hb[row] = silu(w1[row]·x) * (w3[row]·x)}, both against the same quantized activation. */
+    public static void fusedFFNGateUpSiLUQ4_0Packed(
+            KernelContext context,
+            IntArray xQuants,
+            FloatArray xScales,
+            FloatArray hb,
+            ByteArray w1,
+            ByteArray w3,
+            int n,
+            int d) {
+        int wg = context.groupIdx;
+        int lane = context.localIdx & 31;
+        if ((wg << 4) < d) {
+            float[] gateSums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] upSums = context.allocateFloatLocalArray(WARPS * 16);
+            float[] gate = new float[4];
+            float[] up = new float[4];
+            for (int i = 0; i < 4; i++) {
+                gate[i] = 0.0f;
+                up[i] = 0.0f;
+            }
+            int firstRound = context.localIdx >> 5;
+            accumulate(w1, xQuants, xScales, n, wg, lane, firstRound, gate);
+            accumulate(w3, xQuants, xScales, n, wg, lane, firstRound, up);
+            float g0 = reduceOctet(context, gate[0]);
+            float g1 = reduceOctet(context, gate[1]);
+            float g2 = reduceOctet(context, gate[2]);
+            float g3 = reduceOctet(context, gate[3]);
+            float u0 = reduceOctet(context, up[0]);
+            float u1 = reduceOctet(context, up[1]);
+            float u2 = reduceOctet(context, up[2]);
+            float u3 = reduceOctet(context, up[3]);
+            if ((lane & 7) == 0) {
+                int slot = ((context.localIdx >> 5) << 4) + ((lane >> 3) << 2);
+                gateSums[slot] = g0;
+                gateSums[slot + 1] = g1;
+                gateSums[slot + 2] = g2;
+                gateSums[slot + 3] = g3;
+                upSums[slot] = u0;
+                upSums[slot + 1] = u1;
+                upSums[slot + 2] = u2;
+                upSums[slot + 3] = u3;
+            }
+            context.localBarrier();
+            int r = context.localIdx;
+            if (r < 16) {
+                float g = 0.0f;
+                float u = 0.0f;
+                for (int wi = 0; wi < WARPS; wi++) {
+                    g += gateSums[(wi << 4) + r];
+                    u += upSums[(wi << 4) + r];
+                }
+                hb.set(rowOf(wg, r), g / (1.0f + TornadoMath.exp(-g)) * u);
+            }
+        }
+    }
+}

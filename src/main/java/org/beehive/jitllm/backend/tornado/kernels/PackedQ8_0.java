@@ -26,7 +26,12 @@ public final class PackedQ8_0 {
     public static final boolean ENABLED = Boolean.getBoolean("jitllm.q8.packed");
 
 
+    /** Whether qwen35 Q4_0 projections are packed at load ({@code -Djitllm.q4.packed=true}). */
+    public static final boolean Q4_ENABLED = Boolean.getBoolean("jitllm.q4.packed");
+
     private static final Set<ByteArray> PACKED = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
+
+    private static final Set<ByteArray> PACKED_Q4 = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
 
     private PackedQ8_0() {}
 
@@ -41,6 +46,17 @@ public final class PackedQ8_0 {
         return packed;
     }
 
+    /** Records {@code packed} as holding packed Q4_0 tiles ({@link Qwen35Int8Kernels#packQ4_0Tiles}), and returns it. */
+    static ByteArray recordQ4(ByteArray packed) {
+        PACKED_Q4.add(packed);
+        return packed;
+    }
+
+    /** Whether {@code w} holds packed Q4_0 tiles rather than Q4_0 blocks. */
+    public static boolean isPackedQ4(ByteArray w) {
+        return PACKED_Q4.contains(w);
+    }
+
     /** Whether {@code w} holds packed tiles rather than Q8_0 blocks. */
     public static boolean isPacked(ByteArray w) {
         return PACKED.contains(w);
@@ -51,6 +67,6 @@ public final class PackedQ8_0 {
         return new UnsupportedOperationException(
                 where
                         + " reads a Q8_0 weight packed for -Djitllm.q8.packed=true, and this path has no"
-                        + " kernel for the packed layout. Run without -Djitllm.q8.packed.");
+                        + " kernel for the packed layout. Run without -Djitllm.q8.packed / -Djitllm.q4.packed.");
     }
 }
