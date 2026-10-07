@@ -4,8 +4,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.IntStream;
 import org.beehive.jitllm.backend.tornado.TensorCoreSupport;
+import org.beehive.jitllm.backend.tornado.kernels.Int8GemmKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35BatchKernels;
-import org.beehive.jitllm.backend.tornado.kernels.Qwen35Int8Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen35MMAKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsQ4_0;
@@ -263,7 +263,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         return TensorCoreSupport.isInt8MmaCapable()
                 && state.workspace.wrapQ8ActBatch != null
                 && q40Pair(n, k)
-                && k % Qwen35Int8Kernels.I8_BK == 0
+                && k % Int8GemmKernels.I8_BK == 0
                 && (long) n * k <= state.workspace.wrapInt8WeightScratch.getSize();
     }
 
@@ -273,7 +273,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 && TensorCoreSupport.isInt8MmaCapable()
                 && state.workspace.wrapQ8ActBatch != null
                 && Qwen35Configuration.dequantGemmWidth(batchSize)
-                && k % Qwen35Int8Kernels.I8_BK == 0;
+                && k % Int8GemmKernels.I8_BK == 0;
     }
 
     /**
@@ -285,7 +285,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         quantizeTasks.put("batchLayer_" + layer + "." + task, batchSize * k);
         graph.task(
                 task,
-                Qwen35Int8Kernels::quantizeActivationsQ8Warp,
+                Int8GemmKernels::quantizeActivationsQ8Warp,
                 context,
                 x,
                 state.workspace.wrapQ8ActBatch,
@@ -309,7 +309,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         gemmTasks.put(qualified, n);
         graph.task(
                 task + "_dequant",
-                Qwen35Int8Kernels::decodeQ4_0ToInt8Tiled,
+                Int8GemmKernels::decodeQ4_0ToInt8Tiled,
                 context,
                 w,
                 state.workspace.wrapInt8WeightScratch,
@@ -320,7 +320,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             case STORE ->
                     graph.task(
                             task,
-                            Qwen35Int8Kernels::gemmInt8BlockScaled,
+                            Int8GemmKernels::gemmInt8BlockScaled,
                             context,
                             state.workspace.wrapQ8ActBatch,
                             state.workspace.wrapQ8ActScales,
@@ -333,7 +333,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             case RESIDUAL ->
                     graph.task(
                             task,
-                            Qwen35Int8Kernels::gemmInt8BlockScaledResidual,
+                            Int8GemmKernels::gemmInt8BlockScaledResidual,
                             context,
                             state.workspace.wrapQ8ActBatch,
                             state.workspace.wrapQ8ActScales,
@@ -346,7 +346,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             case SWIGLU ->
                     graph.task(
                             task,
-                            Qwen35Int8Kernels::gemmInt8BlockScaledSwiGLU,
+                            Int8GemmKernels::gemmInt8BlockScaledSwiGLU,
                             context,
                             state.workspace.wrapQ8ActBatch,
                             state.workspace.wrapQ8ActScales,
@@ -1127,7 +1127,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             if (fakeQuantizeForTests) {
                 layer.task(
                         apply + "_fp16",
-                        Qwen35Int8Kernels::fakeQuantizeNormedToFP16,
+                        Int8GemmKernels::fakeQuantizeNormedToFP16,
                         context,
                         state.workspace.wrapNormedBatch,
                         state.workspace.wrapNormedFP16Batch,
@@ -1399,7 +1399,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             } else if (fakeQuantizeForTests) {
                 layer.task(
                         "attn_output_fp16",
-                        Qwen35Int8Kernels::fakeQuantizeToFP16,
+                        Int8GemmKernels::fakeQuantizeToFP16,
                         context,
                         state.workspace.wrapXbBatch,
                         state.workspace.wrapHbFP16BatchMMA);
