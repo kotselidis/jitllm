@@ -1055,13 +1055,11 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             layer.transferToDevice(
                     DataTransferMode.FIRST_EXECUTION, weights.attnKNorm[layerIndex].asFloatArray());
             if (!nativeProjections) {
-                layer.transferToDevice(
-                        DataTransferMode.FIRST_EXECUTION,
-                        weights.wkLayered[layerIndex].asByteArray());
+                org.beehive.jitllm.backend.tornado.kernels.PackedRepack.upload(
+                        layer, weights.wkLayered[layerIndex].asByteArray());
                 if (weights.wvLayered[layerIndex] != null) {
-                    layer.transferToDevice(
-                            DataTransferMode.FIRST_EXECUTION,
-                            weights.wvLayered[layerIndex].asByteArray());
+                    org.beehive.jitllm.backend.tornado.kernels.PackedRepack.upload(
+                            layer, weights.wvLayered[layerIndex].asByteArray());
                 }
             }
         }
