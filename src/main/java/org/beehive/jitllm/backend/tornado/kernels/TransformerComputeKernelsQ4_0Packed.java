@@ -69,7 +69,8 @@ public final class TransformerComputeKernelsQ4_0Packed {
     /**
      * This lane's sums of its four rows (column pair {@code L >> 3}, both halves: acc[0], acc[1]
      * the pair in the low half, acc[2], acc[3] in the high half) over the rounds {@code
-     * firstRound, firstRound + WARPS, ...}, the activation quantized.
+     * firstRound, firstRound + warps, ...}, the activation quantized. Two rounds a step, both
+     * loaded before either is used, so each lane keeps four 64-bit loads in flight.
      */
     private static void accumulate(
             ByteArray w, IntArray xQuants, FloatArray xScales, int n, int wg, int lane, int firstRound, int warps, float[] acc) {
@@ -81,37 +82,51 @@ public final class TransformerComputeKernelsQ4_0Packed {
         int column = (group << 3) + (pair << 1);
         int laneBytes = (group << 9) + (lane << 4);
         int tileBase = colTile * rounds * TILE_BYTES;
-        for (int round = firstRound; round < rounds; round += warps) {
+        for (int round = firstRound; round < rounds; round += warps << 1) {
+            int second = round + warps;
+            boolean hasSecond = second < rounds;
             int tile = tileBase + round * TILE_BYTES;
+            int tile2 = tileBase + (hasSecond ? second : round) * TILE_BYTES;
             long n0 = w.getLong(tile + laneBytes);
             long n1 = w.getLong(tile + laneBytes + 8);
-            // Block 0's two nibble groups are the low 32 bits, block 1's the high: a 64-bit value is
-            // only ever shifted by the constant 32 (a variable 64-bit shift miscompiles here).
-            int lo0 = (int) n0;
-            int hi0 = (int) (n0 >>> 32);
-            int lo1 = (int) n1;
-            int hi1 = (int) (n1 >>> 32);
-            for (int b = 0; b < 2; b++) {
-                int g0 = b == 0 ? lo0 : hi0;
-                int g1 = b == 0 ? lo1 : hi1;
-                int block = (round << 1) + b;
-                int x = xQuants.get((block << 3) + quad);
-                float xScale = xScales.get(block);
-                int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
-                // Each row's four nibbles gathered while they are a small 16-bit group, then expanded:
-                // no step masks or shifts a word with its top bit set (TornadoVM miscompiles such
-                // masks here). Group g holds (c, k), (c, k + 1), (c + 1, k), (c + 1, k + 1).
-                int g0h = g0 >> 16;
-                int g1h = g1 >> 16;
-                int even = q4Word((g0 & 0xFF) | ((g1 & 0xFF) << 8));
-                int odd = q4Word(((g0 >> 8) & 0xFF) | (((g1 >> 8) & 0xFF) << 8));
-                acc[0] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(scales).getFloat32() * xScale);
-                acc[1] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(scales + 2).getFloat32() * xScale);
-                even = q4Word((g0h & 0xFF) | ((g1h & 0xFF) << 8));
-                odd = q4Word(((g0h >> 8) & 0xFF) | (((g1h >> 8) & 0xFF) << 8));
-                acc[2] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(scales + 128).getFloat32() * xScale);
-                acc[3] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(scales + 130).getFloat32() * xScale);
+            long m0 = w.getLong(tile2 + laneBytes);
+            long m1 = w.getLong(tile2 + laneBytes + 8);
+            roundDot(w, xQuants, xScales, tile, round, n0, n1, quad, column, acc);
+            if (hasSecond) {
+                roundDot(w, xQuants, xScales, tile2, second, m0, m1, quad, column, acc);
             }
+        }
+    }
+
+    /** One round's products of this lane: its two loaded nibble words {@code n0}, {@code n1}. */
+    private static void roundDot(
+            ByteArray w, IntArray xQuants, FloatArray xScales, int tile, int round, long n0, long n1, int quad, int column, float[] acc) {
+        // Block 0's two nibble groups are the low 32 bits, block 1's the high: a 64-bit value is
+        // only ever shifted by the constant 32 (a variable 64-bit shift miscompiles here).
+        int lo0 = (int) n0;
+        int hi0 = (int) (n0 >>> 32);
+        int lo1 = (int) n1;
+        int hi1 = (int) (n1 >>> 32);
+        for (int b = 0; b < 2; b++) {
+            int g0 = b == 0 ? lo0 : hi0;
+            int g1 = b == 0 ? lo1 : hi1;
+            int block = (round << 1) + b;
+            int x = xQuants.get((block << 3) + quad);
+            float xScale = xScales.get(block);
+            int scales = tile + QUANT_BYTES + (((b << 7) + column) << 1);
+            // Each row's four nibbles gathered while they are a small 16-bit group, then expanded:
+            // no step masks or shifts a word with its top bit set (TornadoVM miscompiles such
+            // masks here). Group g holds (c, k), (c, k + 1), (c + 1, k), (c + 1, k + 1).
+            int g0h = g0 >> 16;
+            int g1h = g1 >> 16;
+            int even = q4Word((g0 & 0xFF) | ((g1 & 0xFF) << 8));
+            int odd = q4Word(((g0 >> 8) & 0xFF) | (((g1 >> 8) & 0xFF) << 8));
+            acc[0] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(scales).getFloat32() * xScale);
+            acc[1] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(scales + 2).getFloat32() * xScale);
+            even = q4Word((g0h & 0xFF) | ((g1h & 0xFF) << 8));
+            odd = q4Word(((g0h >> 8) & 0xFF) | (((g1h >> 8) & 0xFF) << 8));
+            acc[2] += QuantizationUtils.dp4a_packed(even, x, 0) * (w.getHalfFloat(scales + 128).getFloat32() * xScale);
+            acc[3] += QuantizationUtils.dp4a_packed(odd, x, 0) * (w.getHalfFloat(scales + 130).getFloat32() * xScale);
         }
     }
 
