@@ -35,37 +35,46 @@ final class PackedTilePacker {
     private PackedTilePacker() {}
 
     static byte[] packQ8_0(ByteArray w, int n, int k) {
-        int rowBytes = (k / 32) * Q8_0_BLOCK_BYTES;
-        int rounds = k / BK;
-        byte[] out = new byte[(n / BN) * rounds * Qwen35Int8Kernels.PACKED_TILE_BYTES];
-        MemorySegment weights = w.getSegment();
-        IntStream.range(0, n / BN)
-                .parallel()
-                .forEach(
-                        colTile -> {
-                            byte[] rows = slice(weights, colTile, rowBytes);
-                            for (int round = 0; round < rounds; round++) {
-                                packQ8_0Tile(rows, rowBytes, round, out, (colTile * rounds + round) * Qwen35Int8Kernels.PACKED_TILE_BYTES);
-                            }
-                        });
+        byte[] out = new byte[(int) packedBytes(false, n, k)];
+        pack(false, w, n, k, MemorySegment.ofArray(out));
         return out;
     }
 
     static byte[] packQ4_0(ByteArray w, int n, int k) {
-        int rowBytes = (k / 32) * Q4_0_BLOCK_BYTES;
+        byte[] out = new byte[(int) packedBytes(true, n, k)];
+        pack(true, w, n, k, MemorySegment.ofArray(out));
+        return out;
+    }
+
+    /** Bytes of the packed form of an {@code n x k} Q4_0 ({@code q4}) or Q8_0 weight. */
+    static long packedBytes(boolean q4, int n, int k) {
+        return (long) (n / BN) * (k / BK) * (q4 ? Qwen35Int8Kernels.PACKED_Q4_TILE_BYTES : Qwen35Int8Kernels.PACKED_TILE_BYTES);
+    }
+
+    /**
+     * Packs {@code w} into {@code out}, {@link #packedBytes} long: on the heap, or straight into a
+     * mapping of the cache file. Each column tile is packed on the heap and copied out whole.
+     */
+    static void pack(boolean q4, ByteArray w, int n, int k, MemorySegment out) {
+        int rowBytes = (k / 32) * (q4 ? Q4_0_BLOCK_BYTES : Q8_0_BLOCK_BYTES);
         int rounds = k / BK;
-        byte[] out = new byte[(n / BN) * rounds * Qwen35Int8Kernels.PACKED_Q4_TILE_BYTES];
+        int tileBytes = q4 ? Qwen35Int8Kernels.PACKED_Q4_TILE_BYTES : Qwen35Int8Kernels.PACKED_TILE_BYTES;
         MemorySegment weights = w.getSegment();
         IntStream.range(0, n / BN)
                 .parallel()
                 .forEach(
                         colTile -> {
                             byte[] rows = slice(weights, colTile, rowBytes);
+                            byte[] tiles = new byte[rounds * tileBytes];
                             for (int round = 0; round < rounds; round++) {
-                                packQ4_0Tile(rows, rowBytes, round, out, (colTile * rounds + round) * Qwen35Int8Kernels.PACKED_Q4_TILE_BYTES);
+                                if (q4) {
+                                    packQ4_0Tile(rows, rowBytes, round, tiles, round * tileBytes);
+                                } else {
+                                    packQ8_0Tile(rows, rowBytes, round, tiles, round * tileBytes);
+                                }
                             }
+                            MemorySegment.copy(tiles, 0, out, ValueLayout.JAVA_BYTE, (long) colTile * tiles.length, tiles.length);
                         });
-        return out;
     }
 
     /** The 128 rows of column tile {@code colTile}, copied to the heap. */

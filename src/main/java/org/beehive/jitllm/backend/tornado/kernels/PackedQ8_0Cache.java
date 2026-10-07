@@ -21,6 +21,10 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.TornadoNativeArray;
 
@@ -80,6 +84,14 @@ public final class PackedQ8_0Cache {
     private final Map<String, Entry> index;
     private final List<Entry> written = new ArrayList<>();
     private final Arena arena = Arena.ofAuto();
+    private final List<Future<Void>> flushes = new ArrayList<>();
+    private final ExecutorService flusher =
+            Executors.newSingleThreadExecutor(
+                    r -> {
+                        Thread thread = new Thread(r, "jitllm-packed-cache-flush");
+                        thread.setDaemon(true);
+                        return thread;
+                    });
     private long next;
 
     private PackedQ8_0Cache(Mode mode, Path file, Path temporary, FileChannel channel, Map<String, Entry> index) {
@@ -141,19 +153,27 @@ public final class PackedQ8_0Cache {
                             yield map(entry);
                         }
                         case WRITE -> {
-                            byte[] bytes =
-                                    format == FORMAT_Q4_0
-                                            ? Qwen35Int8Kernels.packQ4_0TileBytes(weights, rows, cols)
-                                            : Qwen35Int8Kernels.packQ8_0TileBytes(weights, rows, cols);
-                            long offset = align(next + HEADER) ;
-                            ByteBuffer buffer = ByteBuffer.wrap(bytes);
-                            long position = offset;
-                            while (buffer.hasRemaining()) {
-                                position += channel.write(buffer, position);
-                            }
-                            Entry entry = new Entry(name, format, rows, cols, offset, bytes.length);
+                            // Packed straight into a shared mapping of the file, whose pages are
+                            // then written back on the flusher while the next tensor packs.
+                            boolean q4 = format == FORMAT_Q4_0;
+                            long offset = align(next + HEADER);
+                            long length = PackedTilePacker.packedBytes(q4, rows, cols);
+                            Arena target = Arena.ofShared();
+                            MemorySegment segment = channel.map(FileChannel.MapMode.READ_WRITE, offset, length, target);
+                            PackedTilePacker.pack(q4, weights, rows, cols, segment);
+                            flushes.add(
+                                    flusher.submit(
+                                            () -> {
+                                                try {
+                                                    segment.force();
+                                                } finally {
+                                                    target.close();
+                                                }
+                                                return null;
+                                            }));
+                            Entry entry = new Entry(name, format, rows, cols, offset, length);
                             written.add(entry);
-                            next = offset + bytes.length;
+                            next = offset + length;
                             yield map(entry);
                         }
                         case MEMORY ->
@@ -173,6 +193,10 @@ public final class PackedQ8_0Cache {
             return;
         }
         try {
+            for (Future<Void> flush : flushes) {
+                flush.get();
+            }
+            flusher.shutdown();
             long indexOffset = align(next);
             ByteBuffer out = ByteBuffer.allocate(indexBytes()).order(ByteOrder.LITTLE_ENDIAN);
             out.putInt(written.size());
@@ -194,8 +218,11 @@ public final class PackedQ8_0Cache {
                 Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
             }
             System.err.println("[jitllm] packed Q8_0 weights: cached " + written.size() + " tensors in " + file);
-        } catch (IOException e) {
+        } catch (IOException | ExecutionException e) {
             System.err.println("[jitllm] packed Q8_0 weights: could not complete the cache (" + e.getMessage() + ")");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("[jitllm] packed Q8_0 weights: interrupted completing the cache");
         }
     }
 
