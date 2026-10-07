@@ -165,6 +165,87 @@ public class Qwen35Q8_0Int8ProjectionAccelTest {
     }
 
     /**
+     * The GEMM over packed weights ({@link Qwen35Int8Kernels#packQ8_0Tiles}) against {@link
+     * Qwen35Int8Kernels#gemmInt8Q8_0} on the same operands, unsplit and split three ways (ten
+     * 64-k rounds: shares of 4, 4 and 2). Same summation order, so the stored results and the
+     * split partial sums are equal bit for bit.
+     */
+    @Test
+    public void thePackedGemmMatchesTheGemm() throws Exception {
+        assumeTrue("no int8 tensor cores", TensorCoreSupport.isInt8MmaCapable());
+        int m = 256, n = 384, k = 640;
+        byte[] raw = randomWeights(n, k, 41);
+        ByteArray w = toDevice(raw);
+        FloatArray a = activations(m, k, 42);
+        ByteArray q8 = new ByteArray(m * k);
+        FloatArray dA = new FloatArray(m * k / 32);
+        IntArray rows = rowsOf(m);
+        ByteArray packed = Qwen35Int8Kernels.packQ8_0Tiles(w, n, k);
+        for (int splits : new int[] {1, 3}) {
+            {
+                FloatArray reference = new FloatArray(splits * m * n);
+                FloatArray staged = new FloatArray(splits * m * n);
+                reference.init(Float.NaN);
+                staged.init(Float.NaN);
+                // Split, every split writes its partial sums; unsplit, the output itself.
+                TaskGraph g =
+                        new TaskGraph("q8k")
+                                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a, w, packed, q8, dA, reference, staged, rows)
+                                .task("q", Qwen35Int8Kernels::quantizeActivationsQ8Warp, new KernelContext(), a, q8, dA, k)
+                                .task(
+                                        "g",
+                                        Qwen35Int8Kernels::gemmInt8Q8_0,
+                                        new KernelContext(),
+                                        q8,
+                                        dA,
+                                        w,
+                                        reference,
+                                        reference,
+                                        m,
+                                        n,
+                                        k,
+                                        Qwen35Int8Kernels.EPILOGUE_STORE,
+                                        reference,
+                                        splits,
+                                        rows,
+                                        n,
+                                        0)
+                                .task(
+                                        "p",
+                                        Qwen35Int8Kernels::gemmInt8Q8_0Packed,
+                                        new KernelContext(),
+                                        q8,
+                                        dA,
+                                        packed,
+                                        staged,
+                                        staged,
+                                        m,
+                                        n,
+                                        k,
+                                        Qwen35Int8Kernels.EPILOGUE_STORE,
+                                        staged,
+                                        splits,
+                                        rows,
+                                        n,
+                                        0)
+                                .transferToHost(DataTransferMode.EVERY_EXECUTION, reference, staged);
+                GridScheduler s = new GridScheduler();
+                s.addWorkerGrid("q8k.q", lanes(m * k, 256));
+                s.addWorkerGrid("q8k.g", gemmGrid(m, n, splits));
+                s.addWorkerGrid("q8k.p", gemmGrid(m, n, splits));
+                try (TornadoExecutionPlan plan = new TornadoExecutionPlan(g.snapshot())) {
+                    plan.withGridScheduler(s).execute();
+                }
+                for (int i = 0; i < splits * m * n; i++) {
+                    if (splits == 1 || !Float.isNaN(reference.get(i))) {
+                        assertEquals("splits " + splits + ", element " + i, reference.get(i), staged.get(i), 0.0f);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * The residual and SwiGLU epilogues against the stored product of the same operands: the
      * residual adds it to what was there, bit for bit; SwiGLU multiplies it by {@code silu(gate)}.
      */
