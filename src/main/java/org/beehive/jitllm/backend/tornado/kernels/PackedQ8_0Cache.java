@@ -74,7 +74,8 @@ public final class PackedQ8_0Cache {
     private enum Mode {
         READ,
         WRITE,
-        MEMORY
+        MEMORY,
+        GPU
     }
 
     private final Mode mode;
@@ -109,6 +110,10 @@ public final class PackedQ8_0Cache {
      * tensors are packed. Falls back to packing in memory when the cache cannot be used.
      */
     public static PackedQ8_0Cache open(FileChannel model, long tensorDataOffset) {
+        if (PackedRepack.ENABLED) {
+            System.err.println("[jitllm] packed weights: repacking on the GPU at load (-Djitllm.packed.mode=gpu)");
+            return new PackedQ8_0Cache(Mode.GPU, null, null, null, Map.of());
+        }
         if (!ENABLED) {
             return memory();
         }
@@ -175,6 +180,11 @@ public final class PackedQ8_0Cache {
                             written.add(entry);
                             next = offset + length;
                             yield map(entry);
+                        }
+                        case GPU -> {
+                            // The GGUF bytes stay on the host; the device copy is repacked after upload.
+                            PackedRepack.register(weights, rows, cols, format == FORMAT_Q4_0);
+                            yield weights;
                         }
                         case MEMORY ->
                                 format == FORMAT_Q4_0

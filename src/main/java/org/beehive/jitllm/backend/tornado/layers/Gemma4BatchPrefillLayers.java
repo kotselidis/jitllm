@@ -1040,13 +1040,15 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     gateUpF16[layerIndex],
                     downF16[layerIndex]);
         } else {
-            layer.transferToDevice(
-                    DataTransferMode.FIRST_EXECUTION,
-                    weights.wqLayered[layerIndex].asByteArray(),
-                    weights.woLayered[layerIndex].asByteArray(),
-                    weights.w1Layered[layerIndex].asByteArray(),
-                    weights.w3Layered[layerIndex].asByteArray(),
-                    weights.w2Layered[layerIndex].asByteArray());
+            Object[] projections = {
+                weights.wqLayered[layerIndex].asByteArray(),
+                weights.woLayered[layerIndex].asByteArray(),
+                weights.w1Layered[layerIndex].asByteArray(),
+                weights.w3Layered[layerIndex].asByteArray(),
+                weights.w2Layered[layerIndex].asByteArray()
+            };
+            layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, projections);
+            org.beehive.jitllm.backend.tornado.kernels.PackedRepack.owner(layer, projections);
         }
         if (hasOwnKv) {
             requireDecodable(weights.wkLayered[layerIndex], "blk." + layerIndex + ".attn_k");

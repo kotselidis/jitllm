@@ -2569,6 +2569,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             tensors.add(require(weights.attnKNorm, layerIndex, "attn_k_norm").asFloatArray());
         }
         layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, tensors.toArray());
+        org.beehive.jitllm.backend.tornado.kernels.PackedRepack.owner(layer, tensors.toArray());
     }
 
     private static Object deviceArray(TornadoTensor tensor) {

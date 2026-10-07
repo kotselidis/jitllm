@@ -1939,6 +1939,7 @@ public class Qwen35FFNLayers
             layer.consumeFromDevice(source, tensors.toArray());
         } else {
             layer.transferToDevice(DataTransferMode.FIRST_EXECUTION, tensors.toArray());
+            org.beehive.jitllm.backend.tornado.kernels.PackedRepack.owner(layer, tensors.toArray());
         }
     }
 

@@ -103,6 +103,11 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
     private final State state;
     private final Stage[] stages;
     private final TornadoExecutionPlan[] plans;
+
+    /** Per stage: its graph that repacks packed weights on the GPU after the warm-up, or -1. */
+    private final int[] packedRepackGraphs;
+
+    private final GridScheduler[] packedRepackSchedulers;
     private final PipelineTransport transport;
     private final String transportName;
 
@@ -187,6 +192,8 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
 
         this.stages = new Stage[devices.length];
         this.plans = new TornadoExecutionPlan[devices.length];
+        this.packedRepackGraphs = new int[devices.length];
+        this.packedRepackSchedulers = new GridScheduler[devices.length];
         this.prefillGraphs = batched ? new int[devices.length][] : null;
         this.decodeGraphs = batched ? new int[devices.length][] : null;
         int last = devices.length - 1;
@@ -308,6 +315,8 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
                         scheduler);
             }
             transport.updateGridScheduler(s, scheduler);
+            packedRepackGraphs[s] = org.beehive.jitllm.backend.tornado.kernels.PackedRepack.appendGraph(graphs, scheduler, "packedRepack" + s);
+            packedRepackSchedulers[s] = scheduler;
 
             TornadoExecutionPlan plan =
                     new TornadoExecutionPlan(graphs.toArray(new ImmutableTaskGraph[0]))
@@ -330,6 +339,9 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             plans[s] = plan;
         }
         forceCopyInReadOnlyData();
+        for (int s = 0; s < plans.length; s++) {
+            org.beehive.jitllm.backend.tornado.kernels.PackedRepack.run(plans[s], packedRepackGraphs[s], packedRepackSchedulers[s]);
+        }
     }
 
     /**

@@ -300,6 +300,15 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
                 weights.w3Layered[layerIndex].asByteArray(),
                 weights.freq_cis_realFlat.asFloatArray(),
                 weights.freq_cis_imagFlat.asFloatArray());
+        org.beehive.jitllm.backend.tornado.kernels.PackedRepack.owner(
+                layer,
+                weights.wqLayered[layerIndex].asByteArray(),
+                weights.wkLayered[layerIndex].asByteArray(),
+                weights.wvLayered[layerIndex].asByteArray(),
+                weights.woLayered[layerIndex].asByteArray(),
+                weights.w1Layered[layerIndex].asByteArray(),
+                weights.w2Layered[layerIndex].asByteArray(),
+                weights.w3Layered[layerIndex].asByteArray());
 
         int dim = config.dim();
         int kvDim = config.kvDim();

@@ -2,6 +2,7 @@ package org.beehive.jitllm.backend.tornado.kernels;
 
 import uk.ac.manchester.tornado.api.KernelContext;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
+import uk.ac.manchester.tornado.api.types.arrays.IntArray;
 
 // @formatter:off
 /**
@@ -135,6 +136,34 @@ public final class PackedRepackKernels {
                 packed.set(dst, raw.get(src));
                 packed.set(dst + 1, raw.get(src + 1));
             }
+        }
+    }
+
+    /** {@link #copy}, unless {@code done[0]} says the weights are already packed. */
+    public static void copyOnce(KernelContext context, ByteArray src, ByteArray dst, int bytes, IntArray done) {
+        if (done.get(0) == 0) {
+            copy(context, src, dst, bytes);
+        }
+    }
+
+    /** {@link #repackQ8_0}, unless {@code done[0]} says the weights are already packed. */
+    public static void repackQ8_0Once(KernelContext context, ByteArray raw, ByteArray packed, int n, int k, IntArray done) {
+        if (done.get(0) == 0) {
+            repackQ8_0(context, raw, packed, n, k);
+        }
+    }
+
+    /** {@link #repackQ4_0}, unless {@code done[0]} says the weights are already packed. */
+    public static void repackQ4_0Once(KernelContext context, ByteArray raw, ByteArray packed, int n, int k, IntArray done) {
+        if (done.get(0) == 0) {
+            repackQ4_0(context, raw, packed, n, k);
+        }
+    }
+
+    /** Marks the weights packed: the last task of the repack graph. */
+    public static void markDone(KernelContext context, IntArray done) {
+        if (context.globalIdx == 0) {
+            done.set(0, 1);
         }
     }
 }
