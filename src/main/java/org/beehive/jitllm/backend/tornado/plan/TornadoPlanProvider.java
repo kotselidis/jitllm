@@ -35,6 +35,14 @@ public interface TornadoPlanProvider {
     }
 
     /**
+     * Whether this family's logits can sample greedily on the device, and its decode loop read the
+     * token from there, for weights in {@code weights}.
+     */
+    default boolean deviceSampling(DataType weights) {
+        return false;
+    }
+
+    /**
      * The <b>model-wide</b> weight representations this provider builds plan components for.
      *
      * <p>Provider admission, and nothing else. It answers "given a model whose weights report this

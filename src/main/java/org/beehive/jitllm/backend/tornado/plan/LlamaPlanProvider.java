@@ -53,6 +53,12 @@ public final class LlamaPlanProvider implements TornadoPlanProvider {
                         decode.maxBlocksPerSlot()));
     }
 
+    /** The FP16 logits sample on the device. */
+    @Override
+    public boolean deviceSampling(DataType weights) {
+        return weights == DataType.F16;
+    }
+
     @Override
     public Set<DataType> supportedDataTypes() {
         // BOTH_REPRESENTATIONS plus Q4_0, which this family retains rather than materializing.

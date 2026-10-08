@@ -27,6 +27,12 @@ public final class MistralPlanProvider implements TornadoPlanProvider {
         return ID;
     }
 
+    /** The FP16 logits sample on the device. */
+    @Override
+    public boolean deviceSampling(DataType weights) {
+        return weights == DataType.F16;
+    }
+
     @Override
     public Set<DataType> supportedDataTypes() {
         return TornadoSupportSets.BOTH_REPRESENTATIONS;
