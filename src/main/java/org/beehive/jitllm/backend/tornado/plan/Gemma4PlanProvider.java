@@ -1,6 +1,8 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.fp16.Gemma4FP16PlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.q8_0.Gemma4Q8_0PlanComponents;
@@ -100,5 +102,36 @@ public final class Gemma4PlanProvider implements TornadoPlanProvider {
                                                         model::createNewState)));
         stage.resolveExecutionPolicy(session.executionPolicy());
         return stage;
+    }
+
+    /**
+     * The batched projections and attention are tensor-core kernels, with no scalar twin. Without
+     * tensor cores the plan fails at "MMA instructions only supported for the CUDA backend".
+     */
+    @Override
+    public Optional<String> batchPrefillUnsupported(Combination c) {
+        return c.tensorCores()
+                ? Optional.empty()
+                : Optional.of(
+                        "the gemma4 batched prefill is written for tensor cores"
+                                + " only, which this device does not have");
+    }
+
+    /**
+     * The quantized layers' FP16 writers and grouped attention, in both of this family's modes: the
+     * shuffle-reduced grouped kernel on CUDA, its shared-memory twin on OpenCL. The FP16/BF16
+     * layers keep FP32.
+     */
+    @Override
+    public Optional<String> fp16KeyValueUnsupported(Combination c) {
+        if (c.weights() != DataType.Q8_0 && c.weights() != DataType.Q4_0) {
+            return Optional.of("the gemma4 " + c.weights() + " layers keep an FP32 cache");
+        }
+        return Optional.empty();
+    }
+
+    @Override
+    public Set<DataType> nativeLibraryWeights() {
+        return Set.of(DataType.Q8_0, DataType.Q4_0);
     }
 }

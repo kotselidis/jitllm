@@ -4,6 +4,7 @@ import org.beehive.jitllm.backend.tornado.layers.AbstractLogitsTaskGraph;
 import org.beehive.jitllm.backend.tornado.layers.Activation;
 import org.beehive.jitllm.backend.tornado.layers.ActivationTaskGraph;
 import org.beehive.jitllm.backend.tornado.layers.BatchPrefillTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.layers.PackedQ8_0LogitsLayer;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchDecodeActivation;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchFeedForward;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchPrefillLayers;
@@ -12,7 +13,6 @@ import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersBatchDecode;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersGrouped;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FeedForward;
 import org.beehive.jitllm.backend.tornado.layers.TransformerLayerTaskGraphs;
-import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillActivation;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillQ8DeviceActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
@@ -76,7 +76,7 @@ public class Qwen35PlanComponents
 
     @Override
     public AbstractLogitsTaskGraph singleTokenLogits(String previousGraphId) {
-        return new LogitsQ8_0Layer(
+        return new PackedQ8_0LogitsLayer(
                 "logits", state, weights, config, previousGraphId, schedulerType);
     }
 

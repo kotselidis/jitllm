@@ -3,6 +3,7 @@ package org.beehive.jitllm.backend.tornado;
 import java.util.Optional;
 import org.beehive.jitllm.backend.tornado.device.TornadoDevices;
 import org.beehive.jitllm.backend.tornado.plan.ExecutionMode;
+import org.beehive.jitllm.backend.tornado.plan.TornadoPlanRegistry;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.model.Model;
@@ -80,82 +81,55 @@ public final class Fp16KeyValueSupport {
             // Not a key/value question: the plan cannot be built with either cache.
             return noBatchedPrefill;
         }
-        switch (c.architecture()) {
-            case "qwen35", "qwen35moe" -> {
-                // FP16 writers and readers in every mode, including batched prefill. On CUDA the
-                // split-KV and tensor-core attention read it; on OpenCL (an NVIDIA-class device,
-                // checked above) the single-workgroup FP16 kernel does.
-                return Optional.empty();
-            }
-            case "deepseek2" -> {
-                // The latent cache is written and read in FP16 by the decode and batched-prefill
-                // kernels, which are CUDA's: they reduce with warp shuffles.
-                if (!BackendId.CUDA.equals(c.backend())) {
-                    return Optional.of("the deepseek2 layers are written for the CUDA backend");
-                }
-                if (c.weights() != DataType.Q8_0) {
-                    return Optional.of(
-                            "the deepseek2 " + c.weights() + " layers keep an FP32 cache");
-                }
-                return Optional.empty();
-            }
-            case "gemma4" -> {
-                // The quantized layers' FP16 writers and grouped attention, in both of this
-                // family's modes: the shuffle-reduced grouped kernel on CUDA, its shared-memory
-                // twin on OpenCL. The FP16/BF16 layers keep FP32.
-                if (c.weights() != DataType.Q8_0 && c.weights() != DataType.Q4_0) {
-                    return Optional.of("the gemma4 " + c.weights() + " layers keep an FP32 cache");
-                }
-                return Optional.empty();
-            }
-            case "llama", "qwen3" -> {
-                if (!c.nvidiaScheduler()) {
-                    return Optional.of("the non-NVIDIA decode layers keep an FP32 cache");
-                }
-                boolean q8 = c.weights() == DataType.Q8_0;
-                boolean f16 = c.weights() == DataType.F16;
-                boolean q4Llama = c.weights() == DataType.Q4_0 && c.architecture().equals("llama");
-                if (!f16 && !q8 && !q4Llama) {
-                    return Optional.of("the " + c.weights() + " layers keep an FP32 cache");
-                }
-                return switch (c.mode()) {
-                    case STANDARD -> Optional.empty();
-                    case PREFILL_DECODE ->
-                            q4Llama
-                                    ? Optional.of("Q4_0 has no sequential prefill/decode plan")
-                                    : Optional.empty();
-                    case BATCH_PREFILL_DECODE -> Optional.empty();
-                };
-            }
-            case "mistral" -> {
-                // Mistral keeps the non-NVIDIA scheduler for its FP32 attention; its FP16 cache
-                // takes the flash kernels, which need an NVIDIA-class device, not that scheduler.
-                if (!c.nvidiaDevice()) {
-                    return Optional.of("the FP16 flash kernels need an NVIDIA-class device");
-                }
-                if (c.weights() != DataType.F16 && c.weights() != DataType.Q8_0) {
-                    return Optional.of("the " + c.weights() + " layers keep an FP32 cache");
-                }
-                return c.mode() == ExecutionMode.STANDARD
-                        ? Optional.empty()
-                        : Optional.of("mistral has single-token plans only");
-            }
-            case "qwen2", "deepseek-r1-distill-qwen", "phi3", "granite" -> {
-                // Single-token only: these families have no prefill/decode plans.
-                if (!c.nvidiaScheduler()) {
-                    return Optional.of("the non-NVIDIA decode layers keep an FP32 cache");
-                }
-                if (c.weights() != DataType.F16 && c.weights() != DataType.Q8_0) {
-                    return Optional.of("the " + c.weights() + " layers keep an FP32 cache");
-                }
-                return c.mode() == ExecutionMode.STANDARD
-                        ? Optional.empty()
-                        : Optional.of(c.architecture() + " has single-token plans only");
-            }
-            default -> {
-                return Optional.of("the " + c.architecture() + " layers keep an FP32 cache");
-            }
+        return TornadoPlanRegistry.provider(c.architecture())
+                .map(provider -> provider.fp16KeyValueUnsupported(c))
+                .orElseGet(
+                        () ->
+                                Optional.of(
+                                        "the " + c.architecture() + " layers keep an FP32 cache"));
+    }
+
+    // @formatter:off
+    /**
+     * The FP16 answer of the NVIDIA-class decode layers shared by Llama and Qwen3: F16 and Q8_0
+     * weights, and Q4_0 where {@code q4_0} says the family's Q4_0 layers write FP16 too. Every
+     * mode, except that Q4_0 has no sequential prefill/decode plan.
+     */
+    // @formatter:on
+    public static Optional<String> nvidiaDecodeLayers(Combination c, boolean q4_0) {
+        if (!c.nvidiaScheduler()) {
+            return Optional.of("the non-NVIDIA decode layers keep an FP32 cache");
         }
+        boolean q8 = c.weights() == DataType.Q8_0;
+        boolean f16 = c.weights() == DataType.F16;
+        boolean q4 = q4_0 && c.weights() == DataType.Q4_0;
+        if (!f16 && !q8 && !q4) {
+            return Optional.of("the " + c.weights() + " layers keep an FP32 cache");
+        }
+        return switch (c.mode()) {
+            case STANDARD -> Optional.empty();
+            case PREFILL_DECODE ->
+                    q4
+                            ? Optional.of("Q4_0 has no sequential prefill/decode plan")
+                            : Optional.empty();
+            case BATCH_PREFILL_DECODE -> Optional.empty();
+        };
+    }
+
+    /**
+     * The FP16 answer of a family with single-token plans only, on the NVIDIA-class decode layers:
+     * F16 and Q8_0 weights.
+     */
+    public static Optional<String> singleTokenNvidiaLayers(Combination c) {
+        if (!c.nvidiaScheduler()) {
+            return Optional.of("the non-NVIDIA decode layers keep an FP32 cache");
+        }
+        if (c.weights() != DataType.F16 && c.weights() != DataType.Q8_0) {
+            return Optional.of("the " + c.weights() + " layers keep an FP32 cache");
+        }
+        return c.mode() == ExecutionMode.STANDARD
+                ? Optional.empty()
+                : Optional.of(c.architecture() + " has single-token plans only");
     }
 
     /**

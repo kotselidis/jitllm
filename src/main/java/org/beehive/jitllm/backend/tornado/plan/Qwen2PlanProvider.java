@@ -1,6 +1,9 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
 import org.beehive.jitllm.backend.tornado.lowering.TornadoSupportSets;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.fp16.Qwen2FP16PlanComponents;
@@ -37,5 +40,11 @@ public final class Qwen2PlanProvider implements TornadoPlanProvider {
         return weights == DataType.F16
                 ? new Qwen2FP16PlanComponents(typed, model)
                 : new Qwen2Q8_0PlanComponents(typed, model);
+    }
+
+    /** Single-token plans only, on the NVIDIA-class decode layers. */
+    @Override
+    public Optional<String> fp16KeyValueUnsupported(Combination c) {
+        return Fp16KeyValueSupport.singleTokenNvidiaLayers(c);
     }
 }

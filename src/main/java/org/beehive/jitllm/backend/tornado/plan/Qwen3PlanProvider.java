@@ -1,6 +1,9 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
 import org.beehive.jitllm.backend.tornado.lowering.TornadoSupportSets;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.fp16.Qwen3FP16PlanComponents;
@@ -37,5 +40,17 @@ public final class Qwen3PlanProvider implements TornadoPlanProvider {
         return weights == DataType.F16
                 ? new Qwen3FP16PlanComponents(typed, model)
                 : new Qwen3Q8_0PlanComponents(typed, model);
+    }
+
+    /** The NVIDIA-class decode layers, without a Q4_0 path. */
+    @Override
+    public Optional<String> fp16KeyValueUnsupported(Combination c) {
+        return Fp16KeyValueSupport.nvidiaDecodeLayers(c, false);
+    }
+
+    /** F16: projections through cuBLAS, the first chunk's attention through cuDNN. */
+    @Override
+    public Set<DataType> nativeLibraryWeights() {
+        return Set.of(DataType.F16);
     }
 }

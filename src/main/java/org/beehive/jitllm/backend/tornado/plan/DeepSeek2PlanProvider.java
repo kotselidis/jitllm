@@ -1,11 +1,14 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
 import org.beehive.jitllm.backend.tornado.plan.components.DeepSeek2PlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.inference.state.DeepSeek2State;
 import org.beehive.jitllm.inference.state.State;
 import org.beehive.jitllm.model.Model;
+import org.beehive.jitllm.runtime.backend.BackendId;
 import org.beehive.jitllm.runtime.model.ArchitectureId;
 import org.beehive.jitllm.runtime.tensor.DataType;
 
@@ -54,5 +57,31 @@ public final class DeepSeek2PlanProvider implements TornadoPlanProvider {
                                 model, session, firstLayer, endLayer, prefillBatchSize);
         stage.cacheFirstLayer = firstLayer;
         return stage;
+    }
+
+    /** The batched prefill runs its projections and attention on CUDA tensor cores. */
+    @Override
+    public Optional<String> batchPrefillUnsupported(Combination c) {
+        return BackendId.CUDA.equals(c.backend()) && c.tensorCores()
+                ? Optional.empty()
+                : Optional.of(
+                        "the deepseek2 batched prefill runs its projections and"
+                                + " attention on CUDA tensor cores, which this device"
+                                + " does not have");
+    }
+
+    /**
+     * The latent cache is written and read in FP16 by the decode and batched-prefill kernels, which
+     * are CUDA's: they reduce with warp shuffles.
+     */
+    @Override
+    public Optional<String> fp16KeyValueUnsupported(Combination c) {
+        if (!BackendId.CUDA.equals(c.backend())) {
+            return Optional.of("the deepseek2 layers are written for the CUDA backend");
+        }
+        if (c.weights() != DataType.Q8_0) {
+            return Optional.of("the deepseek2 " + c.weights() + " layers keep an FP32 cache");
+        }
+        return Optional.empty();
     }
 }

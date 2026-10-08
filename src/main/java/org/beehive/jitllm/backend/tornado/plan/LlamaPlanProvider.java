@@ -1,6 +1,10 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
+import org.beehive.jitllm.backend.tornado.NativePrefillSupport;
 import org.beehive.jitllm.backend.tornado.lowering.TornadoSupportSets;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.fp16.LlamaFP16PlanComponents;
@@ -9,6 +13,7 @@ import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.state.State;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.runtime.model.ArchitectureId;
+import org.beehive.jitllm.runtime.policy.ExecutionPolicy;
 import org.beehive.jitllm.runtime.tensor.DataType;
 
 /**
@@ -51,5 +56,30 @@ public final class LlamaPlanProvider implements TornadoPlanProvider {
                     .LlamaQ4_0PlanComponents(typed, model);
         }
         return new LlamaQ8_0PlanComponents(typed, model);
+    }
+
+    /**
+     * Llama Q4_0's batched prefill exists only with its projections in cuBLAS: without native
+     * libraries there is nothing to build.
+     */
+    @Override
+    public Optional<String> batchPrefillNeeds(Combination c, ExecutionPolicy policy) {
+        if (c.weights() == DataType.Q4_0 && !NativePrefillSupport.nativeProjections(policy)) {
+            return Optional.of(
+                    "the llama Q4_0 batched prefill runs its projections through cuBLAS; add"
+                            + " --with-native-libraries on a CUDA device with tensor cores");
+        }
+        return Optional.empty();
+    }
+
+    /** The NVIDIA-class decode layers, whose Q4_0 path writes FP16 too. */
+    @Override
+    public Optional<String> fp16KeyValueUnsupported(Combination c) {
+        return Fp16KeyValueSupport.nvidiaDecodeLayers(c, true);
+    }
+
+    @Override
+    public Set<DataType> nativeLibraryWeights() {
+        return Set.of(DataType.Q4_0);
     }
 }

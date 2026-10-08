@@ -137,6 +137,27 @@ public final class TornadoPlanRegistry {
                                 });
     }
 
+    /** Where a native-library path exists, for a message that must say so: "llama Q4_0, ...". */
+    public static String nativeLibraryPaths() {
+        return Index.BY_ID.values().stream()
+                .filter(provider -> !provider.nativeLibraryWeights().isEmpty())
+                .map(
+                        provider ->
+                                provider.architecture().name()
+                                        + " "
+                                        + provider.nativeLibraryWeights().stream()
+                                                .sorted()
+                                                .map(DataType::name)
+                                                .collect(java.util.stream.Collectors.joining("/")))
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(", "));
+    }
+
+    /** The provider registered for the architecture named {@code architecture}, if any. */
+    public static Optional<TornadoPlanProvider> provider(String architecture) {
+        return Optional.ofNullable(Index.BY_ID.get(ArchitectureId.of(architecture)));
+    }
+
     /** The provider registered for {@code model}'s architecture, if it has migrated. */
     static Optional<TornadoPlanProvider> provider(Model model) {
         return Optional.ofNullable(Index.BY_ID.get(model.architectureId()));

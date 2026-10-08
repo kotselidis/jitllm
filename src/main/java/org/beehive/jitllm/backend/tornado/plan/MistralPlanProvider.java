@@ -1,6 +1,8 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
 import org.beehive.jitllm.backend.tornado.lowering.TornadoSupportSets;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.fp16.MistralFP16PlanComponents;
@@ -43,5 +45,22 @@ public final class MistralPlanProvider implements TornadoPlanProvider {
         return weights == DataType.F16
                 ? new MistralFP16PlanComponents(typed, model)
                 : new MistralQ8_0PlanComponents(typed, model);
+    }
+
+    /**
+     * Mistral keeps the non-NVIDIA scheduler for its FP32 attention; its FP16 cache takes the flash
+     * kernels, which need an NVIDIA-class device, not that scheduler.
+     */
+    @Override
+    public Optional<String> fp16KeyValueUnsupported(Combination c) {
+        if (!c.nvidiaDevice()) {
+            return Optional.of("the FP16 flash kernels need an NVIDIA-class device");
+        }
+        if (c.weights() != DataType.F16 && c.weights() != DataType.Q8_0) {
+            return Optional.of("the " + c.weights() + " layers keep an FP32 cache");
+        }
+        return c.mode() == ExecutionMode.STANDARD
+                ? Optional.empty()
+                : Optional.of("mistral has single-token plans only");
     }
 }

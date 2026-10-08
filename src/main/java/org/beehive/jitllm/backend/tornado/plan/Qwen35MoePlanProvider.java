@@ -1,6 +1,8 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
 import org.beehive.jitllm.backend.tornado.plan.components.Qwen35MoePlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.inference.state.Qwen35MoeState;
@@ -47,5 +49,17 @@ public final class Qwen35MoePlanProvider implements TornadoPlanProvider {
     @Override
     public boolean stageCacheHoldsOnlyItsLayers() {
         return false;
+    }
+
+    /** The qwen35 layers' batched prefill, with the experts in place of the dense feed-forward. */
+    @Override
+    public Optional<String> batchPrefillUnsupported(Combination c) {
+        return Qwen35PlanProvider.batchPrefillOn(c);
+    }
+
+    /** The qwen35 layers' FP16 key/value cache. */
+    @Override
+    public Optional<String> fp16KeyValueUnsupported(Combination c) {
+        return Optional.empty();
     }
 }

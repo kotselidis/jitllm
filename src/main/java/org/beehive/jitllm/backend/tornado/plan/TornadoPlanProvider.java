@@ -1,10 +1,13 @@
 package org.beehive.jitllm.backend.tornado.plan;
 
+import java.util.Optional;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.Fp16KeyValueSupport.Combination;
 import org.beehive.jitllm.backend.tornado.plan.components.SingleTokenForwardPlanComponents;
 import org.beehive.jitllm.inference.state.State;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.runtime.model.ArchitectureId;
+import org.beehive.jitllm.runtime.policy.ExecutionPolicy;
 import org.beehive.jitllm.runtime.tensor.DataType;
 
 /**
@@ -106,5 +109,40 @@ public interface TornadoPlanProvider {
                                                         : model.createNewState()));
         stage.resolveExecutionPolicy(session.executionPolicy());
         return stage;
+    }
+
+    // ── What this family's layers can build ───────────────────────────────────
+
+    /**
+     * The weight representations whose batched prefill has a native-library path ({@code
+     * --with-native-libraries}): projections through cuBLAS rather than the JIT kernels.
+     */
+    default Set<DataType> nativeLibraryWeights() {
+        return Set.of();
+    }
+
+    /**
+     * Why this family's batched prefill cannot be built for {@code c}, with either key/value cache,
+     * or empty when it can. Asked only for a batched prefill on a device backend.
+     */
+    default Optional<String> batchPrefillUnsupported(Combination c) {
+        return Optional.empty();
+    }
+
+    /**
+     * What a batched prefill of this family needs from {@code policy} that it does not ask for, or
+     * empty when nothing. Asked only for a batched prefill on a device backend.
+     */
+    default Optional<String> batchPrefillNeeds(Combination c, ExecutionPolicy policy) {
+        return Optional.empty();
+    }
+
+    /**
+     * Why this family's layers cannot store and read the key/value cache in half precision for
+     * {@code c}, or empty when they can. Asked on a backend where the FP16 kernels were verified,
+     * once the plan is known to build. A family keeps an FP32 cache unless it says otherwise.
+     */
+    default Optional<String> fp16KeyValueUnsupported(Combination c) {
+        return Optional.of("the " + c.architecture() + " layers keep an FP32 cache");
     }
 }
