@@ -118,6 +118,36 @@ public final class TornadoPlanRegistry {
      */
     static Optional<ForwardPlan> create(
             DataType quantization, ExecutionMode mode, State state, Model model) {
+        return components(quantization, mode, state, model)
+                .map(
+                        components ->
+                                switch (mode) {
+                                    case STANDARD -> new SingleTokenForwardPlan(model, components);
+                                    case PREFILL_DECODE ->
+                                            new PrefillDecodeForwardPlan(
+                                                    model,
+                                                    (PrefillDecodeForwardPlanComponents)
+                                                            components);
+                                    case BATCH_PREFILL_DECODE ->
+                                            new BatchPrefillDecodeForwardPlan(
+                                                    model,
+                                                    (BatchPrefillDecodeForwardPlanComponents)
+                                                            components,
+                                                    state.executionPolicy().prefillBatchSize());
+                                });
+    }
+
+    /** The provider registered for {@code model}'s architecture, if it has migrated. */
+    static Optional<TornadoPlanProvider> provider(Model model) {
+        return Optional.ofNullable(Index.BY_ID.get(model.architectureId()));
+    }
+
+    /**
+     * The components for a migrated architecture in {@code mode}, admitted as {@link #create}
+     * admits them: an unsupported representation or mode is refused by name.
+     */
+    static Optional<SingleTokenForwardPlanComponents> components(
+            DataType quantization, ExecutionMode mode, State state, Model model) {
         TornadoPlanProvider provider = Index.BY_ID.get(model.architectureId());
         if (provider == null) {
             return Optional.empty();
@@ -135,7 +165,7 @@ public final class TornadoPlanRegistry {
                 provider.components(quantization, state, model);
         // A provider may support a mode for one representation and not for another — Llama has
         // prefill and batch kernels for Q8_0 and F16 but only single-token ones for Q4_0. Without
-        // this the cast below fails with a ClassCastException naming two internal interfaces,
+        // this the plan's cast fails with a ClassCastException naming two internal interfaces,
         // where the contract of this method is that an unsupported combination is refused by name.
         if (mode == ExecutionMode.PREFILL_DECODE
                         && !(components instanceof PrefillDecodeForwardPlanComponents)
@@ -144,17 +174,6 @@ public final class TornadoPlanRegistry {
             throw new UnsupportedOperationException(
                     mode + " not yet supported for " + model.getModelType() + " + " + quantization);
         }
-        return Optional.of(
-                switch (mode) {
-                    case STANDARD -> new SingleTokenForwardPlan(model, components);
-                    case PREFILL_DECODE ->
-                            new PrefillDecodeForwardPlan(
-                                    model, (PrefillDecodeForwardPlanComponents) components);
-                    case BATCH_PREFILL_DECODE ->
-                            new BatchPrefillDecodeForwardPlan(
-                                    model,
-                                    (BatchPrefillDecodeForwardPlanComponents) components,
-                                    state.executionPolicy().prefillBatchSize());
-                });
+        return Optional.of(components);
     }
 }

@@ -12,6 +12,7 @@ import org.beehive.jitllm.backend.tornado.layers.type.q4_0.prefill.LlamaQ4_0Laye
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LogitsQ8_0LayerDecode;
 import org.beehive.jitllm.backend.tornado.plan.components.BatchPrefillDecodeForwardPlanComponents;
+import org.beehive.jitllm.backend.tornado.plan.components.StagedForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchDecodeActivation;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillQ8DeviceActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
@@ -36,7 +37,8 @@ import org.beehive.jitllm.model.llama.LlamaConfiguration;
  * by name.
  */
 // @formatter:on
-public class LlamaQ4_0PlanComponents implements BatchPrefillDecodeForwardPlanComponents {
+public class LlamaQ4_0PlanComponents
+        implements BatchPrefillDecodeForwardPlanComponents, StagedForwardPlanComponents {
 
     private final LlamaState state;
     private final LlamaTornadoWeights weights;
@@ -86,18 +88,39 @@ public class LlamaQ4_0PlanComponents implements BatchPrefillDecodeForwardPlanCom
 
     @Override
     public BatchPrefillTransformerLayerTaskGraphs batchPrefillTransformerLayers(int batchSize) {
-        if (!NativePrefillSupport.nativeProjections(state.executionPolicy())) {
-            throw new UnsupportedOperationException(
-                    "the Llama Q4_0 batched prefill runs its projections through cuBLAS: add"
-                            + " --with-native-libraries on a CUDA device with tensor cores");
-        }
-        return new LlamaQ4_0LayersBatchPrefillNative(state, weights, config, batchSize);
+        return batchPrefillTransformerLayers(batchSize, 0, config.numberOfLayers());
     }
 
     @Override
     public AbstractLogitsTaskGraph decodeLogits(String previousGraphId) {
         return new LogitsQ8_0LayerDecode(
                 "logits", state, weights, config, previousGraphId, schedulerType);
+    }
+
+    // ── Pipeline stages ───────────────────────────────────────────────────────
+
+    @Override
+    public TransformerLayerTaskGraphs singleTokenTransformerLayers(int firstLayer, int endLayer) {
+        return new LlamaQ4_0FFNLayers(
+                "layers", state, weights, config, schedulerType, firstLayer, endLayer);
+    }
+
+    @Override
+    public BatchPrefillTransformerLayerTaskGraphs batchPrefillTransformerLayers(
+            int batchSize, int firstLayer, int endLayer) {
+        if (!NativePrefillSupport.nativeProjections(state.executionPolicy())) {
+            throw new UnsupportedOperationException(
+                    "the Llama Q4_0 batched prefill runs its projections through cuBLAS: add"
+                            + " --with-native-libraries on a CUDA device with tensor cores");
+        }
+        return new LlamaQ4_0LayersBatchPrefillNative(
+                state, weights, config, batchSize, firstLayer, endLayer);
+    }
+
+    @Override
+    public TransformerLayerTaskGraphs batchDecodeTransformerLayers(int firstLayer, int endLayer) {
+        return new LlamaQ4_0FFNLayersDecode(
+                "decode", state, weights, config, schedulerType, firstLayer, endLayer);
     }
 
     // ── Sequential prefill/decode: not implemented for Q4_0 ──────────────────

@@ -66,4 +66,34 @@ public interface TornadoPlanProvider {
      *     used to live in the central factory
      */
     SingleTokenForwardPlanComponents components(DataType weights, State state, Model model);
+
+    /**
+     * Inner stage boundaries of a model split across devices fall on multiples of this, for a
+     * family whose graphs group layers.
+     */
+    default int stageLayerAlignment() {
+        return 1;
+    }
+
+    /**
+     * A state for one stage of a model split across devices, holding layers {@code [firstLayer,
+     * endLayer)}: the session's storage options and execution policy, and a key/value cache for the
+     * stage's layers only, which is what layers built with a range address. A family whose layers
+     * index the cache by absolute layer overrides this to keep the whole model's layout.
+     */
+    default State stageState(
+            Model model, State session, int firstLayer, int endLayer, int prefillBatchSize) {
+        State stage =
+                State.withStorageOptions(
+                        session.storageOptions(),
+                        () ->
+                                State.withPrefillBatchSize(
+                                        prefillBatchSize,
+                                        () ->
+                                                State.withKeyValueLayers(
+                                                        endLayer - firstLayer,
+                                                        model::createNewState)));
+        stage.resolveExecutionPolicy(session.executionPolicy());
+        return stage;
+    }
 }

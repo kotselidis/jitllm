@@ -105,6 +105,13 @@ public interface TornadoVMMasterPlan {
         // A batched prefill the family cannot build on this device, with either cache.
         BatchPrefillSupport.require(model, state.executionPolicy(), true);
 
+        // A model split by layers across several devices: its own plan, one per device.
+        var split = org.beehive.jitllm.runtime.backend.DeviceSplit.fromSystemProperties();
+        if (split.isPresent()) {
+            reportPath(org.beehive.jitllm.runtime.backend.ExecutionPath.LEGACY, model, state);
+            return new TornadoVMMasterPlanPipeline(state, model, split.get(), sink);
+        }
+
         // The lowering's opt-in is consulted here, in the one factory every caller reaches, rather
         // than at each construction site. It was branched at two sites before — the API session and
         // the golden harness — which is why the CLI, the server and the benchmark script silently
