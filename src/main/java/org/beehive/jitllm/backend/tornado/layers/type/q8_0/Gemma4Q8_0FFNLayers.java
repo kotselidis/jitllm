@@ -910,26 +910,18 @@ public class Gemma4Q8_0FFNLayers
         if (weights.layerOutputScale[layerIndex] != null) {
             shared.add(weights.layerOutputScale[layerIndex].asFloatArray());
         }
-        // The projections the batch-prefill graph reads itself; with native libraries it reads
-        // FP16 copies instead, so the file's tensors exist only here.
-        boolean[] prefillReads =
-                batchedPlan
-                        ? org.beehive.jitllm.backend.tornado.layers.Gemma4BatchPrefillLayers
-                                .prefillReadsProjections(gemma4State, weights, config, layerIndex)
-                        : new boolean[] {false, false, false, false};
-        java.util.List<Object> qkv = new java.util.ArrayList<>();
-        qkv.add(weightArray(weights.wqLayered[layerIndex]));
+        // The projections: the batch-prefill graph reads them itself, whichever GEMMs it runs.
+        shared.add(weightArray(weights.wqLayered[layerIndex]));
         if (config.hasOwnKv(layerIndex)) {
-            qkv.add(weightArray(weights.wkLayered[layerIndex]));
+            shared.add(weightArray(weights.wkLayered[layerIndex]));
             if (weights.wvLayered[layerIndex] != null) {
-                qkv.add(weightArray(weights.wvLayered[layerIndex]));
+                shared.add(weightArray(weights.wvLayered[layerIndex]));
             }
         }
-        (prefillReads[0] ? shared : own).addAll(qkv);
-        (prefillReads[1] ? shared : own).add(weightArray(weights.woLayered[layerIndex]));
-        (prefillReads[2] ? shared : own).add(weightArray(weights.w1Layered[layerIndex]));
-        (prefillReads[2] ? shared : own).add(weightArray(weights.w3Layered[layerIndex]));
-        (prefillReads[3] ? shared : own).add(weightArray(weights.w2Layered[layerIndex]));
+        shared.add(weightArray(weights.woLayered[layerIndex]));
+        shared.add(weightArray(weights.w1Layered[layerIndex]));
+        shared.add(weightArray(weights.w3Layered[layerIndex]));
+        shared.add(weightArray(weights.w2Layered[layerIndex]));
         if (batchedPlan) {
             unifiedLayer.consumeFromDevice("batchPrefillLayer_" + layerIndex, shared.toArray());
         } else {

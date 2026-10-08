@@ -171,11 +171,6 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
     // @formatter:on
     private final boolean nativeProjections;
 
-    private final HalfFloatArray[] qkvF16;
-    private final HalfFloatArray[] woF16;
-    private final HalfFloatArray[] gateUpF16;
-    private final HalfFloatArray[] downF16;
-
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
 
@@ -277,45 +272,6 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         : null;
 
         this.nativeProjections = nativeProjections(state);
-        this.qkvF16 = new HalfFloatArray[layers];
-        this.woF16 = new HalfFloatArray[layers];
-        this.gateUpF16 = new HalfFloatArray[layers];
-        this.downF16 = new HalfFloatArray[layers];
-        if (nativeProjections) {
-            for (int l = firstLayer; l < endLayer; l++) {
-                int headDim = config.headDim(l);
-                int qDim = nHead * headDim;
-                int kvDim = config.keyValueHeads(l) * headDim;
-                int ffnLen = config.feedForwardLength(l);
-                qkvF16[l] =
-                        config.hasOwnKv(l)
-                                ? Gemma4Fp16Weights.stack(
-                                        dim,
-                                        new TornadoTensor[] {
-                                            weights.wqLayered[l],
-                                            weights.wkLayered[l],
-                                            valueWeights(l)
-                                        },
-                                        new int[] {qDim, kvDim, kvDim})
-                                : Gemma4Fp16Weights.stack(
-                                        dim,
-                                        new TornadoTensor[] {weights.wqLayered[l]},
-                                        new int[] {qDim});
-                woF16[l] =
-                        Gemma4Fp16Weights.stack(
-                                qDim, new TornadoTensor[] {weights.woLayered[l]}, new int[] {dim});
-                gateUpF16[l] =
-                        Gemma4Fp16Weights.stack(
-                                dim,
-                                new TornadoTensor[] {weights.w1Layered[l], weights.w3Layered[l]},
-                                new int[] {ffnLen, ffnLen});
-                downF16[l] =
-                        Gemma4Fp16Weights.stack(
-                                ffnLen,
-                                new TornadoTensor[] {weights.w2Layered[l]},
-                                new int[] {dim});
-            }
-        }
 
         this.gemmAttention =
                 fp16KeyValue
@@ -761,22 +717,6 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         .isTensorCoreCapableBackend();
     }
 
-    // @formatter:off
-    /**
-     * Whether the batch-prefill graph of layer {@code l} hands each of this projection group's own
-     * weights to a task — and so whether a decode graph may bind them from it. With native
-     * libraries the prefill reads its FP16 copies instead, the file's tensors are never allocated
-     * in that graph, and the decode graph has to upload them itself.
-     *
-     * @return {@code [qkv, attn_output, gate/up, ffn_down]}
-     */
-    // @formatter:on
-    public static boolean[] prefillReadsProjections(
-            Gemma4State state, Gemma4TornadoWeights w, Gemma4Configuration c, int l) {
-        boolean jit = !nativeProjections(state);
-        return new boolean[] {jit, jit, jit, jit};
-    }
-
     /** Whether this state's prefill projections are cuBLAS GEMMs: requested, and available. */
     static boolean nativeProjections(Gemma4State state) {
         return org.beehive.jitllm.backend.tornado.NativePrefillSupport.nativeProjections(
@@ -1012,38 +952,26 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     pleProjF16[layerIndex],
                     weights.perLayerPostNorm[layerIndex].asFloatArray());
         }
-        // Each projection as the task that reads it: its FP16 copy for cuBLAS, or the file's
-        // tensor.
-        if (nativeProjections) {
-            layer.transferToDevice(
-                    DataTransferMode.FIRST_EXECUTION,
-                    qkvF16[layerIndex],
-                    woF16[layerIndex],
-                    gateUpF16[layerIndex],
-                    downF16[layerIndex]);
-        } else {
-            layer.transferToDevice(
-                    DataTransferMode.FIRST_EXECUTION,
-                    weights.wqLayered[layerIndex].asByteArray(),
-                    weights.woLayered[layerIndex].asByteArray(),
-                    weights.w1Layered[layerIndex].asByteArray(),
-                    weights.w3Layered[layerIndex].asByteArray(),
-                    weights.w2Layered[layerIndex].asByteArray());
-        }
+        // Each projection in the file's representation: the int8 and FP16 GEMMs read it, and
+        // cuBLAS reads it decoded into the shared FP16 scratch.
+        layer.transferToDevice(
+                DataTransferMode.FIRST_EXECUTION,
+                weights.wqLayered[layerIndex].asByteArray(),
+                weights.woLayered[layerIndex].asByteArray(),
+                weights.w1Layered[layerIndex].asByteArray(),
+                weights.w3Layered[layerIndex].asByteArray(),
+                weights.w2Layered[layerIndex].asByteArray());
         if (hasOwnKv) {
             requireDecodable(weights.wkLayered[layerIndex], "blk." + layerIndex + ".attn_k");
             requireDecodable(valueWeights(layerIndex), "blk." + layerIndex + ".attn_v");
             layer.transferToDevice(
                     DataTransferMode.FIRST_EXECUTION, weights.attnKNorm[layerIndex].asFloatArray());
-            if (!nativeProjections) {
+            layer.transferToDevice(
+                    DataTransferMode.FIRST_EXECUTION, weights.wkLayered[layerIndex].asByteArray());
+            if (weights.wvLayered[layerIndex] != null) {
                 layer.transferToDevice(
                         DataTransferMode.FIRST_EXECUTION,
-                        weights.wkLayered[layerIndex].asByteArray());
-                if (weights.wvLayered[layerIndex] != null) {
-                    layer.transferToDevice(
-                            DataTransferMode.FIRST_EXECUTION,
-                            weights.wvLayered[layerIndex].asByteArray());
-                }
+                        weights.wvLayered[layerIndex].asByteArray());
             }
         }
         if (weights.layerOutputScale[layerIndex] != null) {
@@ -1121,11 +1049,14 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         stride,
                         qDim + kvDim,
                         false);
-            } else if (qkvF16[layerIndex] != null) {
+            } else if (nativeProjections) {
+                addDequant(layer, "qDequant", weights.wqLayered[layerIndex], 0);
+                addDequant(layer, "kDequant", weights.wkLayered[layerIndex], qDim * dim);
+                addDequant(layer, "vDequant", valueWeights(layerIndex), (qDim + kvDim) * dim);
                 nativeGemm(
                         layer,
                         "qkvProj",
-                        qkvF16[layerIndex],
+                        state.workspace.weightsF16Scratch,
                         state.workspace.wrapXbFP16Batch,
                         state.workspace.qkvResultBatch,
                         qDim + 2 * kvDim,
@@ -1223,11 +1154,12 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         stride,
                         0,
                         false);
-            } else if (qkvF16[layerIndex] != null) {
+            } else if (nativeProjections) {
+                addDequant(layer, "qDequant", weights.wqLayered[layerIndex], 0);
                 nativeGemm(
                         layer,
                         "qkvProj",
-                        qkvF16[layerIndex],
+                        state.workspace.weightsF16Scratch,
                         state.workspace.wrapXbFP16Batch,
                         state.workspace.qkvResultBatch,
                         qDim,
@@ -1360,11 +1292,12 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     dim,
                     0,
                     true);
-        } else if (woF16[layerIndex] != null) {
+        } else if (nativeProjections) {
+            addDequant(layer, "woDequant", weights.woLayered[layerIndex], 0);
             nativeGemm(
                     layer,
                     "woProj",
-                    woF16[layerIndex],
+                    state.workspace.weightsF16Scratch,
                     state.workspace.attnOutFP16,
                     state.workspace.woOut,
                     dim,
@@ -1483,11 +1416,13 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     2 * ffnLen,
                     ffnLen,
                     false);
-        } else if (gateUpF16[layerIndex] != null) {
+        } else if (nativeProjections) {
+            addDequant(layer, "gateDequant", weights.w1Layered[layerIndex], 0);
+            addDequant(layer, "upDequant", weights.w3Layered[layerIndex], ffnLen * dim);
             nativeGemm(
                     layer,
                     "gateUpProj",
-                    gateUpF16[layerIndex],
+                    state.workspace.weightsF16Scratch,
                     state.workspace.normedXFFNFP16,
                     state.workspace.gateUpResultBatch,
                     2 * ffnLen,
@@ -1541,11 +1476,12 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     dim,
                     0,
                     true);
-        } else if (downF16[layerIndex] != null) {
+        } else if (nativeProjections) {
+            addDequant(layer, "w2Dequant", weights.w2Layered[layerIndex], 0);
             nativeGemm(
                     layer,
                     "w2Proj",
-                    downF16[layerIndex],
+                    state.workspace.weightsF16Scratch,
                     state.workspace.wrapHbFP16Batch,
                     state.workspace.w2Out,
                     dim,
@@ -1849,7 +1785,7 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 scheduler.addWorkerGrid(
                         p + "qkvProj", mmaGrid(paddedBatch, hasOwnKv ? qDim + 2 * kvDim : qDim));
             }
-            if (!nativeProjections && !qkvDirect && !int8Qkv[l]) {
+            if (nativeProjections || (!qkvDirect && !int8Qkv[l])) {
                 scheduler.addWorkerGrid(p + "qDequant", elementwise(qDim * dim, 256));
                 if (hasOwnKv) {
                     scheduler.addWorkerGrid(p + "kDequant", elementwise(kvDim * dim, 256));
@@ -1881,8 +1817,11 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                                         Gemma4AttentionKernels.TC_LANES)
                                 : WorkerGridFactory.genericWorker(
                                         paddedBatch * nHead * HEAD_LOCAL_SIZE, HEAD_LOCAL_SIZE));
-            if (nativeProjections || int8Wo[l]) {
-                // cuBLAS, or recorded with the int8 tasks
+            if (nativeProjections) {
+                // cuBLAS, over the projection decoded into the scratch
+                scheduler.addWorkerGrid(p + "woDequant", elementwise(dim * qDim, 256));
+            } else if (int8Wo[l]) {
+                // recorded with the int8 tasks
             } else if (SPLIT_K) {
                 scheduler.addWorkerGrid(p + "woProj", mmaSplitKGrid(paddedBatch, dim));
                 scheduler.addWorkerGrid(p + "woReduce", reduceWorker);
@@ -1900,16 +1839,20 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             if (!nativeProjections && !int8GateUp[l]) {
                 scheduler.addWorkerGrid(p + "gateUpProj", mmaGrid(paddedBatch, 2 * ffnLen));
             }
-            if (!nativeProjections
-                    && !int8GateUp[l]
-                    && (DEQUANT_GATE_UP || !allQ8(weights.w1Layered[l], weights.w3Layered[l]))) {
+            if (nativeProjections
+                    || !int8GateUp[l]
+                            && (DEQUANT_GATE_UP
+                                    || !allQ8(weights.w1Layered[l], weights.w3Layered[l]))) {
                 WorkerGrid dequantWorker = elementwise(ffnLen * dim, 256);
                 scheduler.addWorkerGrid(p + "gateDequant", dequantWorker);
                 scheduler.addWorkerGrid(p + "upDequant", dequantWorker);
             }
             scheduler.addWorkerGrid(p + "batch_geglu", elementwise(batchSize * ffnLen, 256));
-            if (nativeProjections || int8Down[l]) {
-                // cuBLAS, or recorded with the int8 tasks
+            if (nativeProjections) {
+                // cuBLAS, over the projection decoded into the scratch
+                scheduler.addWorkerGrid(p + "w2Dequant", elementwise(dim * ffnLen, 256));
+            } else if (int8Down[l]) {
+                // recorded with the int8 tasks
             } else if (SPLIT_K) {
                 scheduler.addWorkerGrid(p + "w2Proj", mmaSplitKGrid(paddedBatch, dim));
                 scheduler.addWorkerGrid(p + "w2Reduce", reduceWorker);
