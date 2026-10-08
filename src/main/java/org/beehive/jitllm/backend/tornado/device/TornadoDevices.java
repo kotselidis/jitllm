@@ -58,19 +58,23 @@ public final class TornadoDevices {
                 String platformName = device.getPlatformName();
                 String deviceInfo = "";
                 long maxWorkGroup = 0L;
+                long localMemory = 0L;
                 try {
                     deviceInfo = device.getPhysicalDevice().getDeviceInfo();
                     maxWorkGroup = maxWorkGroupOf(device.getPhysicalDevice());
+                    localMemory =
+                            Math.max(0L, device.getPhysicalDevice().getDeviceLocalMemorySize());
                 } catch (RuntimeException e) {
                     // A device that cannot describe itself gets no architecture-gated grants
-                    // and no known workgroup limit.
+                    // and no known workgroup or local-memory limit.
                 }
                 return new ResolvedDevice(
                         backendId(type),
                         platformName,
                         capabilitiesOf(type, platformName, deviceInfo),
                         TornadoNativeArray.ARRAY_HEADER,
-                        maxWorkGroup);
+                        maxWorkGroup,
+                        localMemory);
             } catch (RuntimeException | LinkageError e) {
                 // No accelerator present. The identity still has to be stable and comparable.
                 // No accelerator: no native-array header either, which is what a caller mapping
@@ -116,8 +120,10 @@ public final class TornadoDevices {
      *       lowered on the other backends as well and its Java body is correct everywhere, so that
      *       half withholds a preference rather than a result; the reduction half does not, and is
      *       why this must never be granted on OpenCL.
-     *   <li><b>split-KV attention</b> — everywhere except Metal, which fails to JIT {@code
-     *       processHeadsFlashAttentionSplitKV}.
+     *   <li><b>split-KV attention</b> — everywhere. Metal used to be left out because the 64-thread
+     *       kernel needs about 33 KB of threadgroup memory and Apple GPUs allow 32 KB, so Metal
+     *       refused to build its pipeline; {@code SplitKvAttentionPolicy} now picks the 32-thread
+     *       kernel on such devices.
      *   <li><b>single-pass RMS</b> — the device half of the scheduler type: an NVIDIA platform.
      *       Elsewhere lowering emits an extra {@code *_rms_finalize} task per block. The model half
      *       of that decision is not a device fact and stays in {@code SchedulerDetectionService}.
@@ -161,9 +167,7 @@ public final class TornadoDevices {
                 capabilities.add(DeviceCapability.PACKED_INTEGER_DOT);
             }
         }
-        if (type != TornadoVMBackendType.METAL) {
-            capabilities.add(DeviceCapability.SPLIT_KV_ATTENTION);
-        }
+        capabilities.add(DeviceCapability.SPLIT_KV_ATTENTION);
         if (name.contains("nvidia") || name.contains("cuda")) {
             capabilities.add(DeviceCapability.SINGLE_PASS_RMS);
         }
@@ -221,7 +225,8 @@ public final class TornadoDevices {
             String displayName,
             DeviceCapabilities capabilities,
             long nativeArrayHeaderBytes,
-            long maxWorkGroupSize)
+            long maxWorkGroupSize,
+            long localMemoryBytes)
             implements Device {
 
         ResolvedDevice(
@@ -234,6 +239,7 @@ public final class TornadoDevices {
                     platformName,
                     capabilities,
                     nativeArrayHeaderBytes,
+                    0L,
                     0L);
         }
 
@@ -242,13 +248,15 @@ public final class TornadoDevices {
                 String platformName,
                 DeviceCapabilities capabilities,
                 long nativeArrayHeaderBytes,
-                long maxWorkGroupSize) {
+                long maxWorkGroupSize,
+                long localMemoryBytes) {
             this(
                     DeviceId.of(backend, platformName),
                     platformName,
                     capabilities,
                     nativeArrayHeaderBytes,
-                    maxWorkGroupSize);
+                    maxWorkGroupSize,
+                    localMemoryBytes);
         }
     }
 }

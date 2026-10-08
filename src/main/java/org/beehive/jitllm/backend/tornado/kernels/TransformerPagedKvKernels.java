@@ -704,6 +704,154 @@ public class TransformerPagedKvKernels {
 
     // @formatter:off
     /**
+     * {@link #processHeadsFlashAttentionSplitKVPaged} in workgroups of 32 threads, for devices
+     * whose local memory cannot hold the 64-thread kernel's per-thread accumulators (34052 bytes):
+     * Apple GPUs allow 32 KB per threadgroup. Only {@code MAX_LOCAL_SIZE} differs (17284 bytes);
+     * the arithmetic and the partial-output layout are the same, so {@code combineSplitKVAttention}
+     * reads it unchanged. A copy rather than a shared helper because TornadoVM cannot pass local
+     * arrays to a callee. Selected by {@code SplitKvAttentionPolicy}.
+     */
+    // @formatter:on
+    public static void processHeadsFlashAttentionSplitKVPaged32(
+            KernelContext context,
+            FloatArray q,
+            FloatArray key_cache,
+            FloatArray value_cache,
+            FloatArray att,
+            int nHeads,
+            int headSize,
+            int kvDim,
+            int kvMul,
+            IntArray positionHolder,
+            int layer,
+            IntArray blockTable,
+            int blockCfg,
+            int blockStride,
+            int nSplits) {
+
+        final int MAX_HEAD_SIZE = 128;
+        final int MAX_LOCAL_SIZE = 32;
+
+        int tid = context.localIdx;
+        int g = context.groupIdx; // 0 .. nHeads*nSplits - 1
+        int localSize = context.localGroupSizeX;
+        int h = g / nSplits;
+        int s = g % nSplits;
+
+        if (h >= nHeads) {
+            return;
+        }
+
+        int pos = positionHolder.get(0);
+        int slot = positionHolder.get(1);
+        int seqLen = pos + 1;
+        int chunk = (seqLen + nSplits - 1) / nSplits;
+        int startPos = s * chunk;
+        int endPos = Math.min(startPos + chunk, seqLen); // exclusive
+
+        int layerOff = KvBlockAddress.layerOffset(layer, kvDim, blockCfg);
+        int kvHeadIdx = h / kvMul;
+        float invSqrt = 1.0f / TornadoMath.sqrt(headSize);
+
+        float[] q_shared = context.allocateFloatLocalArray(MAX_HEAD_SIZE);
+        float[] accShared = context.allocateFloatLocalArray(MAX_LOCAL_SIZE * MAX_HEAD_SIZE);
+        float[] mShared = context.allocateFloatLocalArray(MAX_LOCAL_SIZE);
+        float[] lShared = context.allocateFloatLocalArray(MAX_LOCAL_SIZE);
+        float[] corrShared = context.allocateFloatLocalArray(MAX_LOCAL_SIZE);
+        float[] bcast = context.allocateFloatLocalArray(1);
+
+        // Per-head region within att, COMPACT layout (stride nSplits*(headSize+2)):
+        // [nSplits*headSize partial outputs][nSplits block maxima][nSplits block sums]. A
+        // contextLength stride here would scatter writes at large offsets that TornadoVM fails to
+        // sync between the two tasks.
+        int headBase = h * nSplits * (headSize + 2);
+        int outBase = headBase + s * headSize;
+        int mBase = headBase + nSplits * headSize;
+        int lBase = mBase + nSplits;
+
+        for (int i = tid; i < headSize; i += localSize) {
+            q_shared[i] = q.get(h * headSize + i);
+        }
+        int rowBase = tid * headSize;
+        for (int d = 0; d < headSize; d++) {
+            accShared[rowBase + d] = 0.0f;
+        }
+        context.localBarrier();
+
+        // Strided scan over this split's position chunk (no barriers).
+        float m = Float.NEGATIVE_INFINITY;
+        float l = 0.0f;
+        for (int p = startPos + tid; p < endPos; p += localSize) {
+            int base =
+                    KvBlockAddress.offset(
+                                    blockTable, slot, p, layerOff, kvDim, blockCfg, blockStride)
+                            + kvHeadIdx * headSize;
+            float score = 0.0f;
+            for (int d = 0; d < headSize; d++) {
+                score += q_shared[d] * key_cache.get(base + d);
+            }
+            score *= invSqrt;
+            float newM = Math.max(m, score);
+            float corr = (m == Float.NEGATIVE_INFINITY) ? 0.0f : TornadoMath.exp(m - newM);
+            float e = TornadoMath.exp(score - newM);
+            for (int d = 0; d < headSize; d++) {
+                accShared[rowBase + d] =
+                        accShared[rowBase + d] * corr + e * value_cache.get(base + d);
+            }
+            l = l * corr + e;
+            m = newM;
+        }
+        mShared[tid] = m;
+        lShared[tid] = l;
+        context.localBarrier();
+
+        // Block max.
+        if (tid == 0) {
+            float blockMax = Float.NEGATIVE_INFINITY;
+            for (int t = 0; t < localSize; t++) {
+                if (mShared[t] > blockMax) {
+                    blockMax = mShared[t];
+                }
+            }
+            bcast[0] = blockMax;
+        }
+        context.localBarrier();
+        float M = bcast[0];
+
+        corrShared[tid] =
+                (mShared[tid] == Float.NEGATIVE_INFINITY)
+                        ? 0.0f
+                        : TornadoMath.exp(mShared[tid] - M);
+        context.localBarrier();
+
+        // Block sum L = Σ_t l_t · corr_t.
+        if (tid == 0) {
+            float blockSum = 0.0f;
+            for (int t = 0; t < localSize; t++) {
+                blockSum += lShared[t] * corrShared[t];
+            }
+            bcast[0] = blockSum;
+        }
+        context.localBarrier();
+        float L = bcast[0];
+
+        // Write UNNORMALIZED partial numerator (relative to block max M), plus M and L for the
+        // combine.
+        for (int d = tid; d < headSize; d += localSize) {
+            float acc = 0.0f;
+            for (int t = 0; t < localSize; t++) {
+                acc += corrShared[t] * accShared[t * headSize + d];
+            }
+            att.set(outBase + d, acc); // unnormalized partial numerator (relative to block max M)
+        }
+        if (tid == 0) {
+            att.set(mBase + s, M);
+            att.set(lBase + s, L);
+        }
+    }
+
+    // @formatter:off
+    /**
      * Lane-cooperative split-KV attention for a 128-wide head over an FP16 paged cache.
      *
      * <p>Same mathematics, same paged addressing and the same partial-output layout as {@link

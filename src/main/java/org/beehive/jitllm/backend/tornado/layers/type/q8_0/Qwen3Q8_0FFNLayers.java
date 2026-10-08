@@ -7,6 +7,7 @@ import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
+import org.beehive.jitllm.backend.tornado.scheduling.SplitKvAttentionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.inference.state.Qwen3State;
 import org.beehive.jitllm.inference.state.State;
@@ -42,13 +43,15 @@ public class Qwen3Q8_0FFNLayers
     private final int nEmbdHead;
     private final int nEmbdGqa;
     private final int gqa;
-    // Decode attention is split-KV (flash-decoding) on every backend except Metal, where TornadoVM
-    // fails to JIT the multi-workgroup split-KV kernel; Metal falls back to the
-    // single-workgroup-per-head
-    // online-softmax kernel instead (see SchedulerDetectionService.isMetalBackend). Splits per
-    // head: see State.SPLIT_KV.
-    private final boolean isMetalBackend = SchedulerDetectionService.isMetalBackend();
-    private final int attentionSplits = isMetalBackend ? 1 : State.SPLIT_KV;
+    // Decode attention is split-KV (flash-decoding) wherever the device grants
+    // SPLIT_KV_ATTENTION, which every backend does; a device without it falls back to the
+    // single-workgroup-per-head online-softmax kernel. On a device whose local memory cannot hold
+    // the 64-thread kernel's arrays (Metal), SplitKvAttentionPolicy selects the 32-thread kernel
+    // and fewer splits. Split capacity: see State.SPLIT_KV.
+    private final boolean singleWorkgroupAttention =
+            SchedulerDetectionService.lacksSplitKvAttention();
+    private final int attentionSplits =
+            singleWorkgroupAttention ? 1 : SplitKvAttentionPolicy.splits(State.SPLIT_KV);
     // GEMV reduction strategy: 32-lane warp-shuffle on CUDA, shared-memory trees elsewhere.
     // Warp is
     // faster but the OpenCL backend miscompiles simdShuffleDown, so it is auto-selected by backend.
@@ -87,9 +90,17 @@ public class Qwen3Q8_0FFNLayers
                 WorkerGridFactory.createRoPEWorker(config.numberOfHeads(), nEmbdHead);
         // Split-KV attention launches nHeads*nSplits workgroups, then a combine pass over nHeads
         // workgroups.
+        // The FP32 split-KV kernel's local arrays grow with its workgroup; where 64 threads do
+        // not fit (Metal), the 32-thread kernel runs on 32-thread workgroups.
         WorkerGrid parallelAttentionWorker =
-                WorkerGridFactory.createAttentionWorker(
-                        config.numberOfHeads() * attentionSplits, nEmbdHead);
+                SplitKvAttentionPolicy.narrow() && !useFp16KVCache()
+                        ? WorkerGridFactory.genericWorker(
+                                config.numberOfHeads()
+                                        * attentionSplits
+                                        * SplitKvAttentionPolicy.NARROW_GROUP,
+                                SplitKvAttentionPolicy.NARROW_GROUP)
+                        : WorkerGridFactory.createAttentionWorker(
+                                config.numberOfHeads() * attentionSplits, nEmbdHead);
         WorkerGrid attentionCombineWorker =
                 WorkerGridFactory.createAttentionWorker(config.numberOfHeads(), nEmbdHead);
         // attn_output_proj worker (output projection)
@@ -119,8 +130,8 @@ public class Qwen3Q8_0FFNLayers
             gridScheduler.addWorkerGrid("layer_" + i + ".rope_and_kv_cache", ropeWorker);
             gridScheduler.addWorkerGrid(
                     "layer_" + i + ".attention",
-                    isMetalBackend ? attentionCombineWorker : parallelAttentionWorker);
-            if (!isMetalBackend) {
+                    singleWorkgroupAttention ? attentionCombineWorker : parallelAttentionWorker);
+            if (!singleWorkgroupAttention) {
                 gridScheduler.addWorkerGrid(
                         "layer_" + i + ".attention_combine", attentionCombineWorker);
             }
@@ -300,7 +311,7 @@ public class Qwen3Q8_0FFNLayers
                     state.kvBlockStride); // max sequence length
         }
 
-        if (isMetalBackend) {
+        if (singleWorkgroupAttention) {
             // Metal: single-workgroup-per-head online-softmax attention, writing directly to
             // wrapXb.
             // No combine phase needed (TornadoVM fails to JIT the multi-workgroup split-KV kernel
@@ -349,7 +360,10 @@ public class Qwen3Q8_0FFNLayers
             } else {
                 unifiedLayer.task(
                         "attention",
-                        TransformerPagedKvKernels::processHeadsFlashAttentionSplitKVPaged,
+                        SplitKvAttentionPolicy.narrow()
+                                ? TransformerPagedKvKernels
+                                        ::processHeadsFlashAttentionSplitKVPaged32
+                                : TransformerPagedKvKernels::processHeadsFlashAttentionSplitKVPaged,
                         context,
                         qwen3State.workspace.wrapQ, // query vectors
                         qwen3State.workspace.wrapKeyCache, // key cache

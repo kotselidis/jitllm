@@ -134,9 +134,15 @@ scattered through the layer builders.
 | `SINGLE_PASS_RMS` | single-pass RMS normalization |
 
 A capability that is withheld is withheld deliberately and is a divergence, not a bug:
-`SPLIT_KV_ATTENTION` is not granted to Metal, whose driver refuses to JIT
-`processHeadsFlashAttentionSplitKV`, and `TENSOR_CORE_MMA` is CUDA-only because the MMA
-kernels do not exist elsewhere — the non-MMA sibling is what the other backends run.
+`TENSOR_CORE_MMA` is CUDA-only because the MMA kernels do not exist elsewhere — the non-MMA
+sibling is what the other backends run.
+
+`SPLIT_KV_ATTENTION` is granted everywhere. The FP32 split-KV kernel gives each thread a
+128-float accumulator row in local memory, 34052 bytes for its 64-thread workgroups, and Apple
+GPUs allow 32 KB per threadgroup, so Metal used to refuse its pipeline and the capability was
+withheld. `SplitKvAttentionPolicy` now reads the device's local-memory size and selects
+`processHeadsFlashAttentionSplitKVPaged32`, the same arithmetic in 32-thread workgroups
+(17284 bytes), wherever the 64-thread arrays do not fit.
 
 `PACKED_HALF2_MATH` is withheld on OpenCL. Packed FP16 arithmetic rounds each product to
 FP16 before the FP32 accumulator sees it, once per term; over a 2048-term projection row
@@ -218,7 +224,8 @@ they cost real time otherwise:
   a run to Apple's OpenCL, where a Qwen3 kernel will not compile and healthy numbers look
   like regressions.
 - Metal's kernel selection differs from CUDA/OpenCL only through `SUBGROUP_SHUFFLE_32` and
-  the withheld `SPLIT_KV_ATTENTION`. Nothing else branches on the backend.
+  the device's 32 KB of threadgroup memory, which selects the 32-thread split-KV kernel.
+  Nothing else branches on the backend.
 
 Qwen2 and Qwen3 in F16 once produced fluent-looking token salad on Metal, in every
 execution mode, while exiting 0 and reporting normal throughput; the cause was
