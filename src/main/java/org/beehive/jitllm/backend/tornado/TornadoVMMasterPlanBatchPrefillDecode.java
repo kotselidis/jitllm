@@ -31,7 +31,7 @@ import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
  * </pre>
  */
 // @formatter:on
-public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPlan {
+public class TornadoVMMasterPlanBatchPrefillDecode implements BatchPrefillDecodePlan {
 
     /**
      * Rule 16: library code routes its output through the platform logger, so an embedder can
@@ -241,6 +241,7 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
      * for copying batch embeddings into state before calling this.
      */
     // @formatter:off
+    @Override
     public void tornadoVMForwardBatchPrefill() {
         var batchAct =
                 executionPlan
@@ -267,6 +268,7 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
     }
 
     /** Whether this plan carries a fallback batch-prefill family. */
+    @Override
     public boolean hasBatchPrefillFallback() {
         return taskGraphLayout.fallbackLayerGraphs() > 0;
     }
@@ -277,6 +279,7 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
      * this chunk's embeddings and its start position into state, exactly as for the primary path.
      */
     // @formatter:off
+    @Override
     public void tornadoVMForwardBatchPrefillFallback() {
         var batchAct =
                 executionPlan
