@@ -43,4 +43,16 @@ public final class DeepSeek2PlanProvider implements TornadoPlanProvider {
         DeepSeek2State typed = PlanStates.expect(DeepSeek2State.class, state, ID);
         return new DeepSeek2PlanComponents(typed, model);
     }
+
+    /** A stage's latent cache holds its own layers; the layers address it from the first. */
+    @Override
+    public State stageState(
+            Model model, State session, int firstLayer, int endLayer, int prefillBatchSize) {
+        DeepSeek2State stage =
+                (DeepSeek2State)
+                        TornadoPlanProvider.super.stageState(
+                                model, session, firstLayer, endLayer, prefillBatchSize);
+        stage.cacheFirstLayer = firstLayer;
+        return stage;
+    }
 }

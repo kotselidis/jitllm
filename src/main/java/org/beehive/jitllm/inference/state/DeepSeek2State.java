@@ -184,7 +184,10 @@ public final class DeepSeek2State extends State {
 
     // ── Cache layout ──────────────────────────────────────────────────────────
 
-    /** The first layer this state's device cache holds. */
+    /**
+     * The first layer this state's device cache holds: 0, unless the state is one stage of a model
+     * split across devices, whose provider sets it to the stage's first layer.
+     */
     public int cacheFirstLayer;
 
     /**
@@ -206,9 +209,8 @@ public final class DeepSeek2State extends State {
      */
     // @formatter:on
     private void allocateDeviceWorkspace(DeepSeek2Configuration config) {
-        int first = 0;
-        int end = config.numberOfLayers();
-        this.cacheFirstLayer = first;
+        // A stage of a split holds its own layers only (keyValueLayersForConstruction).
+        int layers = keyValueLayersForConstruction(config.numberOfLayers());
         this.cacheLayerStride = config.contextLength() * config.keyWidth();
         int dim = config.dim();
 
@@ -239,7 +241,7 @@ public final class DeepSeek2State extends State {
                         config.numberOfHeads()
                                 * DeepSeek2Configuration.DECODE_ATTENTION_SPLITS
                                 * (config.kvLoraRank() + 2));
-        int cacheElements = Math.max(1, (end - first) * cacheLayerStride);
+        int cacheElements = Math.max(1, layers * cacheLayerStride);
         if (storageOptions().usesFp16KeyValueCache()) {
             workspace.wrapKeyCacheFP16 = TornadoWorkspaces.halfFloats(cacheElements);
             workspace.wrapValueCacheFP16 = TornadoWorkspaces.halfFloats(1);

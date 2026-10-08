@@ -26,7 +26,8 @@ import org.beehive.jitllm.model.deepseek2.DeepSeek2Configuration;
  * built from the prefill layers this object built, which the plan asks for first.
  */
 // @formatter:on
-public class DeepSeek2PlanComponents implements BatchPrefillDecodeForwardPlanComponents {
+public class DeepSeek2PlanComponents
+        implements BatchPrefillDecodeForwardPlanComponents, StagedForwardPlanComponents {
 
     private final DeepSeek2State state;
     private final DeepSeek2TornadoWeights weights;
@@ -94,10 +95,7 @@ public class DeepSeek2PlanComponents implements BatchPrefillDecodeForwardPlanCom
 
     @Override
     public BatchPrefillTransformerLayerTaskGraphs batchPrefillTransformerLayers(int batchSize) {
-        prefill =
-                new DeepSeek2BatchPrefillLayers(
-                        state, weights, config, batchSize, 0, config.numberOfLayers());
-        return prefill;
+        return batchPrefillTransformerLayers(batchSize, 0, config.numberOfLayers());
     }
 
     /** The decode layers bind the cache from the prefill graphs directly; no pass-through. */
@@ -108,6 +106,35 @@ public class DeepSeek2PlanComponents implements BatchPrefillDecodeForwardPlanCom
 
     @Override
     public TransformerLayerTaskGraphs batchDecodeTransformerLayers() {
+        return batchDecodeTransformerLayers(0, config.numberOfLayers());
+    }
+
+    // ── Pipeline stages ───────────────────────────────────────────────────────
+
+    @Override
+    public TransformerLayerTaskGraphs singleTokenTransformerLayers(int firstLayer, int endLayer) {
+        return new DeepSeek2Layers(
+                "deepseek2",
+                state,
+                weights,
+                config,
+                schedulerType,
+                "activationUpdate",
+                firstLayer,
+                endLayer);
+    }
+
+    @Override
+    public BatchPrefillTransformerLayerTaskGraphs batchPrefillTransformerLayers(
+            int batchSize, int firstLayer, int endLayer) {
+        prefill =
+                new DeepSeek2BatchPrefillLayers(
+                        state, weights, config, batchSize, firstLayer, endLayer);
+        return prefill;
+    }
+
+    @Override
+    public TransformerLayerTaskGraphs batchDecodeTransformerLayers(int firstLayer, int endLayer) {
         if (prefill == null) {
             throw new IllegalStateException(
                     "the deepseek2 batched decode layers are built after the prefill layers");
@@ -119,8 +146,8 @@ public class DeepSeek2PlanComponents implements BatchPrefillDecodeForwardPlanCom
                 config,
                 schedulerType,
                 "decodeActivation",
-                0,
-                config.numberOfLayers(),
+                firstLayer,
+                endLayer,
                 prefill);
     }
 }
