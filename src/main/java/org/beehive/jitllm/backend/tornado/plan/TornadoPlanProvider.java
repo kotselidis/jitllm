@@ -76,10 +76,19 @@ public interface TornadoPlanProvider {
     }
 
     /**
+     * Whether a stage's key/value cache holds the stage's layers only, which layers built with a
+     * range address relative to their first. A family whose layers index their caches and recurrent
+     * state by absolute layer answers false: each stage then keeps the whole model's layout and
+     * uses its own layers' part.
+     */
+    default boolean stageCacheHoldsOnlyItsLayers() {
+        return true;
+    }
+
+    /**
      * A state for one stage of a model split across devices, holding layers {@code [firstLayer,
-     * endLayer)}: the session's storage options and execution policy, and a key/value cache for the
-     * stage's layers only, which is what layers built with a range address. A family whose layers
-     * index the cache by absolute layer overrides this to keep the whole model's layout.
+     * endLayer)}, with the session's storage options and execution policy: see {@link
+     * #stageCacheHoldsOnlyItsLayers}.
      */
     default State stageState(
             Model model, State session, int firstLayer, int endLayer, int prefillBatchSize) {
@@ -90,9 +99,11 @@ public interface TornadoPlanProvider {
                                 State.withPrefillBatchSize(
                                         prefillBatchSize,
                                         () ->
-                                                State.withKeyValueLayers(
-                                                        endLayer - firstLayer,
-                                                        model::createNewState)));
+                                                stageCacheHoldsOnlyItsLayers()
+                                                        ? State.withKeyValueLayers(
+                                                                endLayer - firstLayer,
+                                                                model::createNewState)
+                                                        : model.createNewState()));
         stage.resolveExecutionPolicy(session.executionPolicy());
         return stage;
     }

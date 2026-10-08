@@ -42,4 +42,10 @@ public final class Qwen35MoePlanProvider implements TornadoPlanProvider {
         Qwen35MoeState typed = PlanStates.expect(Qwen35MoeState.class, state, ID);
         return new Qwen35MoePlanComponents(typed, model);
     }
+
+    /** The layers index the caches and recurrent state by absolute layer. */
+    @Override
+    public boolean stageCacheHoldsOnlyItsLayers() {
+        return false;
+    }
 }

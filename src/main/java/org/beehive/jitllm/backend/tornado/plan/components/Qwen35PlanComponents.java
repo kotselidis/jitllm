@@ -9,6 +9,7 @@ import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchFeedForward;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35BatchPrefillLayers;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayers;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersBatchDecode;
+import org.beehive.jitllm.backend.tornado.layers.Qwen35FFNLayersGrouped;
 import org.beehive.jitllm.backend.tornado.layers.Qwen35FeedForward;
 import org.beehive.jitllm.backend.tornado.layers.TransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
@@ -39,7 +40,8 @@ import org.beehive.jitllm.runtime.tensor.DataType;
  * kernels have to scan it in order — but the same decode graphs behind them, reading what those
  * chunks left on the device.
  */
-public class Qwen35PlanComponents implements BatchPrefillDecodeForwardPlanComponents {
+public class Qwen35PlanComponents
+        implements BatchPrefillDecodeForwardPlanComponents, StagedForwardPlanComponents {
 
     private final Qwen35State state;
     private final Qwen35TornadoWeights weights;
@@ -164,5 +166,51 @@ public class Qwen35PlanComponents implements BatchPrefillDecodeForwardPlanCompon
     /** The batched-prefill feed-forward in place of the dense SwiGLU, or {@code null} for it. */
     protected Qwen35BatchFeedForward batchFeedForward(int batchSize) {
         return null;
+    }
+
+    // ── Pipeline stages ───────────────────────────────────────────────────────
+
+    /**
+     * Several layers to a graph: each graph is a launch and a synchronization per token, which is
+     * most of the time between kernels for the mixture-of-experts layers.
+     */
+    @Override
+    public TransformerLayerTaskGraphs singleTokenTransformerLayers(int firstLayer, int endLayer) {
+        return new Qwen35FFNLayersGrouped(
+                "qwen35FFN",
+                state,
+                weights,
+                config,
+                schedulerType,
+                "activationUpdate",
+                firstLayer,
+                endLayer,
+                feedForward());
+    }
+
+    @Override
+    public BatchPrefillTransformerLayerTaskGraphs batchPrefillTransformerLayers(
+            int batchSize, int firstLayer, int endLayer) {
+        return new Qwen35BatchPrefillLayers(
+                state,
+                weights,
+                config,
+                batchSize,
+                firstLayer,
+                endLayer,
+                batchFeedForward(batchSize));
+    }
+
+    @Override
+    public TransformerLayerTaskGraphs batchDecodeTransformerLayers(int firstLayer, int endLayer) {
+        return new Qwen35FFNLayersBatchDecode(
+                "decode",
+                state,
+                weights,
+                config,
+                schedulerType,
+                firstLayer,
+                endLayer,
+                feedForward());
     }
 }
