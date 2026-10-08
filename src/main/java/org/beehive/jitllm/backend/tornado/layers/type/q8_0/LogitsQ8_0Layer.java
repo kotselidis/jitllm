@@ -144,7 +144,7 @@ public class LogitsQ8_0Layer extends AbstractLogitsTaskGraph {
                                 == org.beehive.jitllm.runtime.tensor.DataType.Q4_K
                         || packedQ8_0Vocabulary(weights))
                 && state.workspace.wrapXbQuants != null
-                && org.beehive.jitllm.backend.tornado.device.TornadoDevices.current()
+                && org.beehive.jitllm.backend.tornado.device.TornadoDevices.target()
                         .capabilities()
                         .supports(
                                 org.beehive.jitllm.runtime.backend.DeviceCapability

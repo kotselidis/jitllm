@@ -58,4 +58,12 @@ public interface Device {
     default long nativeArrayHeaderBytes() {
         return 0L;
     }
+
+    /**
+     * How many compute units (streaming multiprocessors) the device runs blocks on, or 0 when
+     * unknown. A GEMM sized in waves of blocks asks this to decide how far to split its reduction.
+     */
+    default int computeUnits() {
+        return 0;
+    }
 }

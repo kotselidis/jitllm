@@ -689,18 +689,10 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
     }
 
     /** Streaming multiprocessors of the device, or 0 where it cannot say. */
-    private static final int SM_COUNT = streamingMultiprocessors();
 
-    private static int streamingMultiprocessors() {
-        try {
-            return uk.ac.manchester.tornado.api.runtime.TornadoRuntimeProvider.getTornadoRuntime()
-                    .getBackend(0)
-                    .getDefaultDevice()
-                    .getPhysicalDevice()
-                    .getDeviceMaxComputeUnits();
-        } catch (RuntimeException | LinkageError e) {
-            return 0;
-        }
+    /** The streaming multiprocessors of the device this plan is built for; 0 when unknown. */
+    private static int smCount() {
+        return org.beehive.jitllm.backend.tornado.device.TornadoDevices.target().computeUnits();
     }
 
     private static final int MAX_GEMM_SPLITS = 8;
@@ -711,7 +703,7 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
      * splits K into, so that its 128 x 128 tiles fill the device's multiprocessors.
      *
      * <p>A tile is one block, and a block takes a multiprocessor to itself (its registers allow no
-     * second one), so a GEMM runs in waves of {@code SM_COUNT} tiles and its time is the number of
+     * second one), so a GEMM runs in waves of {@link #smCount} tiles and its time is the number of
      * waves times the rounds each tile runs. On the A10's 72 multiprocessors the 5,120-wide
      * projections have 80 tiles at a 256-row chunk: two waves, the second eight tiles long. Split
      * in {@code s}, a GEMM has {@code s} times the tiles, each running {@code 1/s} of the rounds.
@@ -720,16 +712,17 @@ public class Qwen35BatchPrefillLayers implements BatchPrefillTransformerLayerTas
      */
     // @formatter:on
     private int gemmSplits(int outputs, int k) {
-        if (SM_COUNT <= 0) {
+        int sms = smCount();
+        if (sms <= 0) {
             return 1;
         }
         int tiles = (batchSize / GEMM_TILE) * (outputs / GEMM_TILE);
         int rounds = k / Int8GemmKernels.I8_BK;
-        long unsplit = (long) ((tiles + SM_COUNT - 1) / SM_COUNT) * rounds;
+        long unsplit = (long) ((tiles + sms - 1) / sms) * rounds;
         int best = 1;
         long bestCost = unsplit;
         for (int splits = 2; splits <= MAX_GEMM_SPLITS && splits <= rounds; splits++) {
-            long waves = ((long) tiles * splits + SM_COUNT - 1) / SM_COUNT;
+            long waves = ((long) tiles * splits + sms - 1) / sms;
             long cost = waves * ((rounds + splits - 1) / splits);
             if (cost < bestCost) {
                 best = splits;

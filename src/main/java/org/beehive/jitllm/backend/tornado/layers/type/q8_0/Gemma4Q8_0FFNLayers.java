@@ -223,7 +223,7 @@ public class Gemma4Q8_0FFNLayers
                 .equalsIgnoreCase(System.getProperty("jitllm.gemma4.packedIntegerDot", "true"))) {
             return false;
         }
-        return org.beehive.jitllm.backend.tornado.device.TornadoDevices.current()
+        return org.beehive.jitllm.backend.tornado.device.TornadoDevices.target()
                 .capabilities()
                 .supports(org.beehive.jitllm.runtime.backend.DeviceCapability.PACKED_INTEGER_DOT);
     }

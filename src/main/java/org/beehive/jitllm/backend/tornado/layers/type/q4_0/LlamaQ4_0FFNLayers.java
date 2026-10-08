@@ -133,7 +133,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
             state.workspace.packedRepack.upload(unifiedLayer, layerWeights);
         }
         unifiedLayer = configureLayerDataTransfers(unifiedLayer, layerIndex);
-        if (DP4A) {
+        if (dp4a()) {
             Object[] packed = {
                 state.workspace.wrapXbQuants,
                 state.workspace.wrapXbScales,
@@ -173,7 +173,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 weights.rms_att_weightLayered[layerIndex].asFloatArray(),
                 state.workspace.temp);
 
-        if (DP4A) {
+        if (dp4a()) {
             // Three packed projections reading the one activation the apply quantized.
             packedProjection(
                     unifiedLayer,
@@ -222,7 +222,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
 
         configureAttention(unifiedLayer, layerIndex);
 
-        if (DP4A) {
+        if (dp4a()) {
             // The attention output is a new activation: quantized fresh for the output projection.
             quantize(unifiedLayer, "attn_out_quantize", state.workspace.wrapXb);
             packedResidualProjection(
@@ -273,7 +273,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                 weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
                 state.workspace.tempFFN);
 
-        if (DP4A && weights.w1Layered[layerIndex].isPackedQ4()) {
+        if (dp4a() && weights.w1Layered[layerIndex].isPackedQ4()) {
             unifiedLayer.task(
                     "ffn_gate_up",
                     TransformerComputeKernelsQ4_0Packed::fusedFFNGateUpSiLUQ4_0Packed,
@@ -285,7 +285,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
                     weights.w3Layered[layerIndex].asByteArray(),
                     config.dim(),
                     config.hiddenDim());
-        } else if (DP4A) {
+        } else if (dp4a()) {
             unifiedLayer.task(
                     "ffn_gate_up",
                     TransformerComputeKernelsQ4_0::fusedFFNGateUpSiLUQ4_0DP4A,
@@ -314,7 +314,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
         }
 
         boolean q4_1Down = weights.w2Layered[layerIndex].dataType() == DataType.Q4_1;
-        if (DP4A) {
+        if (dp4a()) {
             // SwiGLU's output, quantized fresh for the down projection.
             quantize(unifiedLayer, "ffn_down_quantize", state.workspace.wrapHb);
             packedResidualProjection(
@@ -360,15 +360,15 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
      * on CUDA, granted where the device lowers {@code dp4a}.
      */
     // @formatter:on
-    private static final boolean DP4A =
-            org.beehive.jitllm.backend.tornado.device.TornadoDevices.current()
-                    .capabilities()
-                    .supports(
-                            org.beehive.jitllm.runtime.backend.DeviceCapability.PACKED_INTEGER_DOT);
+    private static boolean dp4a() {
+        return org.beehive.jitllm.backend.tornado.device.TornadoDevices.target()
+                .capabilities()
+                .supports(org.beehive.jitllm.runtime.backend.DeviceCapability.PACKED_INTEGER_DOT);
+    }
 
     /** The norm's apply; on the packed path it also quantizes its output for the projections. */
     private void rmsApply(TaskGraph graph, String name, FloatArray rmsWeights, FloatArray temp) {
-        if (DP4A) {
+        if (dp4a()) {
             graph.task(
                     name,
                     TransformerComputeKernelsQ4_0::rmsApplyAndQuantizeActivationQ8Blocks,
@@ -532,7 +532,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
         WorkerGrid parallelAttentionWorker = attentionWorker();
 
         for (int i = firstLayer; i < endLayer(config.numberOfLayers()); i++) {
-            if (DP4A) {
+            if (dp4a()) {
                 String layer = "layer_" + i + ".";
                 tornadoForwardScheduler.addWorkerGrid(layer + "attn_rms_reduce", rmsReduceWorker);
                 tornadoForwardScheduler.addWorkerGrid(

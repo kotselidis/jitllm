@@ -741,32 +741,24 @@ public class LlamaQ4_0LayersBatchPrefillNative implements BatchPrefillTransforme
 
     private static final int SPLITS_MAX = 8;
 
-    private static final int SM_COUNT = streamingMultiprocessors();
-
-    private static int streamingMultiprocessors() {
-        try {
-            return uk.ac.manchester.tornado.api.runtime.TornadoRuntimeProvider.getTornadoRuntime()
-                    .getBackend(0)
-                    .getDefaultDevice()
-                    .getPhysicalDevice()
-                    .getDeviceMaxComputeUnits();
-        } catch (RuntimeException | LinkageError e) {
-            return 0;
-        }
+    /** The streaming multiprocessors of the device this plan is built for; 0 when unknown. */
+    private static int smCount() {
+        return org.beehive.jitllm.backend.tornado.device.TornadoDevices.target().computeUnits();
     }
 
     /** K splits that best fill the device with 128 x 128 tiles, as the other int8 prefills. */
     private int gemmSplits(int outputs, int k) {
-        if (SM_COUNT <= 0) {
+        int sms = smCount();
+        if (sms <= 0) {
             return 1;
         }
         int tiles = (batchSize / Int8GemmKernels.I8_BM) * (outputs / Int8GemmKernels.I8_BN);
         int rounds = k / Int8GemmKernels.I8_BK;
-        long unsplit = (long) ((tiles + SM_COUNT - 1) / SM_COUNT) * rounds;
+        long unsplit = (long) ((tiles + sms - 1) / sms) * rounds;
         int best = 1;
         long bestCost = unsplit;
         for (int splits = 2; splits <= SPLITS_MAX && splits <= rounds; splits++) {
-            long waves = ((long) tiles * splits + SM_COUNT - 1) / SM_COUNT;
+            long waves = ((long) tiles * splits + sms - 1) / sms;
             long cost = waves * ((rounds + splits - 1) / splits);
             if (cost < bestCost) {
                 best = splits;

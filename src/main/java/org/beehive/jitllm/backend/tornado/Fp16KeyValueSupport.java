@@ -199,7 +199,7 @@ public final class Fp16KeyValueSupport {
 
     /** Whether the current device is NVIDIA-class, whatever the model. */
     public static boolean nvidiaDevice() {
-        return TornadoDevices.current()
+        return TornadoDevices.target()
                 .capabilities()
                 .supports(org.beehive.jitllm.runtime.backend.DeviceCapability.SINGLE_PASS_RMS);
     }

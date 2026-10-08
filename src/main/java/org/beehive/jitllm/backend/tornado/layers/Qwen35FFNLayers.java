@@ -192,7 +192,7 @@ public class Qwen35FFNLayers
             int endLayer,
             Qwen35FeedForward feedForward) {
         super(taskGraphName, state, weights, config, schedulerType);
-        if (feedForward != null && !DP4A) {
+        if (feedForward != null && !dp4a()) {
             throw new UnsupportedOperationException(
                     "this feed-forward reads a quantized activation, which needs a device with"
                             + " packed integer dot products");
@@ -924,8 +924,8 @@ public class Qwen35FFNLayers
                 "attn_rms_apply",
                 qwen35State.workspace.temp,
                 require(weights.rms_att_weightLayered, layerIndex, "attn_norm"),
-                DP4A);
-        normedActivationQuantized = DP4A;
+                dp4a());
+        normedActivationQuantized = dp4a();
 
         if (config.isRecurrentLayer(layerIndex)) {
             deltaNetBranch(layer, layerIndex);
@@ -949,8 +949,8 @@ public class Qwen35FFNLayers
                 "ffn_rms_apply",
                 qwen35State.workspace.tempFFN,
                 require(weights.rms_ffn_weightLayered, layerIndex, "post_attention_norm"),
-                DP4A);
-        if (DP4A) {
+                dp4a());
+        if (dp4a()) {
             normedActivationQuantized = true;
         }
 
@@ -982,7 +982,7 @@ public class Qwen35FFNLayers
                 require(weights.w3Layered, layerIndex, "ffn_up"),
                 qwen35State.workspace.wrapXb);
         hiddenActivationQuantized = false;
-        if (DP4A) {
+        if (dp4a()) {
             // SwiGLU's output, quantized fresh. It is neither of the activations quantized
             // earlier in this layer, and the scratch it shares with them is sized for it.
             layer.task(
@@ -1027,7 +1027,7 @@ public class Qwen35FFNLayers
      */
     // @formatter:on
     private int attentionSplits() {
-        var device = org.beehive.jitllm.backend.tornado.device.TornadoDevices.current();
+        var device = org.beehive.jitllm.backend.tornado.device.TornadoDevices.target();
         boolean eligible =
                 fp16Kv()
                         && config.headSize() == SPLIT_KV_MAX_HEAD
@@ -1150,7 +1150,7 @@ public class Qwen35FFNLayers
 
     private DeltaRuleGeometry deltaRuleGeometry() {
         return selectDeltaRuleGeometry(
-                config.headValueDim(), deltaRuleWorkGroupLimit(TornadoDevices.current()));
+                config.headValueDim(), deltaRuleWorkGroupLimit(TornadoDevices.target()));
     }
 
     // @formatter:off
@@ -1299,18 +1299,19 @@ public class Qwen35FFNLayers
      * not, at 0/63 argmax disagreements and token-identical greedy output over 120 tokens.
      */
     // @formatter:on
-    private static final boolean DP4A =
-            TornadoDevices.current()
-                            .capabilities()
-                            .supports(
-                                    org.beehive.jitllm.runtime.backend.DeviceCapability
-                                            .PACKED_INTEGER_DOT)
-                    // The escape hatch is for the tests whose subject is addressing rather than
-                    // arithmetic: they compare the device against the host exactly, which a
-                    // quantized activation cannot do. Not a user option, and not a CLI flag.
-                    && !"false"
-                            .equalsIgnoreCase(
-                                    System.getProperty("jitllm.qwen35.packedIntegerDot", "true"));
+    private static boolean dp4a() {
+        return TornadoDevices.target()
+                        .capabilities()
+                        .supports(
+                                org.beehive.jitllm.runtime.backend.DeviceCapability
+                                        .PACKED_INTEGER_DOT)
+                // The escape hatch is for the tests whose subject is addressing rather than
+                // arithmetic: they compare the device against the host exactly, which a
+                // quantized activation cannot do. Not a user option, and not a CLI flag.
+                && !"false"
+                        .equalsIgnoreCase(
+                                System.getProperty("jitllm.qwen35.packedIntegerDot", "true"));
+    }
 
     /**
      * Whether {@code wrapSsmOut} holds the activation {@code ssm_out_quantize} quantized.
@@ -1787,7 +1788,7 @@ public class Qwen35FFNLayers
         }
 
         ssmActivationQuantized = false;
-        if (DP4A && packedScratchHolds(config.deltaNetValueDim())) {
+        if (dp4a() && packedScratchHolds(config.deltaNetValueDim())) {
             // The delta-net readout, quantized fresh. It is none of the activations quantized
             // elsewhere in this layer, and it reuses their scratch: every projection that read
             // those is behind us in this graph, and the arrays are sized for the feed-forward's
@@ -1913,7 +1914,7 @@ public class Qwen35FFNLayers
                     qwen35State.workspace.wrapAtt,
                     qwen35State.workspace.wrapAttSplit,
                     qwen35State.workspace.wrapHb);
-            if (DP4A) {
+            if (dp4a()) {
                 layer.transferToDevice(
                         DataTransferMode.FIRST_EXECUTION,
                         qwen35State.workspace.wrapXbQuants,
@@ -1959,7 +1960,7 @@ public class Qwen35FFNLayers
                     qwen35State.workspace.wrapHb,
                     qwen35State.workspace.positionHolder);
             layer.consumeFromDevice(predecessor, qwen35State.workspace.wrapBlockTable);
-            if (DP4A) {
+            if (dp4a()) {
                 layer.consumeFromDevice(
                         predecessor,
                         qwen35State.workspace.wrapXbQuants,
@@ -2061,7 +2062,7 @@ public class Qwen35FFNLayers
             }
             // Where the apply carries the quantization it takes the quantization's grid: one
             // 32-lane workgroup per block, which is the ownership the block maximum needs.
-            if (DP4A) {
+            if (dp4a()) {
                 scheduler.addWorkerGrid(
                         prefix + "attn_rms_apply",
                         WorkerGridFactory.genericWorker(config.dim(), 32));
@@ -2092,7 +2093,7 @@ public class Qwen35FFNLayers
                 scheduler.addWorkerGrid(
                         prefix + "ssm_gate_proj",
                         projWorker(layer, "ssm_gate_proj", config.deltaNetValueDim()));
-                if (DP4A && packedScratchHolds(config.deltaNetValueDim())) {
+                if (dp4a() && packedScratchHolds(config.deltaNetValueDim())) {
                     scheduler.addWorkerGrid(
                             prefix + "ssm_out_quantize",
                             WorkerGridFactory.genericWorker(config.deltaNetValueDim(), 32));

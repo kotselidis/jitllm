@@ -65,7 +65,7 @@ public final class LaneAttentionPolicy {
      */
     public static boolean laneCooperativeAttention(int headSize) {
         return headSize == SUPPORTED_HEAD_SIZE
-                && TornadoDevices.current()
+                && TornadoDevices.target()
                         .capabilities()
                         .supports(DeviceCapability.SHUFFLE_REDUCED_FP16_GEMV);
     }
