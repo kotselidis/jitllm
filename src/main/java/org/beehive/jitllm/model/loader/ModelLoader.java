@@ -516,15 +516,15 @@ public abstract class ModelLoader {
     }
 
     /**
-     * Q4_0 projection packing ({@code -Djitllm.q4.packed=true}) for the loaders whose layer graphs
-     * read packed Q4_0 tiles: each retained Q4_0 projection whose shape packs is recorded as
-     * packed, and repacked on the GPU once uploaded (see {@link PackedTiles}). A projection of
-     * another type — the Q4_1 {@code ffn_down} of some layers, a materialized trunk — is left as it
-     * is.
+     * Q4_0 projection packing, when {@code pack} ({@link PackedWeights#packQ4}), for the loaders
+     * whose layer graphs read packed Q4_0 tiles: each retained Q4_0 projection whose shape packs is
+     * recorded as packed, and repacked on the GPU once uploaded (see {@link PackedTiles}). A
+     * projection of another type — the Q4_1 {@code ffn_down} of some layers, a materialized trunk —
+     * is left as it is.
      */
     public static TornadoTensor[] packQ4(
             TornadoTensor[] tensors, IntFunction<GGMLTensorEntry> entries, boolean pack) {
-        if (!pack || !PackedWeights.Q4_ENABLED) {
+        if (!pack) {
             return tensors;
         }
         for (int i = 0; i < tensors.length; i++) {

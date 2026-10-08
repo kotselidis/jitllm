@@ -526,17 +526,17 @@ public class Qwen35ModelLoader extends AbstractModelLoader<Qwen35, Qwen35Configu
 
     /**
      * A trunk projection: {@link #deviceTensor}, marked packed for the tile-layout kernels, and
-     * repacked on the GPU once uploaded (see {@link PackedTiles}), when {@code
-     * -Djitllm.q8.packed=true} (or {@code -Djitllm.q4.packed=true}) and it is a Q8_0 (Q4_0) weight
-     * whose shape packs (see {@link PackedWeights}).
+     * repacked on the GPU once uploaded (see {@link PackedTiles}), when it is a Q8_0 or Q4_0 weight
+     * whose shape packs and packing is on for this load ({@link PackedWeights}): every qwen35 path
+     * reads packed tiles.
      */
     private static TornadoTensor projectionTensor(
             Map<String, GGMLTensorEntry> entries, String name) {
         TornadoTensor tensor = deviceTensor(entries, name);
         GGMLTensorEntry entry = entries.get(name);
         int[] shape = entry.shape();
-        boolean q8 = PackedWeights.Q8_ENABLED && entry.ggmlType() == GGMLType.Q8_0;
-        boolean q4 = PackedWeights.Q4_ENABLED && entry.ggmlType() == GGMLType.Q4_0;
+        boolean q8 = entry.ggmlType() == GGMLType.Q8_0 && PackedWeights.packQ8(true);
+        boolean q4 = entry.ggmlType() == GGMLType.Q4_0 && PackedWeights.packQ4(true);
         if (!(q8 || q4) || shape.length != 2) {
             return tensor;
         }

@@ -5,6 +5,7 @@ import static org.beehive.jitllm.model.loader.ModelLoader.*;
 import java.nio.channels.FileChannel;
 import java.util.Map;
 import org.beehive.jitllm.auxiliary.Pair;
+import org.beehive.jitllm.backend.tornado.tensor.PackedWeights;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensorLoader;
 import org.beehive.jitllm.format.DataTypeMapping;
 import org.beehive.jitllm.format.GGMLTensorEntry;
@@ -141,6 +142,7 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
         // too, when they are tied — as Q6_K, so the output weight alone would say Q8_0 and select
         // the wrong plan.
         boolean retainQ4_0 = RETAIN_Q4_0 && allQ4_0(tensorEntries, nl);
+        boolean pack = retainQ4_0 && PackedWeights.packQ4(true);
         if (retainQ4_0) {
             weightType = DataType.Q4_0;
         }
@@ -166,28 +168,28 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
                                         nl,
                                         i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
                                 i -> tensorEntries.get("blk." + i + ".attn_q.weight"),
-                                retainQ4_0),
+                                pack),
                         packQ4(
                                 perLayerQuantized(
                                         retainQ4_0,
                                         nl,
                                         i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
                                 i -> tensorEntries.get("blk." + i + ".attn_k.weight"),
-                                retainQ4_0),
+                                pack),
                         packQ4(
                                 perLayerQuantized(
                                         retainQ4_0,
                                         nl,
                                         i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
                                 i -> tensorEntries.get("blk." + i + ".attn_v.weight"),
-                                retainQ4_0),
+                                pack),
                         packQ4(
                                 perLayerQuantized(
                                         retainQ4_0,
                                         nl,
                                         i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
                                 i -> tensorEntries.get("blk." + i + ".attn_output.weight"),
-                                retainQ4_0),
+                                pack),
                         loadArrayOfTornadoTensors(
                                 nl,
                                 i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")), // fp32
@@ -197,7 +199,7 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
                                         nl,
                                         i -> tensorEntries.get("blk." + i + ".ffn_gate.weight")),
                                 i -> tensorEntries.get("blk." + i + ".ffn_gate.weight"),
-                                retainQ4_0),
+                                pack),
                         // ffn_down keeps its own type: llama.cpp's Q4_0 recipe writes some layers'
                         // down
                         // projection as Q4_1, and the layer graph picks the kernel per layer.
@@ -214,14 +216,14 @@ public class LlamaModelLoader extends AbstractModelLoader<Llama, LlamaConfigurat
                                                         tensorEntries.get(
                                                                 "blk." + i + ".ffn_down.weight")),
                                 i -> tensorEntries.get("blk." + i + ".ffn_down.weight"),
-                                retainQ4_0),
+                                pack),
                         packQ4(
                                 perLayerQuantized(
                                         retainQ4_0,
                                         nl,
                                         i -> tensorEntries.get("blk." + i + ".ffn_up.weight")),
                                 i -> tensorEntries.get("blk." + i + ".ffn_up.weight"),
-                                retainQ4_0),
+                                pack),
                         loadTornadoTensor(tensorEntries.get("output_norm.weight")), // fp32
                         TornadoTensorLoader.fromFloats(ropeFreqs.first()),
                         TornadoTensorLoader.fromFloats(ropeFreqs.second()),
