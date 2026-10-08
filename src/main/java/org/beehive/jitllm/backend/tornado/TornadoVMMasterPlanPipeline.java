@@ -479,6 +479,9 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             transport.executeToken(plans, null, TornadoVMMasterPlan.CUDA_GRAPHS);
         }
         State last = stages[stages.length - 1].state();
+        // A token sampled on the device is in the last stage's state; the loop reads the
+        // session's.
+        state.workspace.sampledToken.set(0, last.workspace.sampledToken.get(0));
         return last.workspace.wrapLogits;
     }
 
