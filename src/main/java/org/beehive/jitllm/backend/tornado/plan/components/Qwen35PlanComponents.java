@@ -13,12 +13,14 @@ import org.beehive.jitllm.backend.tornado.layers.Qwen35FeedForward;
 import org.beehive.jitllm.backend.tornado.layers.TransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.LogitsQ8_0Layer;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillActivation;
+import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillQ8DeviceActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.inference.state.Qwen35State;
 import org.beehive.jitllm.inference.weights.tornado.Qwen35TornadoWeights;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.model.qwen35.Qwen35Configuration;
+import org.beehive.jitllm.runtime.tensor.DataType;
 
 /**
  * The {@code qwen35} single-token plan: an activation graph, one graph per trunk layer, and a
@@ -107,13 +109,18 @@ public class Qwen35PlanComponents implements BatchPrefillDecodeForwardPlanCompon
     /**
      * The chunk's activation.
      *
-     * <p>The host decodes the chunk's embedding rows straight into the FP32 batch carrier — a Q4_0
-     * row is 18 bytes per 32 weights and there is no batched device conversion for it — so this
-     * graph transfers that carrier and runs the shared pass-through, which exists to give TornadoVM
-     * a task to attach the transfer to.
+     * <p>A Q8_0 or Q4_0 embedding is decoded on the device: the host copies each token's raw row,
+     * which costs nothing next to decoding the chunk in Java before the JIT has compiled that loop.
+     * Any other embedding the host decodes straight into the FP32 batch carrier, and this graph
+     * transfers it and runs the shared pass-through, which exists to give TornadoVM a task to
+     * attach the transfer to.
      */
     @Override
     public ActivationTaskGraph batchPrefillActivation(int batchSize) {
+        DataType embedding = weights.getTokenEmbeddingTable().dataType();
+        if (embedding == DataType.Q8_0 || embedding == DataType.Q4_0) {
+            return new BatchPrefillQ8DeviceActivation(state, config, batchSize, embedding);
+        }
         return new BatchPrefillActivation(state, config, batchSize, true);
     }
 
