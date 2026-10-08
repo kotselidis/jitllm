@@ -223,6 +223,11 @@ public final class TornadoVMMasterPlanPipeline implements BatchPrefillDecodePlan
             List<ImmutableTaskGraph> graphs,
             GridScheduler scheduler) {
         if (s == 0) {
+            // The host stages a chunk the device does not decode in the session's carrier, which
+            // the first stage then reads.
+            if (state.workspace.wrapXBatch != null) {
+                stageState.workspace.wrapXBatch = state.workspace.wrapXBatch;
+            }
             add(whole.batchPrefillActivation(batchSize), graphs, scheduler);
             // The host stages each chunk in the session's state: its raw embedding rows where the
             // activation decodes them on the device, otherwise its decoded rows.

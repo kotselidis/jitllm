@@ -80,4 +80,25 @@ public final class Gemma4PlanProvider implements TornadoPlanProvider {
                             "gemma4 has no plan components for " + weights);
         };
     }
+
+    /**
+     * A stage's key/value cache holds its own layers, at offsets the layers read from the state.
+     */
+    @Override
+    public State stageState(
+            Model model, State session, int firstLayer, int endLayer, int prefillBatchSize) {
+        State stage =
+                State.withStorageOptions(
+                        session.storageOptions(),
+                        () ->
+                                State.withPrefillBatchSize(
+                                        prefillBatchSize,
+                                        () ->
+                                                Gemma4State.withLayerRange(
+                                                        firstLayer,
+                                                        endLayer,
+                                                        model::createNewState)));
+        stage.resolveExecutionPolicy(session.executionPolicy());
+        return stage;
+    }
 }
