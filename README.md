@@ -274,7 +274,8 @@ A model too large for one GPU can be split by layers across several, like llama.
 `--split-mode layer`. Each GPU holds a contiguous range of layers with their weights and
 key/value cache, and only the hidden state moves between GPUs, once per token. For one
 request at a time this adds memory, not speed. Llama-family models with Q4_0 or Q8_0 layers
-are supported.
+are supported, and so are Qwen3.5 (`qwen35`, e.g. Qwen3.8-27B) and its mixture-of-experts
+models (`qwen35moe`, e.g. Qwen3.6-35B-A3B), Gemma 4 31B and GLM-4.7-Flash (`deepseek2`).
 
 ```bash
 ./jitllm run --gpu --cuda --devices 0:0,0:1 --tensor-split 41,39 --gpu-memory 21GB \
@@ -295,6 +296,10 @@ For Q4_0 models the prompt can be prefilled in chunks on every device as well: a
 `--batch-prefill-size 256 --with-native-libraries` (each device runs its layers on the whole
 chunk, then hands the chunk's hidden states to the next one). The chunks overlap: the first
 device starts the next chunk while the next device still works on the previous one.
+Qwen3.5, Gemma 4 and GLM-4.7-Flash models split the same way with `--batch-prefill-size 256`
+alone: their projections run as int8 tensor-core GEMMs straight on the Q8_0 weights. A
+mixture-of-experts model routes each token to its top experts on the GPU, and a prefill chunk's
+tokens are grouped by expert so every expert's rows run as one GEMM.
 
 ## Run configuration at startup
 
