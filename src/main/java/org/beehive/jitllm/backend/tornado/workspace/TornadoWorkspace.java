@@ -185,6 +185,36 @@ public final class TornadoWorkspace {
     /** The query half of an attention layer's fused query/gate projection, de-interleaved. */
     public FloatArray wrapAttnQ;
 
+    /** A {@code deepseek2} token's compressed query, before its norm and {@code attn_q_b}. */
+    public FloatArray wrapQueryLatent;
+
+    /** {@code attn_kv_a_mqa}'s output: the latent, then the rotated key. */
+    public FloatArray wrapCompressedKv;
+
+    /** Every head's query absorbed into the latent space, then its rotated part. */
+    public FloatArray wrapAbsorbedQuery;
+
+    /** Every head's attended latent, before {@code attn_v_b}. */
+    public FloatArray wrapLatentOut;
+
+    // A deepseek2 chunk's buffers (see DeepSeek2BatchKernels): the projections' outputs, the
+    // latent attention's (token, head) rows and their FP16 copies, and the dense feed-forward's.
+    public FloatArray queryLatentBatch;
+    public FloatArray compressedKvBatch;
+    public FloatArray queryBatch;
+    public HalfFloatArray queryF16Batch;
+    public FloatArray absorbedBatch;
+    public HalfFloatArray absorbedF16Batch;
+    public HalfFloatArray keysF16;
+    public HalfFloatArray latentTF16;
+    public FloatArray scoresBatch;
+    public HalfFloatArray probsF16Batch;
+    public FloatArray latentBatch;
+    public HalfFloatArray latentF16Batch;
+    public FloatArray attnOutBatch;
+    public FloatArray gateBatch;
+    public FloatArray hiddenBatch;
+
     /** Its gate half, applied through a logistic to the attention result. */
     public FloatArray wrapAttnGate;
 

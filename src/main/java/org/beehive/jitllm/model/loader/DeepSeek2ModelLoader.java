@@ -5,6 +5,8 @@ import static org.beehive.jitllm.tokenizer.Vocabulary.fromTokens;
 import java.nio.channels.FileChannel;
 import java.util.Map;
 import org.beehive.jitllm.auxiliary.Pair;
+import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
+import org.beehive.jitllm.backend.tornado.tensor.TornadoTensorLoader;
 import org.beehive.jitllm.format.DataTypeMapping;
 import org.beehive.jitllm.format.GGMLTensorEntry;
 import org.beehive.jitllm.format.GGMLType;
@@ -12,6 +14,7 @@ import org.beehive.jitllm.format.GGUF;
 import org.beehive.jitllm.inference.weights.DeepSeek2LayerWeights;
 import org.beehive.jitllm.inference.weights.Weights;
 import org.beehive.jitllm.inference.weights.standard.DeepSeek2StandardWeights;
+import org.beehive.jitllm.inference.weights.tornado.DeepSeek2TornadoWeights;
 import org.beehive.jitllm.model.deepseek2.DeepSeek2;
 import org.beehive.jitllm.model.deepseek2.DeepSeek2Configuration;
 import org.beehive.jitllm.model.format.Glm4ChatFormat;
@@ -176,7 +179,30 @@ public class DeepSeek2ModelLoader extends AbstractModelLoader<DeepSeek2, DeepSee
             Pair<float[], float[]> ropeFreqs,
             GGMLTensorEntry tokenEmbeddings,
             GGMLTensorEntry outputWeight) {
-        throw new UnsupportedOperationException("deepseek2 has no accelerator path yet");
+        DeepSeek2LayerWeights<TornadoTensor> layers =
+                layerWeights(
+                        config,
+                        tensorEntries,
+                        new TornadoTensor[0],
+                        DeepSeek2ModelLoader::deviceTensor);
+        return new DeepSeek2TornadoWeights(
+                deviceTensor(tokenEmbeddings),
+                layers,
+                deviceTensor(required(tensorEntries, "output_norm.weight")),
+                deviceTensor(outputWeight),
+                TornadoTensorLoader.fromFloats(ropeFreqs.first()),
+                TornadoTensorLoader.fromFloats(ropeFreqs.second()),
+                DataTypeMapping.sourceType(
+                        required(tensorEntries, "blk.0.attn_q_a.weight").ggmlType()));
+    }
+
+    /** A device tensor in the file's representation. Q5_0 has no device decoder here. */
+    static TornadoTensor deviceTensor(GGMLTensorEntry entry) {
+        if (entry.ggmlType() == GGMLType.Q5_0) {
+            throw new UnsupportedOperationException(
+                    "deepseek2 on the accelerator does not read Q5_0 tensors yet");
+        }
+        return ModelLoader.loadTornadoTensorNative(entry);
     }
 
     /** A host tensor, Q5_0 rewritten as Q8_0. */

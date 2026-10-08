@@ -56,6 +56,13 @@ public final class BatchPrefillSupport {
                                             + " OpenCL backend (TornadoVM OpenCL code generation"
                                             + " fails with 'logic node (LogicConstantNode)')")
                             : Optional.empty();
+            case "deepseek2" ->
+                    BackendId.CUDA.equals(c.backend()) && c.tensorCores()
+                            ? Optional.empty()
+                            : Optional.of(
+                                    "the deepseek2 batched prefill runs its projections and"
+                                            + " attention on CUDA tensor cores, which this device"
+                                            + " does not have");
             default -> Optional.empty();
         };
     }
