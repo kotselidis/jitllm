@@ -14,6 +14,7 @@ import org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LogitsQ8_0Laye
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.prefill.LlamaQ8_0LayersBatchPrefill;
 import org.beehive.jitllm.backend.tornado.layers.type.q8_0.prefill.LlamaQ8_0LayersBatchPrefillMMA;
 import org.beehive.jitllm.backend.tornado.plan.components.BatchPrefillDecodeForwardPlanComponents;
+import org.beehive.jitllm.backend.tornado.plan.components.StagedForwardPlanComponents;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchDecodeActivation;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillActivation;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
@@ -29,7 +30,8 @@ import org.beehive.jitllm.model.llama.LlamaConfiguration;
  * <p>Batch embedding prep: CPU dequantizes Q8_0 embeddings into {@code wrapXBatch} (FP32). Decode
  * embedding prep: raw Q8_0 block copy into {@code embeddingX} for on-device conversion.
  */
-public class LlamaQ8_0PlanComponents implements BatchPrefillDecodeForwardPlanComponents {
+public class LlamaQ8_0PlanComponents
+        implements BatchPrefillDecodeForwardPlanComponents, StagedForwardPlanComponents {
 
     private static final int BLOCK_SIZE = 32;
     private static final int Q8_0_BLOCK_BYTES = 34;
@@ -73,6 +75,13 @@ public class LlamaQ8_0PlanComponents implements BatchPrefillDecodeForwardPlanCom
     @Override
     public TransformerLayerTaskGraphs singleTokenTransformerLayers() {
         return new LlamaQ8_0FFNLayers("llamaFFN", state, weights, config, schedulerType);
+    }
+
+    /** One stage's layers; the batched prefill of this representation is not split. */
+    @Override
+    public TransformerLayerTaskGraphs singleTokenTransformerLayers(int firstLayer, int endLayer) {
+        return new LlamaQ8_0FFNLayers(
+                "llamaFFN", state, weights, config, schedulerType, firstLayer, endLayer);
     }
 
     @Override

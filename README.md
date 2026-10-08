@@ -268,6 +268,34 @@ consuming the budget before changing anything.
 
 -----------
 
+### Several GPUs
+
+A model too large for one GPU can be split by layers across several, like llama.cpp's
+`--split-mode layer`. Each GPU holds a contiguous range of layers with their weights and
+key/value cache, and only the hidden state moves between GPUs, once per token. For one
+request at a time this adds memory, not speed. Llama-family models with Q4_0 or Q8_0 layers
+are supported.
+
+```bash
+./jitllm run --gpu --cuda --devices 0:0,0:1 --tensor-split 41,39 --gpu-memory 21GB \
+  -m Llama-3.3-70B-Instruct-Q4_0.gguf -c 2048 --prompt "Why is the sky blue?"
+```
+
+- `--devices` lists TornadoVM `backend:device` indices, one pipeline stage per device.
+  `--gpu-memory` applies to each device.
+- `--tensor-split` gives each device's share of the layers (default: equal). Give the last
+  device a little less: it also holds the output projection.
+- `--split-transport nccl` (default) sends the hidden state GPU to GPU with NCCL. It needs a
+  TornadoVM SDK with `tornado-nccl`, libnccl on `LD_LIBRARY_PATH`, and jitllm built with
+  `-Pnccl`. `--split-transport host` copies through host memory and needs neither.
+
+Llama-3.3-70B Q4_0 (40 GB) runs this way on two 24 GB NVIDIA A10s at about 10 tokens/s.
+
+For Q4_0 models the prompt can be prefilled in chunks on every device as well: add
+`--batch-prefill-size 256 --with-native-libraries` (each device runs its layers on the whole
+chunk, then hands the chunk's hidden states to the next one). The chunks overlap: the first
+device starts the next chunk while the next device still works on the previous one.
+
 ## Run configuration at startup
 
 With `-v` / `--verbose`, the CLI prints an aligned summary to **stderr**, after preparing the session and before
