@@ -149,13 +149,38 @@ public class TransformerComputeKernelsLayered {
         float scale = rmsScale.get(0);
         int rowOffset = rowId * dim;
 
-        float sum1 = 0.0f;
-        float sum3 = 0.0f;
-        for (int j = localId; j < dim; j += 32) {
-            float normalized = rmsWeights.get(j) * scale * x.get(j);
-            sum1 += w1.get(rowOffset + j).getFloat32() * normalized;
-            sum3 += w3.get(rowOffset + j).getFloat32() * normalized;
+        float sum1a = 0.0f;
+        float sum1b = 0.0f;
+        float sum1c = 0.0f;
+        float sum1d = 0.0f;
+        float sum3a = 0.0f;
+        float sum3b = 0.0f;
+        float sum3c = 0.0f;
+        float sum3d = 0.0f;
+        // Four independent loads per matrix in flight per lane, then the tail of a row that is not
+        // a multiple of 128 wide.
+        int j = localId;
+        for (; j + 96 < dim; j += 128) {
+            float na = rmsWeights.get(j) * scale * x.get(j);
+            float nb = rmsWeights.get(j + 32) * scale * x.get(j + 32);
+            float nc = rmsWeights.get(j + 64) * scale * x.get(j + 64);
+            float nd = rmsWeights.get(j + 96) * scale * x.get(j + 96);
+            sum1a += w1.get(rowOffset + j).getFloat32() * na;
+            sum1b += w1.get(rowOffset + j + 32).getFloat32() * nb;
+            sum1c += w1.get(rowOffset + j + 64).getFloat32() * nc;
+            sum1d += w1.get(rowOffset + j + 96).getFloat32() * nd;
+            sum3a += w3.get(rowOffset + j).getFloat32() * na;
+            sum3b += w3.get(rowOffset + j + 32).getFloat32() * nb;
+            sum3c += w3.get(rowOffset + j + 64).getFloat32() * nc;
+            sum3d += w3.get(rowOffset + j + 96).getFloat32() * nd;
         }
+        for (; j < dim; j += 32) {
+            float normalized = rmsWeights.get(j) * scale * x.get(j);
+            sum1a += w1.get(rowOffset + j).getFloat32() * normalized;
+            sum3a += w3.get(rowOffset + j).getFloat32() * normalized;
+        }
+        float sum1 = (sum1a + sum1b) + (sum1c + sum1d);
+        float sum3 = (sum3a + sum3b) + (sum3c + sum3d);
 
         sum1 += context.simdShuffleDown(sum1, 16);
         sum1 += context.simdShuffleDown(sum1, 8);
@@ -1109,10 +1134,23 @@ public class TransformerComputeKernelsLayered {
         }
 
         int rowOffset = rowId * n;
-        float partialSum = 0.0f;
-        for (int j = localId; j < n; j += 32) {
-            partialSum += w.get(rowOffset + j).getFloat32() * x.get(j).getFloat32();
+        float partialSum0 = 0.0f;
+        float partialSum1 = 0.0f;
+        float partialSum2 = 0.0f;
+        float partialSum3 = 0.0f;
+        // Four independent loads in flight per lane, then the tail of a row that is not a
+        // multiple of 128 wide.
+        int j = localId;
+        for (; j + 96 < n; j += 128) {
+            partialSum0 += w.get(rowOffset + j).getFloat32() * x.get(j).getFloat32();
+            partialSum1 += w.get(rowOffset + j + 32).getFloat32() * x.get(j + 32).getFloat32();
+            partialSum2 += w.get(rowOffset + j + 64).getFloat32() * x.get(j + 64).getFloat32();
+            partialSum3 += w.get(rowOffset + j + 96).getFloat32() * x.get(j + 96).getFloat32();
         }
+        for (; j < n; j += 32) {
+            partialSum0 += w.get(rowOffset + j).getFloat32() * x.get(j).getFloat32();
+        }
+        float partialSum = (partialSum0 + partialSum1) + (partialSum2 + partialSum3);
 
         partialSum += context.simdShuffleDown(partialSum, 16);
         partialSum += context.simdShuffleDown(partialSum, 8);
@@ -1180,10 +1218,23 @@ public class TransformerComputeKernelsLayered {
         }
 
         int rowOffset = rowId * n;
-        float partialSum = 0.0f;
-        for (int j = localId; j < n; j += 32) {
-            partialSum += w.get(rowOffset + j).getFloat32() * x.get(j);
+        float partialSum0 = 0.0f;
+        float partialSum1 = 0.0f;
+        float partialSum2 = 0.0f;
+        float partialSum3 = 0.0f;
+        // Four independent loads in flight per lane, then the tail of a row that is not a
+        // multiple of 128 wide.
+        int j = localId;
+        for (; j + 96 < n; j += 128) {
+            partialSum0 += w.get(rowOffset + j).getFloat32() * x.get(j);
+            partialSum1 += w.get(rowOffset + j + 32).getFloat32() * x.get(j + 32);
+            partialSum2 += w.get(rowOffset + j + 64).getFloat32() * x.get(j + 64);
+            partialSum3 += w.get(rowOffset + j + 96).getFloat32() * x.get(j + 96);
         }
+        for (; j < n; j += 32) {
+            partialSum0 += w.get(rowOffset + j).getFloat32() * x.get(j);
+        }
+        float partialSum = (partialSum0 + partialSum1) + (partialSum2 + partialSum3);
 
         partialSum += context.simdShuffleDown(partialSum, 16);
         partialSum += context.simdShuffleDown(partialSum, 8);

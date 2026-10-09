@@ -368,11 +368,31 @@ public class Qwen3Kernels {
         // partial across control flow, which produced incorrect PTX for the shuffle.
         if (rowId < qDim) {
             int rowOffset = rowId * inputDim;
-            float partialSum = 0.0f;
-            for (int j = localId; j < inputDim; j += 32) {
-                partialSum +=
+            float partialSum0 = 0.0f;
+            float partialSum1 = 0.0f;
+            float partialSum2 = 0.0f;
+            float partialSum3 = 0.0f;
+            // Four independent loads in flight per lane, then the tail of a row that is not a
+            // multiple of 128 wide.
+            int j = localId;
+            for (; j + 96 < inputDim; j += 128) {
+                partialSum0 +=
+                        wq.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
+                partialSum1 +=
+                        wq.get(rowOffset + j + 32).getFloat32()
+                                * (rmsWeights.get(j + 32) * scale * x.get(j + 32));
+                partialSum2 +=
+                        wq.get(rowOffset + j + 64).getFloat32()
+                                * (rmsWeights.get(j + 64) * scale * x.get(j + 64));
+                partialSum3 +=
+                        wq.get(rowOffset + j + 96).getFloat32()
+                                * (rmsWeights.get(j + 96) * scale * x.get(j + 96));
+            }
+            for (; j < inputDim; j += 32) {
+                partialSum0 +=
                         wq.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
             }
+            float partialSum = (partialSum0 + partialSum1) + (partialSum2 + partialSum3);
             partialSum += context.simdShuffleDown(partialSum, 16);
             partialSum += context.simdShuffleDown(partialSum, 8);
             partialSum += context.simdShuffleDown(partialSum, 4);
@@ -384,11 +404,31 @@ public class Qwen3Kernels {
         } else if (rowId < qDim + kvDim) {
             int kRow = rowId - qDim;
             int rowOffset = kRow * inputDim;
-            float partialSum = 0.0f;
-            for (int j = localId; j < inputDim; j += 32) {
-                partialSum +=
+            float partialSum0 = 0.0f;
+            float partialSum1 = 0.0f;
+            float partialSum2 = 0.0f;
+            float partialSum3 = 0.0f;
+            // Four independent loads in flight per lane, then the tail of a row that is not a
+            // multiple of 128 wide.
+            int j = localId;
+            for (; j + 96 < inputDim; j += 128) {
+                partialSum0 +=
+                        wk.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
+                partialSum1 +=
+                        wk.get(rowOffset + j + 32).getFloat32()
+                                * (rmsWeights.get(j + 32) * scale * x.get(j + 32));
+                partialSum2 +=
+                        wk.get(rowOffset + j + 64).getFloat32()
+                                * (rmsWeights.get(j + 64) * scale * x.get(j + 64));
+                partialSum3 +=
+                        wk.get(rowOffset + j + 96).getFloat32()
+                                * (rmsWeights.get(j + 96) * scale * x.get(j + 96));
+            }
+            for (; j < inputDim; j += 32) {
+                partialSum0 +=
                         wk.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
             }
+            float partialSum = (partialSum0 + partialSum1) + (partialSum2 + partialSum3);
             partialSum += context.simdShuffleDown(partialSum, 16);
             partialSum += context.simdShuffleDown(partialSum, 8);
             partialSum += context.simdShuffleDown(partialSum, 4);
@@ -400,11 +440,31 @@ public class Qwen3Kernels {
         } else if (rowId < qDim + 2 * kvDim) {
             int vRow = rowId - qDim - kvDim;
             int rowOffset = vRow * inputDim;
-            float partialSum = 0.0f;
-            for (int j = localId; j < inputDim; j += 32) {
-                partialSum +=
+            float partialSum0 = 0.0f;
+            float partialSum1 = 0.0f;
+            float partialSum2 = 0.0f;
+            float partialSum3 = 0.0f;
+            // Four independent loads in flight per lane, then the tail of a row that is not a
+            // multiple of 128 wide.
+            int j = localId;
+            for (; j + 96 < inputDim; j += 128) {
+                partialSum0 +=
+                        wv.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
+                partialSum1 +=
+                        wv.get(rowOffset + j + 32).getFloat32()
+                                * (rmsWeights.get(j + 32) * scale * x.get(j + 32));
+                partialSum2 +=
+                        wv.get(rowOffset + j + 64).getFloat32()
+                                * (rmsWeights.get(j + 64) * scale * x.get(j + 64));
+                partialSum3 +=
+                        wv.get(rowOffset + j + 96).getFloat32()
+                                * (rmsWeights.get(j + 96) * scale * x.get(j + 96));
+            }
+            for (; j < inputDim; j += 32) {
+                partialSum0 +=
                         wv.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
             }
+            float partialSum = (partialSum0 + partialSum1) + (partialSum2 + partialSum3);
             partialSum += context.simdShuffleDown(partialSum, 16);
             partialSum += context.simdShuffleDown(partialSum, 8);
             partialSum += context.simdShuffleDown(partialSum, 4);
