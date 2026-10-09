@@ -111,6 +111,11 @@ public interface TornadoVMMasterPlan {
         // ran the legacy path however the flag was set: a paired A/B taken through the script was
         // measuring legacy against legacy. `handles` answers false unless the opt-in is set and the
         // tuple is the one the slice implements, so this costs a boolean read otherwise.
+        // Opt-in, and refused by name when the session is not one it implements.
+        if (TornadoVMMasterPlanMegakernel.requested()) {
+            reportPath(org.beehive.jitllm.runtime.backend.ExecutionPath.LEGACY, model, state);
+            return new TornadoVMMasterPlanMegakernel(state, model, sink);
+        }
         if (org.beehive.jitllm.backend.tornado.lowering.LoweredPlanSelection.handles(
                 model, state)) {
             reportPath(org.beehive.jitllm.runtime.backend.ExecutionPath.LOWERED, model, state);
