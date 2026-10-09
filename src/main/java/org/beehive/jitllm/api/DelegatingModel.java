@@ -499,7 +499,9 @@ final class DelegatingModel implements TextGenerationModel {
             org.beehive.jitllm.model.Model delegate,
             org.beehive.jitllm.runtime.kv.KvLease lease,
             ExecutionPolicy policy) {
+        // The megakernel is built by the legacy plan factory; the lowered path would bypass it.
         if (!gpu
+                || org.beehive.jitllm.backend.tornado.TornadoVMMasterPlanMegakernel.requested()
                 || !org.beehive.jitllm.backend.tornado.lowering.LoweredPlanSelection.mayHandle(
                         delegate, executionPolicy)) {
             return new LegacySessionRuntime(delegate, lease, policy, storageOptions);

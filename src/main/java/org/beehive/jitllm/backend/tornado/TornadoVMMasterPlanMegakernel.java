@@ -66,7 +66,7 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
     public final TornadoExecutionPlan executionPlan;
 
     /** Whether the opt-in is set; {@link #requireSupported} then decides whether it can run. */
-    static boolean requested() {
+    public static boolean requested() {
         return Boolean.getBoolean(PROPERTY);
     }
 
