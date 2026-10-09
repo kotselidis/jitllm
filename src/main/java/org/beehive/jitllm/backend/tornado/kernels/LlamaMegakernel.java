@@ -44,20 +44,20 @@ public final class LlamaMegakernel {
     /** The widest residual stream a block can hold in shared memory. */
     public static final int MAX_DIM = 4096;
 
+    /**
+     * Floats of the shared vector: the normalised residual, the attention output, or the FFN hidden
+     * vector when {@code hiddenDim} fits, so the down projection reads it from shared memory too.
+     */
+    public static final int VEC_SIZE = 8192;
+
+    /** Halves of a row prefetched ahead of a phase: 4 KB, 32 lines of 128 bytes. */
+    private static final int PREFETCH_HALVES = 2048;
+
     /** The widest head: four values per lane. */
     public static final int MAX_HEAD_SIZE = 128;
 
     private static final int WARPS = BLOCK_SIZE / 32;
     private static final int HEAD_VALUES_PER_LANE = MAX_HEAD_SIZE / 32;
-
-    /** Weight halves a warp streams per stage: 32 lanes of one 16-byte copy each. */
-    public static final int CHUNK = 256;
-
-    /** Copies in flight per lane. */
-    private static final int STAGES = 4;
-
-    /** Ints per ring stage of one warp: 32 lanes of four. */
-    private static final int RING_STAGE = 128;
 
     // Layout of the meta array.
     public static final int META_DIM = 0;
@@ -71,13 +71,21 @@ public final class LlamaMegakernel {
     public static final int META_KV_BLOCK_CFG = 8;
     public static final int META_KV_BLOCK_STRIDE = 9;
     public static final int META_SPLITS = 10;
-    public static final int META_SIZE = 11;
+
+    /** 1 to pick the greedy token in the kernel ({@code sampledToken}), 0 to only write logits. */
+    public static final int META_DEVICE_SAMPLE = 11;
+
+    public static final int META_SIZE = 12;
 
     private LlamaMegakernel() {}
 
-    /** Floats of scratch the kernel needs: Q, the FFN hidden vector, the attention partials. */
-    public static int scratchSize(int dim, int hiddenDim, int heads, int headSize, int splits) {
-        return dim + hiddenDim + heads * splits * (headSize + 2);
+    /**
+     * Floats of scratch the kernel needs: Q, the FFN hidden vector, the attention partials, and one
+     * (logit, index) pair per warp for the in-kernel argmax.
+     */
+    public static int scratchSize(
+            int dim, int hiddenDim, int heads, int headSize, int splits, int blocks) {
+        return dim + hiddenDim + heads * splits * (headSize + 2) + 2 * blocks * WARPS;
     }
 
     /**
@@ -108,7 +116,8 @@ public final class LlamaMegakernel {
             IntArray positionHolder,
             IntArray blockTable,
             IntArray meta,
-            FloatArray logits) {
+            FloatArray logits,
+            IntArray sampledToken) {
         int tid = context.localIdx;
         int lane = tid % 32;
         int warp = tid / 32;
@@ -116,14 +125,12 @@ public final class LlamaMegakernel {
         int block = context.groupIdx;
         int globalWarp = block * WARPS + warp;
         int totalWarps = blocks * WARPS;
-        int ringBase = warp * STAGES * RING_STAGE + lane * 4;
 
-        float[] vec = context.allocateFloatLocalArray(MAX_DIM);
+        float[] vec = context.allocateFloatLocalArray(VEC_SIZE);
         float[] reduce = context.allocateFloatLocalArray(WARPS);
         float[] mergeMax = context.allocateFloatLocalArray(WARPS);
         float[] mergeSum = context.allocateFloatLocalArray(WARPS);
         float[] mergeAcc = context.allocateFloatLocalArray(WARPS * MAX_HEAD_SIZE);
-        int[] ring = context.allocateIntLocalArray(WARPS * STAGES * RING_STAGE);
         float[] acc = new float[HEAD_VALUES_PER_LANE];
 
         int dim = meta.get(META_DIM);
@@ -152,6 +159,9 @@ public final class LlamaMegakernel {
         for (int i = context.globalIdx; i < dim; i += context.globalGroupSizeX) {
             x.set(i, embedding.get(i).getFloat32());
         }
+        if (globalWarp < qkvRows / 2) {
+            prefetchRow(context, wqkv, 2 * globalWarp * dim, 2 * dim, lane);
+        }
         context.gridBarrier();
 
         for (int l = 0; l < layers; l++) {
@@ -165,8 +175,8 @@ public final class LlamaMegakernel {
             for (int p = globalWarp; p < qkvRows / 2; p += totalWarps) {
                 int row = 2 * p;
                 int rowOff = (l * qkvRows + row) * dim;
-                float s0 = dotShared(context, ring, ringBase, wqkv, rowOff, vec, dim, lane);
-                float s1 = dotShared(context, ring, ringBase, wqkv, rowOff + dim, vec, dim, lane);
+                float s0 = dotShared(context, wqkv, rowOff, vec, dim, lane);
+                float s1 = dotShared(context, wqkv, rowOff + dim, vec, dim, lane);
                 if (lane == 0) {
                     if (row < dim + kvDim) {
                         int idx = row < dim ? row : row - dim;
@@ -185,6 +195,9 @@ public final class LlamaMegakernel {
                         valueCache.setHalf2(cacheOff + row - dim - kvDim, Half2.fromFloats(s0, s1));
                     }
                 }
+            }
+            if (globalWarp < dim) {
+                prefetchRow(context, wo, (l * dim + globalWarp) * dim, dim, lane);
             }
             context.gridBarrier();
 
@@ -267,6 +280,9 @@ public final class LlamaMegakernel {
                 }
                 context.localBarrier();
             }
+            if (globalWarp + totalWarps < dim) {
+                prefetchRow(context, wo, (l * dim + globalWarp + totalWarps) * dim, dim, lane);
+            }
             context.gridBarrier();
 
             // 3. Combine the splits into vec, then the output projection and the residual.
@@ -292,10 +308,14 @@ public final class LlamaMegakernel {
             }
             context.localBarrier();
             for (int row = globalWarp; row < dim; row += totalWarps) {
-                float s = dotShared(context, ring, ringBase, wo, (l * dim + row) * dim, vec, dim, lane);
+                float s = dotShared(context, wo, (l * dim + row) * dim, vec, dim, lane);
                 if (lane == 0) {
                     x.set(row, x.get(row) + s);
                 }
+            }
+            if (globalWarp < hiddenDim) {
+                prefetchRow(context, w1, (l * hiddenDim + globalWarp) * dim, dim, lane);
+                prefetchRow(context, w3, (l * hiddenDim + globalWarp) * dim, dim, lane);
             }
             context.gridBarrier();
 
@@ -303,37 +323,113 @@ public final class LlamaMegakernel {
             normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp);
             for (int row = globalWarp; row < hiddenDim; row += totalWarps) {
                 int rowOff = (l * hiddenDim + row) * dim;
-                float gate = dotShared(context, ring, ringBase, w1, rowOff, vec, dim, lane);
-                float up = dotShared(context, ring, ringBase, w3, rowOff, vec, dim, lane);
+                float gate = dotShared(context, w1, rowOff, vec, dim, lane);
+                float up = dotShared(context, w3, rowOff, vec, dim, lane);
                 if (lane == 0) {
                     scratch.set(hbOff + row, gate / (1.0f + TornadoMath.exp(-gate)) * up);
                 }
             }
+            if (globalWarp < dim) {
+                prefetchRow(context, w2, (l * dim + globalWarp) * hiddenDim, hiddenDim, lane);
+            }
             context.gridBarrier();
 
-            // 5. Down projection and the residual.
-            for (int row = globalWarp; row < dim; row += totalWarps) {
-                float s =
-                        dotGlobal(context, ring, ringBase,
-                                w2,
-                                (l * dim + row) * hiddenDim,
-                                scratch,
-                                hbOff,
-                                hiddenDim,
-                                lane);
-                if (lane == 0) {
-                    x.set(row, x.get(row) + s);
+            // 5. Down projection and the residual, against the hidden vector in shared memory
+            // when it fits.
+            if (hiddenDim <= VEC_SIZE) {
+                for (int i = tid; i < hiddenDim; i += BLOCK_SIZE) {
+                    vec[i] = scratch.get(hbOff + i);
                 }
+                context.localBarrier();
+                for (int row = globalWarp; row < dim; row += totalWarps) {
+                    float s =
+                            dotShared(
+                                    context, w2, (l * dim + row) * hiddenDim, vec, hiddenDim, lane);
+                    if (lane == 0) {
+                        x.set(row, x.get(row) + s);
+                    }
+                }
+            } else {
+                for (int row = globalWarp; row < dim; row += totalWarps) {
+                    float s =
+                            dotGlobal(
+                                    context,
+                                    w2,
+                                    (l * dim + row) * hiddenDim,
+                                    scratch,
+                                    hbOff,
+                                    hiddenDim,
+                                    lane);
+                    if (lane == 0) {
+                        x.set(row, x.get(row) + s);
+                    }
+                }
+            }
+            if (l + 1 < layers) {
+                if (globalWarp < qkvRows / 2) {
+                    prefetchRow(
+                            context,
+                            wqkv,
+                            ((l + 1) * qkvRows + 2 * globalWarp) * dim,
+                            2 * dim,
+                            lane);
+                }
+            } else if (globalWarp < vocabulary) {
+                prefetchRow(context, wcls, globalWarp * dim, dim, lane);
             }
             context.gridBarrier();
         }
 
-        // Final norm and the vocabulary projection. No barrier after: nothing reads it in-kernel.
+        // Final norm and the vocabulary projection. Each warp keeps the best of its rows, the
+        // first one on a tie, as the host's greedy argmax does.
         normalize(context, x, norms, 2 * layers * dim, dim, eps, vec, reduce, tid, warp);
+        float best = Float.NEGATIVE_INFINITY;
+        int bestRow = 0;
         for (int row = globalWarp; row < vocabulary; row += totalWarps) {
-            float s = dotShared(context, ring, ringBase, wcls, row * dim, vec, dim, lane);
+            float s = dotShared(context, wcls, row * dim, vec, dim, lane);
             if (lane == 0) {
                 logits.set(row, s);
+                if (s > best) {
+                    best = s;
+                    bestRow = row;
+                }
+            }
+        }
+
+        // Greedy sampling on the device: the per-warp bests, one barrier, then block 0 reduces
+        // them, so the host reads one token instead of the vocabulary-sized logits.
+        if (meta.get(META_DEVICE_SAMPLE) != 0) {
+            int argOff = attOff + heads * splits * partStride;
+            if (lane == 0) {
+                scratch.set(argOff + 2 * globalWarp, best);
+                scratch.set(argOff + 2 * globalWarp + 1, bestRow);
+            }
+            context.gridBarrier();
+            if (block == 0) {
+                float value = Float.NEGATIVE_INFINITY;
+                float index = vocabulary;
+                for (int w = tid; w < totalWarps; w += BLOCK_SIZE) {
+                    float v = scratch.get(argOff + 2 * w);
+                    float r = scratch.get(argOff + 2 * w + 1);
+                    if (v > value || (v == value && r < index)) {
+                        value = v;
+                        index = r;
+                    }
+                }
+                vec[tid] = value;
+                vec[BLOCK_SIZE + tid] = index;
+                context.localBarrier();
+                if (tid == 0) {
+                    for (int t = 1; t < BLOCK_SIZE; t++) {
+                        float v = vec[t];
+                        float r = vec[BLOCK_SIZE + t];
+                        if (v > value || (v == value && r < index)) {
+                            value = v;
+                            index = r;
+                        }
+                    }
+                    sampledToken.set(0, (int) index);
+                }
             }
         }
     }
@@ -374,84 +470,86 @@ public final class LlamaMegakernel {
     }
 
     /**
+     * Prefetches into L2 the first 4 KB of a row this warp will stream next, one 128-byte line per
+     * lane. Called just before a grid barrier: the next phase's first loads then hit L2 instead of
+     * waiting on DRAM while every warp starts at once.
+     */
+    private static void prefetchRow(
+            KernelContext context, HalfFloatArray w, int rowOff, int n, int lane) {
+        int limit = Math.min(n, PREFETCH_HALVES);
+        for (int k = lane * 64; k < limit; k += 32 * 64) {
+            context.prefetchToL2(w, rowOff + k);
+        }
+    }
+
+    /**
      * One warp's dot product of an F16 row with the shared vector; every lane gets the sum.
      *
-     * <p>The row streams through the warp's ring in shared memory with 16-byte {@code cp.async}
-     * copies, {@link #STAGES} deep: each lane copies, and later reads back, only its own eight
-     * halves per chunk, so no lane waits on another and a single {@code cp.async.wait_group}
-     * orders each read after its copy. {@code n} must be a multiple of {@link #CHUNK}.
+     * <p>Instruction-bound, not bandwidth-bound, at one warp per row and eight warps per SM: each
+     * half takes a conversion and an FMA, and nothing else should. Every product goes into its own
+     * accumulator, {@code s = s + a * b}, which contracts to one FFMA; {@code s += a * b + c * d}
+     * would cost an FMUL, an FFMA and an FADD per pair.
      */
     private static float dotShared(
-            KernelContext context,
-            int[] ring,
-            int ringBase,
-            HalfFloatArray w,
-            int rowOff,
-            float[] vec,
-            int n,
-            int lane) {
-        int chunks = n / CHUNK;
-        int laneOff = lane * 8;
-        for (int s = 0; s < STAGES - 1; s++) {
-            if (s < chunks) {
-                context.asyncCopyToLocal16(ring, ringBase + s * RING_STAGE, w, rowOff + s * CHUNK + laneOff);
-            }
-            context.asyncCopyCommit();
+            KernelContext context, HalfFloatArray w, int rowOff, float[] vec, int n, int lane) {
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        float s3 = 0.0f;
+        float s4 = 0.0f;
+        float s5 = 0.0f;
+        float s6 = 0.0f;
+        float s7 = 0.0f;
+        int j = 2 * lane;
+        for (; j < n - 192; j += 256) {
+            Half2 p0 = w.getHalf2(rowOff + j);
+            Half2 p1 = w.getHalf2(rowOff + j + 64);
+            Half2 p2 = w.getHalf2(rowOff + j + 128);
+            Half2 p3 = w.getHalf2(rowOff + j + 192);
+            s0 += Half2.lowFloat(p0) * vec[j];
+            s1 += Half2.highFloat(p0) * vec[j + 1];
+            s2 += Half2.lowFloat(p1) * vec[j + 64];
+            s3 += Half2.highFloat(p1) * vec[j + 65];
+            s4 += Half2.lowFloat(p2) * vec[j + 128];
+            s5 += Half2.highFloat(p2) * vec[j + 129];
+            s6 += Half2.lowFloat(p3) * vec[j + 192];
+            s7 += Half2.highFloat(p3) * vec[j + 193];
         }
-        float sum = 0.0f;
-        for (int c = 0; c < chunks; c++) {
-            int next = c + STAGES - 1;
-            if (next < chunks) {
-                context.asyncCopyToLocal16(ring, ringBase + (next % STAGES) * RING_STAGE, w, rowOff + next * CHUNK + laneOff);
-            }
-            context.asyncCopyCommit();
-            context.asyncCopyWaitGroup(STAGES - 1);
-            int slot = ringBase + (c % STAGES) * RING_STAGE;
-            int j = c * CHUNK + laneOff;
-            for (int k = 0; k < 4; k++) {
-                int bits = ring[slot + k];
-                sum += Float.float16ToFloat((short) (bits & 0xFFFF)) * vec[j + 2 * k]
-                        + Float.float16ToFloat((short) (bits >>> 16)) * vec[j + 2 * k + 1];
-            }
+        for (; j < n; j += 64) {
+            Half2 p = w.getHalf2(rowOff + j);
+            s0 += Half2.lowFloat(p) * vec[j];
+            s1 += Half2.highFloat(p) * vec[j + 1];
         }
-        return context.simdSum(sum);
+        return context.simdSum(((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7)));
     }
 
     /** As {@link #dotShared}, against a vector in global memory. */
     private static float dotGlobal(
             KernelContext context,
-            int[] ring,
-            int ringBase,
             HalfFloatArray w,
             int rowOff,
             FloatArray v,
             int vOff,
             int n,
             int lane) {
-        int chunks = n / CHUNK;
-        int laneOff = lane * 8;
-        for (int s = 0; s < STAGES - 1; s++) {
-            if (s < chunks) {
-                context.asyncCopyToLocal16(ring, ringBase + s * RING_STAGE, w, rowOff + s * CHUNK + laneOff);
-            }
-            context.asyncCopyCommit();
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        float s3 = 0.0f;
+        int j = 2 * lane;
+        for (; j < n - 64; j += 128) {
+            Half2 p0 = w.getHalf2(rowOff + j);
+            Half2 p1 = w.getHalf2(rowOff + j + 64);
+            s0 += Half2.lowFloat(p0) * v.get(vOff + j);
+            s1 += Half2.highFloat(p0) * v.get(vOff + j + 1);
+            s2 += Half2.lowFloat(p1) * v.get(vOff + j + 64);
+            s3 += Half2.highFloat(p1) * v.get(vOff + j + 65);
         }
-        float sum = 0.0f;
-        for (int c = 0; c < chunks; c++) {
-            int next = c + STAGES - 1;
-            if (next < chunks) {
-                context.asyncCopyToLocal16(ring, ringBase + (next % STAGES) * RING_STAGE, w, rowOff + next * CHUNK + laneOff);
-            }
-            context.asyncCopyCommit();
-            context.asyncCopyWaitGroup(STAGES - 1);
-            int slot = ringBase + (c % STAGES) * RING_STAGE;
-            int j = vOff + c * CHUNK + laneOff;
-            for (int k = 0; k < 4; k++) {
-                int bits = ring[slot + k];
-                sum += Float.float16ToFloat((short) (bits & 0xFFFF)) * v.get(j + 2 * k)
-                        + Float.float16ToFloat((short) (bits >>> 16)) * v.get(j + 2 * k + 1);
-            }
+        for (; j < n; j += 64) {
+            Half2 p = w.getHalf2(rowOff + j);
+            s0 += Half2.lowFloat(p) * v.get(vOff + j);
+            s1 += Half2.highFloat(p) * v.get(vOff + j + 1);
         }
-        return context.simdSum(sum);
+        return context.simdSum((s0 + s1) + (s2 + s3));
     }
 }

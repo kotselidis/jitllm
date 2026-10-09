@@ -109,11 +109,8 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
                             + " is not a multiple of 32 up to "
                             + LlamaMegakernel.MAX_HEAD_SIZE);
         }
-        if (c.kvDim() % 2 != 0) {
-            reasons.add("kvDim must be even");
-        }
-        if (c.dim() % LlamaMegakernel.CHUNK != 0 || c.hiddenDim() % LlamaMegakernel.CHUNK != 0) {
-            reasons.add("dim and hiddenDim must be multiples of " + LlamaMegakernel.CHUNK + " (one 16-byte copy per lane per stage)");
+        if (c.dim() % 2 != 0 || c.kvDim() % 2 != 0 || c.hiddenDim() % 2 != 0) {
+            reasons.add("dim, kvDim and hiddenDim must be even");
         }
         if (!reasons.isEmpty()) {
             throw new IllegalStateException(
@@ -139,7 +136,10 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
                         .getPhysicalDevice()
                         .getDeviceMaxComputeUnits();
         this.blocksPerSM = Integer.getInteger(PROPERTY + ".blocksPerSM", 1);
-        this.blocks = multiprocessors * blocksPerSM;
+        this.blocks =
+                Integer.getInteger(
+                        PROPERTY + ".blocks",
+                        defaultBlocks(multiprocessors * blocksPerSM, c.dim()));
         // Enough (head, split) units to give every block one, within the scratch.
         this.splits =
                 Math.max(
@@ -170,7 +170,12 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         this.scratch =
                 new FloatArray(
                         LlamaMegakernel.scratchSize(
-                                c.dim(), c.hiddenDim(), c.numberOfHeads(), c.headSize(), splits));
+                                c.dim(),
+                                c.hiddenDim(),
+                                c.numberOfHeads(),
+                                c.headSize(),
+                                splits,
+                                blocks));
         this.meta = new IntArray(LlamaMegakernel.META_SIZE);
         meta.set(LlamaMegakernel.META_DIM, c.dim());
         meta.set(LlamaMegakernel.META_KV_DIM, c.kvDim());
@@ -183,6 +188,7 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         meta.set(LlamaMegakernel.META_KV_BLOCK_CFG, state.kvBlockCfg);
         meta.set(LlamaMegakernel.META_KV_BLOCK_STRIDE, state.kvBlockStride);
         meta.set(LlamaMegakernel.META_SPLITS, splits);
+        meta.set(LlamaMegakernel.META_DEVICE_SAMPLE, deviceSample() ? 1 : 0);
 
         WorkerGrid1D worker = new WorkerGrid1D(blocks * LlamaMegakernel.BLOCK_SIZE);
         worker.setLocalWork(LlamaMegakernel.BLOCK_SIZE, 1, 1);
@@ -216,6 +222,12 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
                 "in-kernel split-KV");
     }
 
+    /** The session samples greedily on the device ({@code -Djitllm.deviceSample=true}). */
+    private boolean deviceSample() {
+        return state.executionPolicy().samplingResidency()
+                == ExecutionPolicy.SamplingResidency.DEVICE;
+    }
+
     @Override
     public TornadoExecutionPlan createExecutionPlan() {
         TornadoWeightsView v = new TornadoWeightsView((LlamaTornadoWeights) model.weights());
@@ -245,7 +257,8 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
                                 v.freqReal,
                                 v.freqImag,
                                 meta,
-                                ws.wrapLogits)
+                                ws.wrapLogits,
+                                ws.sampledToken)
                         .task(
                                 TASK,
                                 LlamaMegakernel::forward,
@@ -267,8 +280,12 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
                                 ws.positionHolder,
                                 ws.wrapBlockTable,
                                 meta,
-                                ws.wrapLogits)
-                        .transferToHost(DataTransferMode.EVERY_EXECUTION, ws.wrapLogits);
+                                ws.wrapLogits,
+                                ws.sampledToken)
+                        // Greedy decode on the device reads back one token, not the logits.
+                        .transferToHost(
+                                DataTransferMode.EVERY_EXECUTION,
+                                deviceSample() ? ws.sampledToken : ws.wrapLogits);
         return new TornadoExecutionPlan(graph.snapshot());
     }
 
@@ -311,6 +328,21 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
                     w.freq_cis_realFlat.asFloatArray(),
                     w.freq_cis_imagFlat.asFloatArray());
         }
+    }
+
+    /**
+     * The largest grid of at most {@code resident} blocks whose warps divide {@code dim}: every
+     * phase hands out rows round-robin to warps, and the projections onto {@code dim} rows (Wo, the
+     * down projection) then end in a full last round instead of a partial one. On an A10 (72 SMs,
+     * Llama-3.2-1B) that is 64 blocks: 5.81 ms per token against 5.94 ms with 72.
+     */
+    static int defaultBlocks(int resident, int dim) {
+        for (int b = resident; b > 0; b--) {
+            if (dim % (b * (LlamaMegakernel.BLOCK_SIZE / 32)) == 0) {
+                return b;
+            }
+        }
+        return resident;
     }
 
     /** Layer by layer, each layer's tensors in the order given: [l0: a, b, ...][l1: a, b, ...]. */
