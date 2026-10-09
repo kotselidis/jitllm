@@ -54,6 +54,7 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
     private final Model model;
     private final TornadoMetricsReporter metrics;
     private final int blocksPerSM;
+    private final boolean fusedDown;
     private final int blocks;
     private final int splits;
 
@@ -151,7 +152,12 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         this.wo = concatenate(w.woLayered);
         this.w1 = concatenate(w.w1Layered);
         this.w3 = concatenate(w.w3Layered);
-        this.w2 = concatenate(w.w2Layered);
+        this.fusedDown =
+                c.dim() <= LlamaMegakernel.FUSED_MAX_DIM && Boolean.getBoolean(PROPERTY + ".fusedDown");
+        this.w2 =
+                fusedDown
+                        ? concatenateTransposed(w.w2Layered, c.dim(), c.hiddenDim(), LlamaMegakernel.FUSED_MAX_DIM)
+                        : concatenate(w.w2Layered);
         this.norms = new FloatArray(LlamaMegakernel.epsilonIndex(c.dim(), layers) + 1);
         long offset = 0;
         for (TornadoTensor t : w.rms_att_weightLayered) {
@@ -189,6 +195,8 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         meta.set(LlamaMegakernel.META_KV_BLOCK_STRIDE, state.kvBlockStride);
         meta.set(LlamaMegakernel.META_SPLITS, splits);
         meta.set(LlamaMegakernel.META_DEVICE_SAMPLE, deviceSample() ? 1 : 0);
+        meta.set(LlamaMegakernel.META_FUSED_DOWN, fusedDown ? 1 : 0);
+        meta.set(LlamaMegakernel.META_NORM_ONE_PASS, Boolean.getBoolean(PROPERTY + ".normOnePass") ? 1 : 0);
 
         WorkerGrid1D worker = new WorkerGrid1D(blocks * LlamaMegakernel.BLOCK_SIZE);
         worker.setLocalWork(LlamaMegakernel.BLOCK_SIZE, 1, 1);
@@ -350,6 +358,26 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
     }
 
     /** Layer by layer, each layer's tensors in the order given: [l0: a, b, ...][l1: a, b, ...]. */
+    /** Each layer's rows x cols matrix as cols x rows, transposed rows zero-padded to stride. */
+    private static HalfFloatArray concatenateTransposed(TornadoTensor[] perLayer, int rows, int cols, int stride) {
+        long layerElements = (long) cols * stride;
+        HalfFloatArray flat = new HalfFloatArray((int) (layerElements * perLayer.length));
+        short[] source = new short[rows * cols];
+        short[] transposed = new short[(int) layerElements];
+        long offset = 0;
+        for (TornadoTensor t : perLayer) {
+            MemorySegment.copy(t.asHalfFloatArray().getSegment(), java.lang.foreign.ValueLayout.JAVA_SHORT, 0, source, 0, source.length);
+            for (int r = 0; r < rows; r++) {
+                for (int col = 0; col < cols; col++) {
+                    transposed[col * stride + r] = source[r * cols + col];
+                }
+            }
+            MemorySegment.copy(transposed, 0, flat.getSegment(), java.lang.foreign.ValueLayout.JAVA_SHORT, offset, transposed.length);
+            offset += layerElements * Short.BYTES;
+        }
+        return flat;
+    }
+
     private static HalfFloatArray concatenate(TornadoTensor[]... perLayer) {
         long elements = 0;
         for (TornadoTensor[] tensors : perLayer) {
