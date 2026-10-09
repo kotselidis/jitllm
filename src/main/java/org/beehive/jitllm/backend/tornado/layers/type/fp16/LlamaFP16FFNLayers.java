@@ -4,8 +4,11 @@ import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.scheduling.LaneAttentionPolicy;
+import org.beehive.jitllm.backend.tornado.scheduling.RmsReductionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
+import org.beehive.jitllm.backend.tornado.scheduling.SplitKvAttentionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.state.State;
@@ -63,8 +66,10 @@ public class LlamaFP16FFNLayers
         super(taskGraph, state, weights, config, schedulerType);
         this.llamaState = (LlamaState) state;
         var partitions = state.executionPolicy().splitKvPartitions();
-        this.splitKvAttention = partitions.isPresent();
-        int working = partitions.orElse(State.SPLIT_KV);
+        // Split-KV is opt-in on CUDA and the default on Metal, where the per-head kernel it
+        // replaces dominates decode as soon as the context grows; see SplitKvAttentionPolicy.
+        this.splitKvAttention = partitions.isPresent() || SplitKvAttentionPolicy.narrow();
+        int working = partitions.orElse(SplitKvAttentionPolicy.splits(State.SPLIT_KV));
         if (working > State.SPLIT_KV) {
             // The scratch array was allocated for State.SPLIT_KV partitions. A working value above
             // it would index past the end — silently, since the kernels take the count as an
@@ -79,7 +84,62 @@ public class LlamaFP16FFNLayers
                             + " raise jitllm.attention.splitKv.count, which is the capacity");
         }
         this.attentionSplits = working;
+        this.laneAttention =
+                splitKvAttentionEnabled()
+                        && !useFp16KVCache()
+                        && LaneAttentionPolicy.laneCooperativeAttentionFp32CacheAnyHead(
+                                config.headSize());
         setupFFNLayers();
+    }
+
+    /**
+     * Whether split-KV attention over the FP32 cache runs the lane-cooperative kernel for this head
+     * width; see {@link LaneAttentionPolicy#laneCooperativeAttentionFp32CacheAnyHead}.
+     */
+    private final boolean laneAttention;
+
+    /**
+     * Registers the attention tasks' worker grids for layer {@code layerIndex}. The kernel each
+     * grid is for is chosen in {@link #configureAttention}; the two must agree, since the narrow
+     * and lane-cooperative kernels size their local arrays for their own workgroup.
+     */
+    protected void addAttentionWorkerGrids(GridScheduler scheduler, int layerIndex) {
+        String p = "layer_" + layerIndex + ".";
+        WorkerGrid attention;
+        if (!splitKvAttentionEnabled()) {
+            attention =
+                    WorkerGridFactory.createAttentionWorker(
+                            config.numberOfHeads(), config.headSize());
+        } else if (laneAttention) {
+            attention =
+                    WorkerGridFactory.createLaneAttentionWorker(
+                            config.numberOfHeads() * attentionSplits,
+                            LaneAttentionPolicy.WARPS_PER_GROUP);
+        } else if (SplitKvAttentionPolicy.narrow() && !useFp16KVCache()) {
+            attention =
+                    WorkerGridFactory.genericWorker(
+                            config.numberOfHeads()
+                                    * attentionSplits
+                                    * SplitKvAttentionPolicy.NARROW_GROUP,
+                            SplitKvAttentionPolicy.NARROW_GROUP);
+        } else {
+            attention =
+                    WorkerGridFactory.createAttentionWorker(
+                            config.numberOfHeads() * attentionSplits, config.headSize());
+        }
+        scheduler.addWorkerGrid(p + "attention", attention);
+        if (splitKvAttentionEnabled()) {
+            scheduler.addWorkerGrid(
+                    p + "attention_combine",
+                    WorkerGridFactory.createAttentionWorker(
+                            config.numberOfHeads(), config.headSize()));
+        }
+    }
+
+    /** Without a separate finalize task on Metal; see {@link RmsReductionPolicy}. */
+    @Override
+    protected boolean shouldUseFinalNormalization() {
+        return super.shouldUseFinalNormalization() && !RmsReductionPolicy.singleWorkgroup();
     }
 
     @Override
@@ -98,15 +158,6 @@ public class LlamaFP16FFNLayers
                 WorkerGridFactory.genericWorker(
                         configHiddenDimRowMajor, LOCAL_WORK_GROUP_SIZE_ALLOC);
 
-        int attentionGroups =
-                splitKvAttentionEnabled()
-                        ? config.numberOfHeads() * attentionSplits
-                        : config.numberOfHeads();
-        WorkerGrid parallelAttentionWorker =
-                WorkerGridFactory.createAttentionWorker(attentionGroups, config.headSize());
-        WorkerGrid attentionCombineWorker =
-                WorkerGridFactory.createAttentionWorker(config.numberOfHeads(), config.headSize());
-
         int fusedQKVRows = config.dim() + 2 * config.kvDim();
         int fusedQKVGlobal = fusedQKVRows * LOCAL_WORK_GROUP_SIZE_ALLOC;
         WorkerGrid fusedQKVWorker =
@@ -123,12 +174,7 @@ public class LlamaFP16FFNLayers
             tornadoForwardScheduler.addWorkerGrid("layer_" + i + ".qkv_projection", fusedQKVWorker);
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".rope_and_kv_cache", ropeWithCacheWorker);
-            tornadoForwardScheduler.addWorkerGrid(
-                    "layer_" + i + ".attention", parallelAttentionWorker);
-            if (splitKvAttentionEnabled()) {
-                tornadoForwardScheduler.addWorkerGrid(
-                        "layer_" + i + ".attention_combine", attentionCombineWorker);
-            }
+            addAttentionWorkerGrids(tornadoForwardScheduler, i);
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".attn_output_proj", configDimRowMajorGlobalWorker);
             // === FFN Block ===
@@ -501,7 +547,8 @@ public class LlamaFP16FFNLayers
     }
 
     protected boolean splitKvAttentionEnabled() {
-        return splitKvAttention && schedulerType == SchedulerType.NVIDIA;
+        return splitKvAttention
+                && (schedulerType == SchedulerType.NVIDIA || SplitKvAttentionPolicy.narrow());
     }
 
     /** The key cache every graph of this family binds: FP16 when the state holds one. */
@@ -630,7 +677,17 @@ public class LlamaFP16FFNLayers
             } else {
                 unifiedLayer.task(
                         "attention",
-                        TransformerPagedKvKernels::processHeadsFlashAttentionSplitKVPaged,
+                        laneAttention
+                                ? config.headSize() == LaneAttentionPolicy.NARROW_HEAD_SIZE
+                                        ? TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPagedLaneHead64
+                                        : TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPagedLaneHead128
+                                : SplitKvAttentionPolicy.narrow()
+                                        ? TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPaged32
+                                        : TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPaged,
                         context,
                         state.workspace.wrapQ,
                         state.workspace.wrapKeyCache,

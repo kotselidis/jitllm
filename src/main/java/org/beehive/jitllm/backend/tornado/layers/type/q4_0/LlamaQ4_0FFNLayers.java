@@ -248,9 +248,6 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
 
         WorkerGrid ropeWithCacheWorker = WorkerGridFactory.genericWorker(config.dim() / 2, 512);
 
-        WorkerGrid parallelAttentionWorker =
-                WorkerGridFactory.createAttentionWorker(config.numberOfHeads(), config.headSize());
-
         for (int i = 0; i < config.numberOfLayers(); i++) {
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".attn_rms_reduce", rmsReduceWorker);
@@ -258,8 +255,7 @@ public class LlamaQ4_0FFNLayers extends LlamaQ8_0FFNLayers {
             tornadoForwardScheduler.addWorkerGrid("layer_" + i + ".qkv_projection", fusedQkvWorker);
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".rope_and_kv_cache", ropeWithCacheWorker);
-            tornadoForwardScheduler.addWorkerGrid(
-                    "layer_" + i + ".attention", parallelAttentionWorker);
+            addAttentionWorkerGrids(tornadoForwardScheduler, i);
             tornadoForwardScheduler.addWorkerGrid(
                     "layer_" + i + ".attn_output_proj", configDimRowMajorGlobalWorker);
             tornadoForwardScheduler.addWorkerGrid(

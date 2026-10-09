@@ -23,7 +23,8 @@ import org.beehive.jitllm.runtime.backend.DeviceCapability;
  * <p>Reached by the Qwen3 FP16 family's split-KV decode attention over an FP16 paged cache. Every
  * other family, every other quantisation, the FP32 key/value cache, the packed-half2 variant and
  * the non-split per-head kernel keep the kernel they had. Head widths other than 128 keep it too,
- * which is what leaves Llama-3.2-1B (64) and the Qwen3.5 family (256) exactly as they were.
+ * which is what leaves Llama-3.2-1B (64) and the Qwen3.5 family (256) exactly as they were. The
+ * FP32-cache variants below are a separate, Metal-only decision.
  *
  * <p>Measured on one device, an RTX 5070 Ti (sm_120). The decision is a backend-level default
  * rather than a per-device measurement, and what it rests on is structural rather than incidental:
@@ -94,6 +95,22 @@ public final class LaneAttentionPolicy {
     // @formatter:on
     public static boolean laneCooperativeAttentionFp32Cache(int headSize) {
         return headSize == SUPPORTED_HEAD_SIZE
+                && TornadoDevices.current()
+                        .capabilities()
+                        .supports(DeviceCapability.SUBGROUP_SHUFFLE_32);
+    }
+
+    /** The narrower head width the FP32-cache lane-cooperative kernel also has a variant for. */
+    public static final int NARROW_HEAD_SIZE = 64;
+
+    /**
+     * {@link #laneCooperativeAttentionFp32Cache} for a layer stack that installs the kernel
+     * matching its head width: {@code processHeadsFlashAttentionSplitKVPagedLaneHead128} for 128,
+     * {@code processHeadsFlashAttentionSplitKVPagedLaneHead64} for 64 (lane {@code L} owns
+     * dimensions {@code 2L} and {@code 2L+1}). Any other width keeps its kernel.
+     */
+    public static boolean laneCooperativeAttentionFp32CacheAnyHead(int headSize) {
+        return (headSize == SUPPORTED_HEAD_SIZE || headSize == NARROW_HEAD_SIZE)
                 && TornadoDevices.current()
                         .capabilities()
                         .supports(DeviceCapability.SUBGROUP_SHUFFLE_32);

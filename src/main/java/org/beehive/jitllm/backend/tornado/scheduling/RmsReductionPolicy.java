@@ -14,7 +14,7 @@ import org.beehive.jitllm.runtime.backend.BackendId;
  * kernels are batched into shared command buffers and every task is a dispatch the GPU runs in
  * turn, dropping the two finalize tasks per layer is measurable for Qwen3: Qwen3-0.6B decode on an
  * M4 Pro (tg64, tok/s, depth 0) F16 159-161 to 164, Q8_0 203.7 to 207, greedy text identical. Only
- * the Qwen3 layers ask; the other families keep their validated shape.
+ * the Qwen3 and Llama layers ask; the other families keep their validated shape.
  */
 // @formatter:on
 public final class RmsReductionPolicy {

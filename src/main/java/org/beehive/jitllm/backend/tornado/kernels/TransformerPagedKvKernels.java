@@ -1211,6 +1211,142 @@ public class TransformerPagedKvKernels {
         }
     }
 
+    // @formatter:off
+    /**
+     * {@link #processHeadsFlashAttentionSplitKVPagedLaneHead128} for a 64-wide head: lane {@code L}
+     * owns head dimensions {@code 2L} and {@code 2L+1}, and each warp streams its own keys. Same
+     * partial-output layout, so {@code combineSplitKVAttention} reads it unchanged. Selected by
+     * {@code LaneAttentionPolicy.laneCooperativeAttentionFp32Cache}.
+     */
+    // @formatter:on
+    public static void processHeadsFlashAttentionSplitKVPagedLaneHead64(
+            KernelContext context,
+            FloatArray q,
+            FloatArray key_cache,
+            FloatArray value_cache,
+            FloatArray att,
+            int nHeads,
+            int headSize,
+            int kvDim,
+            int kvMul,
+            IntArray positionHolder,
+            int layer,
+            IntArray blockTable,
+            int blockCfg,
+            int blockStride,
+            int nSplits) {
+
+        final int MAX_WARPS = 16;
+        final int HEAD = 64;
+
+        int tid = context.localIdx;
+        int blockSize = context.localGroupSizeX;
+        int lane = tid & 31;
+        int warp = tid >> 5;
+        int nWarps = blockSize >> 5;
+
+        int g = context.groupIdx;
+        int h = g / nSplits;
+        int s = g % nSplits;
+
+        if (h >= nHeads) {
+            return;
+        }
+
+        int pos = positionHolder.get(0);
+        int slot = positionHolder.get(1);
+        int seqLen = pos + 1;
+        int chunk = (seqLen + nSplits - 1) / nSplits;
+        int startPos = s * chunk;
+        int endPos = Math.min(startPos + chunk, seqLen); // exclusive
+
+        int layerOff = KvBlockAddress.layerOffset(layer, kvDim, blockCfg);
+        int kvHeadIdx = h / kvMul;
+        float invSqrt = 1.0f / TornadoMath.sqrt(headSize);
+
+        int dA = lane * 2;
+
+        int qBase = h * headSize;
+        float q0 = q.get(qBase + dA);
+        float q1 = q.get(qBase + dA + 1);
+
+        float[] partial = context.allocateFloatLocalArray(MAX_WARPS * HEAD);
+        float[] mShared = context.allocateFloatLocalArray(MAX_WARPS);
+        float[] lShared = context.allocateFloatLocalArray(MAX_WARPS);
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float m = Float.NEGATIVE_INFINITY;
+        float l = 0.0f;
+
+        for (int p = startPos + warp; p < endPos; p += nWarps) {
+            int base =
+                    KvBlockAddress.offset(
+                                    blockTable, slot, p, layerOff, kvDim, blockCfg, blockStride)
+                            + kvHeadIdx * headSize;
+
+            float part = q0 * key_cache.get(base + dA) + q1 * key_cache.get(base + dA + 1);
+
+            part += context.simdShuffleDown(part, 16);
+            part += context.simdShuffleDown(part, 8);
+            part += context.simdShuffleDown(part, 4);
+            part += context.simdShuffleDown(part, 2);
+            part += context.simdShuffleDown(part, 1);
+            float score = context.simdBroadcastFirst(part) * invSqrt;
+
+            float newM = Math.max(m, score);
+            float corr = (m == Float.NEGATIVE_INFINITY) ? 0.0f : TornadoMath.exp(m - newM);
+            float e = TornadoMath.exp(score - newM);
+
+            acc0 = acc0 * corr + e * value_cache.get(base + dA);
+            acc1 = acc1 * corr + e * value_cache.get(base + dA + 1);
+            l = l * corr + e;
+            m = newM;
+        }
+
+        int warpBase = warp * HEAD;
+        partial[warpBase + dA] = acc0;
+        partial[warpBase + dA + 1] = acc1;
+        if (lane == 0) {
+            mShared[warp] = m;
+            lShared[warp] = l;
+        }
+        context.localBarrier();
+
+        int headBase = h * nSplits * (headSize + 2);
+        int outBase = headBase + s * headSize;
+        int mBase = headBase + nSplits * headSize;
+        int lBase = mBase + nSplits;
+
+        float blockMax = Float.NEGATIVE_INFINITY;
+        for (int w = 0; w < nWarps; w++) {
+            float mw = mShared[w];
+            if (mw > blockMax) {
+                blockMax = mw;
+            }
+        }
+        float denom = 0.0f;
+        for (int w = 0; w < nWarps; w++) {
+            float mw = mShared[w];
+            float f = (mw == Float.NEGATIVE_INFINITY) ? 0.0f : TornadoMath.exp(mw - blockMax);
+            denom += f * lShared[w];
+        }
+
+        for (int d = tid; d < headSize; d += blockSize) {
+            float sum = 0.0f;
+            for (int w = 0; w < nWarps; w++) {
+                float mw = mShared[w];
+                float f = (mw == Float.NEGATIVE_INFINITY) ? 0.0f : TornadoMath.exp(mw - blockMax);
+                sum += f * partial[w * HEAD + d];
+            }
+            att.set(outBase + d, sum);
+        }
+        if (tid == 0) {
+            att.set(mBase + s, blockMax);
+            att.set(lBase + s, denom);
+        }
+    }
+
     public static void processHeadsFlashAttentionSplitKVFP16Paged(
             KernelContext context,
             FloatArray q,
