@@ -109,8 +109,11 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
                             + " is not a multiple of 32 up to "
                             + LlamaMegakernel.MAX_HEAD_SIZE);
         }
-        if (c.dim() % 2 != 0 || c.kvDim() % 2 != 0 || c.hiddenDim() % 2 != 0) {
-            reasons.add("dim, kvDim and hiddenDim must be even");
+        if (c.kvDim() % 2 != 0) {
+            reasons.add("kvDim must be even");
+        }
+        if (c.dim() % LlamaMegakernel.CHUNK != 0 || c.hiddenDim() % LlamaMegakernel.CHUNK != 0) {
+            reasons.add("dim and hiddenDim must be multiples of " + LlamaMegakernel.CHUNK + " (one 16-byte copy per lane per stage)");
         }
         if (!reasons.isEmpty()) {
             throw new IllegalStateException(
