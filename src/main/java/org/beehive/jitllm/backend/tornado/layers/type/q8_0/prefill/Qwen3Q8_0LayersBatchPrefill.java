@@ -7,6 +7,8 @@ import org.beehive.jitllm.backend.tornado.kernels.Qwen3PagedKvKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.layers.BatchPrefillTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.scheduling.BatchPrefillGemmPolicy;
+import org.beehive.jitllm.backend.tornado.scheduling.LaneAttentionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.inference.state.Qwen3State;
 import org.beehive.jitllm.inference.weights.tornado.Qwen3TornadoWeights;
@@ -156,7 +158,9 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
 
         layer.task(
                 "batch_qkv",
-                Qwen3Kernels::batchedFusedQKVMatmulQ8_0,
+                tiledQkv()
+                        ? TransformerBatchPrefillKernels::batchedGemmQKVQ8
+                        : Qwen3Kernels::batchedFusedQKVMatmulQ8_0,
                 context,
                 state.workspace.wrapXbBatch,
                 state.workspace.wrapQBatch,
@@ -168,7 +172,7 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
                 dim,
                 qDim,
                 kvDim,
-                LOCAL_WORK_GROUP_SIZE);
+                tiledQkv() ? batchSize : LOCAL_WORK_GROUP_SIZE);
 
         layer.task(
                 "batch_qk_rmsnorm",
@@ -249,7 +253,10 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         } else {
             layer.task(
                     "batch_attention",
-                    TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionPaged,
+                    laneAttention()
+                            ? TransformerPagedKvBatchPrefillKernels
+                                    ::batchedFlashAttentionPagedLaneHead128
+                            : TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionPaged,
                     context,
                     state.workspace.batchStartPosHolder,
                     state.workspace.wrapQBatch,
@@ -270,14 +277,16 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         // Output projection (Q8_0): n=qDim, d=dim
         layer.task(
                 "batch_attn_out",
-                TransformerBatchPrefillKernels::batchedMatVecWithResidualQ8,
+                tiledGemm()
+                        ? TransformerBatchPrefillKernels::batchedGemmQ8WithResidual
+                        : TransformerBatchPrefillKernels::batchedMatVecWithResidualQ8,
                 context,
                 state.workspace.wrapXbBatch,
                 state.workspace.wrapXBatch,
                 weights.woLayered[layerIndex].asByteArray(),
                 qDim,
                 dim,
-                LOCAL_WORK_GROUP_SIZE);
+                tiledGemm() ? batchSize : LOCAL_WORK_GROUP_SIZE);
 
         // ── FFN Block ──────────────────────────────────────────────────────────
         layer.task(
@@ -291,7 +300,9 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
 
         layer.task(
                 "batch_ffn_gate_up",
-                TransformerBatchPrefillKernels::batchedFusedRmsNormFFNGateUpQ8,
+                tiledGemm()
+                        ? TransformerBatchPrefillKernels::batchedGemmRmsNormFFNGateUpQ8
+                        : TransformerBatchPrefillKernels::batchedFusedRmsNormFFNGateUpQ8,
                 context,
                 state.workspace.wrapXBatch,
                 state.workspace.wrapHbBatch,
@@ -301,18 +312,20 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
                 weights.w3Layered[layerIndex].asByteArray(),
                 dim,
                 hidDim,
-                LOCAL_WORK_GROUP_SIZE);
+                tiledGemm() ? batchSize : LOCAL_WORK_GROUP_SIZE);
 
         layer.task(
                 "batch_ffn_down",
-                TransformerBatchPrefillKernels::batchedMatVecWithResidualQ8,
+                tiledGemm()
+                        ? TransformerBatchPrefillKernels::batchedGemmQ8WithResidual
+                        : TransformerBatchPrefillKernels::batchedMatVecWithResidualQ8,
                 context,
                 state.workspace.wrapHbBatch,
                 state.workspace.wrapXBatch,
                 weights.w2Layered[layerIndex].asByteArray(),
                 hidDim,
                 dim,
-                LOCAL_WORK_GROUP_SIZE);
+                tiledGemm() ? batchSize : LOCAL_WORK_GROUP_SIZE);
 
         layer.persistOnDevice(state.workspace.wrapXBatch, keyCache(), valueCache());
 
@@ -342,11 +355,23 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         while (ropeLocal > 1 && ropeGlobal % ropeLocal != 0) ropeLocal--;
         WorkerGrid ropeWorker = WorkerGridFactory.genericWorker(ropeGlobal, ropeLocal);
 
-        int optLocal = findOptimalLocalSize(nEmbdHead);
+        int optLocal =
+                laneAttention()
+                        ? 32 * LaneAttentionPolicy.PREFILL_WARPS_PER_GROUP
+                        : findOptimalLocalSize(nEmbdHead);
         WorkerGrid attnWorker =
                 WorkerGridFactory.genericWorker(
                         batchSize * config.numberOfHeads() * optLocal, optLocal);
 
+        WorkerGrid gemmDimWorker =
+                WorkerGridFactory.genericWorker(
+                        ((dim + 63) / 64) * ((batchSize + 63) / 64) * 256, 256);
+        WorkerGrid gemmHidWorker =
+                WorkerGridFactory.genericWorker(
+                        ((hidDim + 63) / 64) * ((batchSize + 63) / 64) * 256, 256);
+        WorkerGrid gemmQkvWorker =
+                WorkerGridFactory.genericWorker(
+                        ((qDim + 2 * kvDim) / 64) * ((batchSize + 63) / 64) * 256, 256);
         WorkerGrid matVecDimWorker =
                 WorkerGridFactory.genericWorker(
                         batchSize * dim * LOCAL_WORK_GROUP_SIZE, LOCAL_WORK_GROUP_SIZE);
@@ -358,14 +383,17 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
             String p = "batchPrefillLayer_" + i + ".";
             scheduler.addWorkerGrid(p + "batch_attn_rms", rmsWorker);
             scheduler.addWorkerGrid(p + "batch_attn_rms_apply", rmsApplyWorker);
-            scheduler.addWorkerGrid(p + "batch_qkv", qkvWorker);
+            scheduler.addWorkerGrid(p + "batch_qkv", tiledQkv() ? gemmQkvWorker : qkvWorker);
             scheduler.addWorkerGrid(p + "batch_qk_rmsnorm", qkRmsNormWorker);
             scheduler.addWorkerGrid(p + "batch_rope_kv", ropeWorker);
             scheduler.addWorkerGrid(p + "batch_attention", attnWorker);
-            scheduler.addWorkerGrid(p + "batch_attn_out", matVecDimWorker);
+            scheduler.addWorkerGrid(
+                    p + "batch_attn_out", tiledGemm() ? gemmDimWorker : matVecDimWorker);
             scheduler.addWorkerGrid(p + "batch_ffn_rms", rmsWorker);
-            scheduler.addWorkerGrid(p + "batch_ffn_gate_up", matVecHidWorker);
-            scheduler.addWorkerGrid(p + "batch_ffn_down", matVecDimWorker);
+            scheduler.addWorkerGrid(
+                    p + "batch_ffn_gate_up", tiledGemm() ? gemmHidWorker : matVecHidWorker);
+            scheduler.addWorkerGrid(
+                    p + "batch_ffn_down", tiledGemm() ? gemmDimWorker : matVecDimWorker);
         }
     }
 
@@ -412,5 +440,21 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         return useFp16KVCache()
                 ? state.workspace.wrapValueCacheFP16
                 : state.workspace.wrapValueCache;
+    }
+
+    /** The tiled projection kernels; see {@link BatchPrefillGemmPolicy}. */
+    private static boolean tiledGemm() {
+        return BatchPrefillGemmPolicy.tiled();
+    }
+
+    /** The tiled QKV kernel needs every 64-row tile to lie in one of Q, K and V. */
+    private boolean tiledQkv() {
+        return tiledGemm() && qDim % 64 == 0 && kvDim % 64 == 0;
+    }
+
+    /** The lane-cooperative kernel over the FP32 cache; see {@link LaneAttentionPolicy}. */
+    private boolean laneAttention() {
+        return !useFp16KVCache()
+                && LaneAttentionPolicy.laneCooperativeAttentionFp32Cache(nEmbdHead);
     }
 }
