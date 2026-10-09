@@ -102,4 +102,42 @@ public final class BatchPrefillSupport {
                         + " --batch-prefill-size (the single-token plan runs this model here),"
                         + " or leave prefill batching off in the execution policy");
     }
+
+    /** The batched-prefill chunk Metal runs by default; see {@link #defaultFor}. */
+    public static final int METAL_DEFAULT_PREFILL_BATCH = 256;
+
+    // @formatter:off
+    /**
+     * The policy a model runs when its caller did not choose one: batched prefill on Metal for the
+     * families whose batched kernels are tuned there, the given policy otherwise.
+     *
+     * <p>Qwen3 in F16 and Q8_0 prefills an order of magnitude faster in batches of {@value
+     * #METAL_DEFAULT_PREFILL_BATCH} than one token at a time on an Apple GPU (Qwen3-0.6B on an M4
+     * Pro, pp512: F16 151 to 1949 tok/s, Q8_0 194 to 1928), at a cost of 2-4% in decode (137 to 132
+     * tok/s after a 943-token prompt); greedy text is identical. Other families keep single-token
+     * prefill on Metal: their batched kernels have not been tuned there and run slower than it.
+     * Only a single-token policy is changed, so an explicit choice is never overridden.
+     */
+    // @formatter:on
+    public static ExecutionPolicy defaultFor(Model model, ExecutionPolicy policy) {
+        if (policy.phaseStrategy() != ExecutionPolicy.PhaseStrategy.SINGLE_TOKEN
+                || !org.beehive.jitllm.backend.tornado.device.TornadoDevices.current()
+                        .backend()
+                        .equals(BackendId.METAL)
+                || !"qwen3".equals(model.architectureId().toString())) {
+            return policy;
+        }
+        var type = model.weights().dataType();
+        if (type != org.beehive.jitllm.runtime.tensor.DataType.F16
+                && type != org.beehive.jitllm.runtime.tensor.DataType.Q8_0) {
+            return policy;
+        }
+        if (unsupportedOnCurrentDevice(model).isPresent()) {
+            return policy;
+        }
+        return ExecutionPolicy.from(policy)
+                .phaseStrategy(ExecutionPolicy.PhaseStrategy.PREFILL_DECODE)
+                .prefillBatchSize(METAL_DEFAULT_PREFILL_BATCH)
+                .build();
+    }
 }

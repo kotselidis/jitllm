@@ -144,6 +144,13 @@ withheld. `SplitKvAttentionPolicy` now reads the device's local-memory size and 
 `processHeadsFlashAttentionSplitKVPaged32`, the same arithmetic in 32-thread workgroups
 (17284 bytes), wherever the 64-thread arrays do not fit.
 
+On Metal, Qwen3 in F16 and Q8_0 prefills in batches of 256 by default
+(`BatchPrefillSupport.defaultFor`), when the caller chose no execution policy and neither
+`--with-prefill-decode` nor `-Djitllm.prefillBatchSize` was given. Its batched path runs
+lane-cooperative attention and tiled projections there, about 13x faster than one token at a
+time. Pass `-Djitllm.withPrefillDecode=false` to keep single-token prefill. Other families keep
+single-token prefill on Metal: their batched kernels have not been tuned for it.
+
 `PACKED_HALF2_MATH` is withheld on OpenCL. Packed FP16 arithmetic rounds each product to
 FP16 before the FP32 accumulator sees it, once per term; over a 2048-term projection row
 that loss is systematic rather than cancelling, and on OpenCL it was large enough to fail
