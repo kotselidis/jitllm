@@ -56,6 +56,17 @@ public final class LaneAttentionPolicy {
     // @formatter:on
     public static final int WARPS_PER_GROUP = 16;
 
+    // @formatter:off
+    /**
+     * Warps per (query token, head) in the batched-prefill lane-cooperative kernel. Prefill
+     * launches one workgroup per token and head, so there is no shortage of workgroups to hide
+     * latency with, and fewer warps per workgroup keep more of them resident. Measured on an M4
+     * Pro, Qwen3-0.6B F16, batch 256 (pp512 / pp2048 tok/s): 1 warp 1671 / 681, 2 1947 / 1024, 4
+     * 1961 / 1166, 8 1937 / 999, 16 1822 / 937.
+     */
+    // @formatter:on
+    public static final int PREFILL_WARPS_PER_GROUP = 4;
+
     private LaneAttentionPolicy() {}
 
     /**
