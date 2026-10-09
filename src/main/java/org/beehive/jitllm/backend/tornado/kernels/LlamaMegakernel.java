@@ -59,7 +59,10 @@ public final class LlamaMegakernel {
     private static final int WARPS = BLOCK_SIZE / 32;
     private static final int HEAD_VALUES_PER_LANE = MAX_HEAD_SIZE / 32;
 
-    /** The widest residual stream the fused down projection supports. */
+    /**
+     * The widest residual stream the fused down projection supports: each lane keeps {@code dim /
+     * 32} down-projection sums in registers.
+     */
     public static final int FUSED_MAX_DIM = 2048;
 
     private static final int FUSED_VALUES_PER_LANE = FUSED_MAX_DIM / 32;
@@ -84,6 +87,21 @@ public final class LlamaMegakernel {
     /** Experimental: 1 for the single-pass RMS norm. */
     public static final int META_NORM_ONE_PASS = 13;
 
+    /**
+     * 1 when {@code w2} is stored transposed, rows padded to {@link #FUSED_MAX_DIM}, and the down
+     * projection is fused into gate/up.
+     */
+    public static final int META_FUSED_DOWN = 12;
+
+    /**
+     * 1 for the single-pass RMS norm, which keeps x in registers between its two passes. Off by
+     * default (it measures the same, 5.65 against 5.66 ms). It is kept as an option because
+     * removing its code made the whole kernel 0.25 ms slower per token on an A10 (5.64 against 5.89
+     * ms), with identical CUDA source otherwise and the same register count: ptxas lays out and
+     * schedules the kernel differently. Re-measure before deleting it.
+     */
+    public static final int META_NORM_ONE_PASS = 13;
+
     public static final int META_SIZE = 14;
 
     private LlamaMegakernel() {}
@@ -94,7 +112,11 @@ public final class LlamaMegakernel {
      */
     public static int scratchSize(
             int dim, int hiddenDim, int heads, int headSize, int splits, int blocks) {
-        return dim + hiddenDim + heads * splits * (headSize + 2) + 2 * blocks * WARPS + blocks * dim;
+        return dim
+                + hiddenDim
+                + heads * splits * (headSize + 2)
+                + 2 * blocks * WARPS
+                + blocks * dim;
     }
 
     /**
@@ -332,7 +354,25 @@ public final class LlamaMegakernel {
             context.gridBarrier();
 
             if (fusedDown != 0) {
-                normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp, onePass);
+                // 4+5 fused. w2 is stored [hidden][FUSED_MAX_DIM]: the warp that produces
+                // hb[row] streams row `row` of it into per-lane register sums, so the down
+                // projection's reads overlap gate/up's instead of following them in a phase of
+                // their own. The block sums its warps in a fixed order, writes one partial, and
+                // after the barrier the partials are added in block order: deterministic, though
+                // not the layered plan's summation order. Rows are padded so the inner loop has
+                // no bounds test, which would keep the compiler from batching its loads.
+                normalize(
+                        context,
+                        x,
+                        norms,
+                        (layers + l) * dim,
+                        dim,
+                        eps,
+                        vec,
+                        reduce,
+                        tid,
+                        warp,
+                        onePass);
                 for (int k = 0; k < FUSED_VALUES_PER_LANE; k++) {
                     down[k] = 0.0f;
                 }
@@ -380,7 +420,18 @@ public final class LlamaMegakernel {
                 }
             } else {
                 // 4. RMS norm, gate and up projections, SwiGLU.
-                normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp, onePass);
+                normalize(
+                        context,
+                        x,
+                        norms,
+                        (layers + l) * dim,
+                        dim,
+                        eps,
+                        vec,
+                        reduce,
+                        tid,
+                        warp,
+                        onePass);
                 for (int row = globalWarp; row < hiddenDim; row += totalWarps) {
                     int rowOff = (l * hiddenDim + row) * dim;
                     float gate = dotShared(context, w1, rowOff, vec, dim, lane);
@@ -404,7 +455,12 @@ public final class LlamaMegakernel {
                     for (int row = globalWarp; row < dim; row += totalWarps) {
                         float s =
                                 dotShared(
-                                        context, w2, (l * dim + row) * hiddenDim, vec, hiddenDim, lane);
+                                        context,
+                                        w2,
+                                        (l * dim + row) * hiddenDim,
+                                        vec,
+                                        hiddenDim,
+                                        lane);
                         if (lane == 0) {
                             x.set(row, x.get(row) + s);
                         }
