@@ -340,22 +340,22 @@ public class TransformerBatchPrefillSimdgroupKernelsAccelTest {
 
     @Test
     public void fp16ResidualWholeTiles() {
-        checkResidual(false, 96, 128, 128);
+        checkResidual(false, 128, 128, 128);
     }
 
     @Test
     public void fp16ResidualPartialTiles() {
-        checkResidual(false, 96, 72, 70);
+        checkResidual(false, 128, 72, 70);
     }
 
     @Test
     public void q8ResidualWholeTiles() {
-        checkResidual(true, 96, 128, 128);
+        checkResidual(true, 128, 128, 128);
     }
 
     @Test
     public void q8ResidualPartialTiles() {
-        checkResidual(true, 96, 72, 70);
+        checkResidual(true, 128, 72, 70);
     }
 
     @Test

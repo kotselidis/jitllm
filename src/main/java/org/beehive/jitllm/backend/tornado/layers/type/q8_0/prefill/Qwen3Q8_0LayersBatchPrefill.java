@@ -474,9 +474,15 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         return BatchPrefillGemmPolicy.tiled();
     }
 
-    /** The tiled projections on SIMD-group matrices; see {@link BatchPrefillGemmPolicy}. */
-    private static boolean simdgroupGemm() {
-        return BatchPrefillGemmPolicy.simdgroup();
+    /**
+     * The tiled projections on SIMD-group matrices; see {@link BatchPrefillGemmPolicy}. Their
+     * double-buffered k-loop needs every contraction length to be a multiple of 64.
+     */
+    private boolean simdgroupGemm() {
+        return BatchPrefillGemmPolicy.simdgroup()
+                && config.dim() % 64 == 0
+                && config.hiddenDim() % 64 == 0
+                && qDim % 64 == 0;
     }
 
     /** The tiled QKV kernel needs every 64-row tile to lie in one of Q, K and V. */

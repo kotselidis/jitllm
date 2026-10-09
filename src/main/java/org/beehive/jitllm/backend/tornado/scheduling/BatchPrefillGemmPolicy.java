@@ -36,7 +36,8 @@ public final class BatchPrefillGemmPolicy {
      * scalar, 2929 / 1461 SIMD-group; Q8_0 1944 / 1166 scalar, 2931 / 1462 SIMD-group. Greedy text
      * identical; the CPU/GPU parity tests pass. Q8_0 weights are staged as {@code float}: rounding
      * the dequantized weights to {@code half} was faster but failed the batched-prefill parity
-     * budget.
+     * budget. FP16 stages through two alternating buffers (one barrier per k-slice): kernel time at
+     * batch 256 fell 11% for gate/up and the down projection and 5% for QKV.
      */
     // @formatter:on
     public static boolean simdgroup() {
