@@ -7,6 +7,7 @@ import org.beehive.jitllm.backend.tornado.kernels.Qwen3PagedKvKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillSimdgroupKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvBatchPrefillKernels;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvBatchPrefillSimdgroupKernels;
 import org.beehive.jitllm.backend.tornado.layers.BatchPrefillTransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.scheduling.BatchPrefillGemmPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.LaneAttentionPolicy;
@@ -257,10 +258,14 @@ public class Qwen3FP16LayersBatchPrefill implements BatchPrefillTransformerLayer
         } else {
             layer.task(
                     "batch_attention",
-                    laneAttention()
-                            ? TransformerPagedKvBatchPrefillKernels
-                                    ::batchedFlashAttentionPagedLaneHead128
-                            : TransformerPagedKvBatchPrefillKernels::batchedFlashAttentionPaged,
+                    simdgroupAttention()
+                            ? TransformerPagedKvBatchPrefillSimdgroupKernels
+                                    ::batchedFlashAttentionPagedHead128
+                            : laneAttention()
+                                    ? TransformerPagedKvBatchPrefillKernels
+                                            ::batchedFlashAttentionPagedLaneHead128
+                                    : TransformerPagedKvBatchPrefillKernels
+                                            ::batchedFlashAttentionPaged,
                     context,
                     state.workspace.batchStartPosHolder,
                     state.workspace.wrapQBatch,
@@ -372,9 +377,18 @@ public class Qwen3FP16LayersBatchPrefill implements BatchPrefillTransformerLayer
                 laneAttention()
                         ? 32 * LaneAttentionPolicy.PREFILL_WARPS_PER_GROUP
                         : findOptimalLocalSize(nEmbdHead);
+        int attnTiles =
+                (batchSize + TransformerPagedKvBatchPrefillSimdgroupKernels.QUERY_TILE - 1)
+                        / TransformerPagedKvBatchPrefillSimdgroupKernels.QUERY_TILE;
         WorkerGrid attnWorker =
-                WorkerGridFactory.genericWorker(
-                        batchSize * config.numberOfHeads() * optLocal, optLocal);
+                simdgroupAttention()
+                        ? WorkerGridFactory.genericWorker(
+                                attnTiles
+                                        * config.numberOfHeads()
+                                        * TransformerPagedKvBatchPrefillSimdgroupKernels.THREADS,
+                                TransformerPagedKvBatchPrefillSimdgroupKernels.THREADS)
+                        : WorkerGridFactory.genericWorker(
+                                batchSize * config.numberOfHeads() * optLocal, optLocal);
 
         // Wo: B*dim output rows (n=qDim, d=dim)
         WorkerGrid matVecDimWorker =
@@ -463,6 +477,11 @@ public class Qwen3FP16LayersBatchPrefill implements BatchPrefillTransformerLayer
     private boolean laneAttention() {
         return !useFp16KVCache()
                 && LaneAttentionPolicy.laneCooperativeAttentionFp32Cache(nEmbdHead);
+    }
+
+    /** Attention over the FP32 cache on SIMD-group matrices; see {@link BatchPrefillGemmPolicy}. */
+    private boolean simdgroupAttention() {
+        return laneAttention() && BatchPrefillGemmPolicy.simdgroupAttention();
     }
 
     /** The tiled QKV kernel needs every 64-row tile to lie in one of Q, K and V. */

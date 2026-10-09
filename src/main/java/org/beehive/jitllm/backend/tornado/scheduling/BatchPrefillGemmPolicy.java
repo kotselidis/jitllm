@@ -42,4 +42,21 @@ public final class BatchPrefillGemmPolicy {
     public static boolean simdgroup() {
         return tiled() && !"false".equals(System.getProperty("jitllm.metal.simdgroupGemm"));
     }
+
+    // @formatter:off
+    /**
+     * Whether batched-prefill attention over the FP32 cache runs on SIMD-group matrices ({@link
+     * org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvBatchPrefillSimdgroupKernels})
+     * where the lane-cooperative kernel would otherwise run. On by default with {@link #tiled()};
+     * {@code -Djitllm.metal.simdgroupAttention=false} selects the lane-cooperative kernel.
+     *
+     * <p>Measured on an M4 Pro, Qwen3-0.6B, batch 256, SIMD-group projections (pp512 / pp2048
+     * tok/s): F16 2913 / 1452 lane-cooperative, 3586 / 2439 SIMD-group; Q8_0 2912 / 1453
+     * lane-cooperative, 3591 / 2435 SIMD-group. Greedy text identical; the CPU/GPU parity tests
+     * pass.
+     */
+    // @formatter:on
+    public static boolean simdgroupAttention() {
+        return tiled() && !"false".equals(System.getProperty("jitllm.metal.simdgroupAttention"));
+    }
 }
