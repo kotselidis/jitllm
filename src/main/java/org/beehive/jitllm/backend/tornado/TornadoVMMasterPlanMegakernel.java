@@ -3,7 +3,6 @@ package org.beehive.jitllm.backend.tornado;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
-
 import org.beehive.jitllm.backend.tornado.kernels.LlamaMegakernel;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
 import org.beehive.jitllm.inference.state.State;
@@ -47,6 +46,7 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
     private static final String GRAPH = "megakernel";
     private static final String TASK = "forward";
     private static final int MAX_SPLITS = 16;
+
     /** 32-bit registers per multiprocessor on every architecture since Kepler. */
     private static final int REGISTERS_PER_SM = 65536;
 
@@ -82,31 +82,42 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
     static void requireSupported(Model model, State state) {
         Configuration c = model.configuration();
         List<String> reasons = new ArrayList<>();
-        if (!(c instanceof LlamaConfiguration) || !(model.weights() instanceof LlamaTornadoWeights)) {
+        if (!(c instanceof LlamaConfiguration)
+                || !(model.weights() instanceof LlamaTornadoWeights)) {
             reasons.add("the model is not Llama");
         } else if (model.weights().dataType() != DataType.F16) {
             reasons.add("weights are " + model.weights().dataType() + ", not F16");
         }
-        if (state.executionPolicy().phaseStrategy() == ExecutionPolicy.PhaseStrategy.PREFILL_DECODE) {
+        if (state.executionPolicy().phaseStrategy()
+                == ExecutionPolicy.PhaseStrategy.PREFILL_DECODE) {
             reasons.add("prefill/decode mode is set; the megakernel is single-token");
         }
         if (!state.usesFp16KeyValueCache()) {
             reasons.add("the KV cache is not FP16");
         }
-        if (TornadoRuntimeProvider.getTornadoRuntime().getBackend(0).getBackendType() != TornadoVMBackendType.CUDA) {
+        if (TornadoRuntimeProvider.getTornadoRuntime().getBackend(0).getBackendType()
+                != TornadoVMBackendType.CUDA) {
             reasons.add("the backend is not CUDA (grid barriers are CUDA-only)");
         }
         if (c.dim() > LlamaMegakernel.MAX_DIM) {
             reasons.add("dim " + c.dim() + " exceeds " + LlamaMegakernel.MAX_DIM);
         }
         if (c.headSize() % 32 != 0 || c.headSize() > LlamaMegakernel.MAX_HEAD_SIZE) {
-            reasons.add("head size " + c.headSize() + " is not a multiple of 32 up to " + LlamaMegakernel.MAX_HEAD_SIZE);
+            reasons.add(
+                    "head size "
+                            + c.headSize()
+                            + " is not a multiple of 32 up to "
+                            + LlamaMegakernel.MAX_HEAD_SIZE);
         }
         if (c.dim() % 2 != 0 || c.kvDim() % 2 != 0 || c.hiddenDim() % 2 != 0) {
             reasons.add("dim, kvDim and hiddenDim must be even");
         }
         if (!reasons.isEmpty()) {
-            throw new IllegalStateException("-D" + PROPERTY + "=true cannot run this session: " + String.join("; ", reasons));
+            throw new IllegalStateException(
+                    "-D"
+                            + PROPERTY
+                            + "=true cannot run this session: "
+                            + String.join("; ", reasons));
         }
     }
 
@@ -118,11 +129,19 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         Configuration c = model.configuration();
         LlamaTornadoWeights w = (LlamaTornadoWeights) model.weights();
 
-        int multiprocessors = TornadoRuntimeProvider.getTornadoRuntime().getBackend(0).getDefaultDevice().getPhysicalDevice().getDeviceMaxComputeUnits();
+        int multiprocessors =
+                TornadoRuntimeProvider.getTornadoRuntime()
+                        .getBackend(0)
+                        .getDefaultDevice()
+                        .getPhysicalDevice()
+                        .getDeviceMaxComputeUnits();
         this.blocksPerSM = Integer.getInteger(PROPERTY + ".blocksPerSM", 1);
         this.blocks = multiprocessors * blocksPerSM;
         // Enough (head, split) units to give every block one, within the scratch.
-        this.splits = Math.max(1, Math.min(MAX_SPLITS, (blocks + c.numberOfHeads() - 1) / c.numberOfHeads()));
+        this.splits =
+                Math.max(
+                        1,
+                        Math.min(MAX_SPLITS, (blocks + c.numberOfHeads() - 1) / c.numberOfHeads()));
 
         int layers = c.numberOfLayers();
         this.wqkv = concatenate(w.wqLayered, w.wkLayered, w.wvLayered);
@@ -138,11 +157,17 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         for (TornadoTensor t : w.rms_ffn_weightLayered) {
             offset = copyInto(norms.getSegment(), offset, t.asFloatArray().getSegment());
         }
-        copyInto(norms.getSegment(), offset, w.rms_final_weight_as_floatArray.asFloatArray().getSegment());
+        copyInto(
+                norms.getSegment(),
+                offset,
+                w.rms_final_weight_as_floatArray.asFloatArray().getSegment());
         norms.set(LlamaMegakernel.epsilonIndex(c.dim(), layers), c.rmsNormEps());
 
         this.x = new FloatArray(c.dim());
-        this.scratch = new FloatArray(LlamaMegakernel.scratchSize(c.dim(), c.hiddenDim(), c.numberOfHeads(), c.headSize(), splits));
+        this.scratch =
+                new FloatArray(
+                        LlamaMegakernel.scratchSize(
+                                c.dim(), c.hiddenDim(), c.numberOfHeads(), c.headSize(), splits));
         this.meta = new IntArray(LlamaMegakernel.META_SIZE);
         meta.set(LlamaMegakernel.META_DIM, c.dim());
         meta.set(LlamaMegakernel.META_KV_DIM, c.kvDim());
@@ -168,7 +193,10 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         if (blocksPerSM > 1) {
             // Every block must be resident, so the register file has to hold blocksPerSM of them.
             int registers = (REGISTERS_PER_SM / (LlamaMegakernel.BLOCK_SIZE * blocksPerSM)) & ~7;
-            executionPlan.withCompilerFlags(TornadoVMBackendType.CUDA, (TornadoOptions.DEFAULT_CUDA_COMPILER_FLAGS + " --maxrregcount=" + registers).trim());
+            executionPlan.withCompilerFlags(
+                    TornadoVMBackendType.CUDA,
+                    (TornadoOptions.DEFAULT_CUDA_COMPILER_FLAGS + " --maxrregcount=" + registers)
+                            .trim());
         }
         executionPlan.withStagedTransfers();
         executionPlan.withPreCompilation();
@@ -177,7 +205,12 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
 
     @Override
     public org.beehive.jitllm.runtime.backend.ExecutionInfo executionInfo() {
-        return PlanDiagnostics.describe(state, "megakernel", 1, "one persistent kernel per token (" + blocks + " blocks, " + splits + " KV splits)", "in-kernel split-KV");
+        return PlanDiagnostics.describe(
+                state,
+                "megakernel",
+                1,
+                "one persistent kernel per token (" + blocks + " blocks, " + splits + " KV splits)",
+                "in-kernel split-KV");
     }
 
     @Override
@@ -185,13 +218,54 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         TornadoWeightsView v = new TornadoWeightsView((LlamaTornadoWeights) model.weights());
         var ws = state.workspace;
         KernelContext context = new KernelContext();
-        TaskGraph graph = new TaskGraph(GRAPH)
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, ws.embeddingX, ws.positionHolder, ws.wrapBlockTable)
-                .transferToDevice(DataTransferMode.FIRST_EXECUTION, context, x, scratch, norms, wqkv, wo, w1, w3, w2, v.wcls, ws.wrapKeyCacheFP16, ws.wrapValueCacheFP16, v.freqReal,
-                        v.freqImag, meta, ws.wrapLogits)
-                .task(TASK, LlamaMegakernel::forward, context, (HalfFloatArray) ws.embeddingX, x, scratch, norms, wqkv, wo, w1, w3, w2, v.wcls, ws.wrapKeyCacheFP16,
-                        ws.wrapValueCacheFP16, v.freqReal, v.freqImag, ws.positionHolder, ws.wrapBlockTable, meta, ws.wrapLogits)
-                .transferToHost(DataTransferMode.EVERY_EXECUTION, ws.wrapLogits);
+        TaskGraph graph =
+                new TaskGraph(GRAPH)
+                        .transferToDevice(
+                                DataTransferMode.EVERY_EXECUTION,
+                                ws.embeddingX,
+                                ws.positionHolder,
+                                ws.wrapBlockTable)
+                        .transferToDevice(
+                                DataTransferMode.FIRST_EXECUTION,
+                                context,
+                                x,
+                                scratch,
+                                norms,
+                                wqkv,
+                                wo,
+                                w1,
+                                w3,
+                                w2,
+                                v.wcls,
+                                ws.wrapKeyCacheFP16,
+                                ws.wrapValueCacheFP16,
+                                v.freqReal,
+                                v.freqImag,
+                                meta,
+                                ws.wrapLogits)
+                        .task(
+                                TASK,
+                                LlamaMegakernel::forward,
+                                context,
+                                (HalfFloatArray) ws.embeddingX,
+                                x,
+                                scratch,
+                                norms,
+                                wqkv,
+                                wo,
+                                w1,
+                                w3,
+                                w2,
+                                v.wcls,
+                                ws.wrapKeyCacheFP16,
+                                ws.wrapValueCacheFP16,
+                                v.freqReal,
+                                v.freqImag,
+                                ws.positionHolder,
+                                ws.wrapBlockTable,
+                                meta,
+                                ws.wrapLogits)
+                        .transferToHost(DataTransferMode.EVERY_EXECUTION, ws.wrapLogits);
         return new TornadoExecutionPlan(graph.snapshot());
     }
 
@@ -226,9 +300,13 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
     }
 
     /** The per-model arrays the layered plan already holds flat. */
-    private record TornadoWeightsView(HalfFloatArray wcls, FloatArray freqReal, FloatArray freqImag) {
+    private record TornadoWeightsView(
+            HalfFloatArray wcls, FloatArray freqReal, FloatArray freqImag) {
         TornadoWeightsView(LlamaTornadoWeights w) {
-            this(w.wclsByteArray.asHalfFloatArray(), w.freq_cis_realFlat.asFloatArray(), w.freq_cis_imagFlat.asFloatArray());
+            this(
+                    w.wclsByteArray.asHalfFloatArray(),
+                    w.freq_cis_realFlat.asFloatArray(),
+                    w.freq_cis_imagFlat.asFloatArray());
         }
     }
 
@@ -241,13 +319,20 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
             }
         }
         if (elements > Integer.MAX_VALUE) {
-            throw new IllegalStateException("a concatenated weight of " + elements + " elements does not fit an int-indexed array");
+            throw new IllegalStateException(
+                    "a concatenated weight of "
+                            + elements
+                            + " elements does not fit an int-indexed array");
         }
         HalfFloatArray flat = new HalfFloatArray((int) elements);
         long offset = 0;
         for (int l = 0; l < perLayer[0].length; l++) {
             for (TornadoTensor[] tensors : perLayer) {
-                offset = copyInto(flat.getSegment(), offset, tensors[l].asHalfFloatArray().getSegment());
+                offset =
+                        copyInto(
+                                flat.getSegment(),
+                                offset,
+                                tensors[l].asHalfFloatArray().getSegment());
             }
         }
         return flat;

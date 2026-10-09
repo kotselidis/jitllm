@@ -11,8 +11,8 @@ import uk.ac.manchester.tornado.api.types.vectors.Half2;
  * The whole Llama F16 single-token forward pass as one persistent kernel.
  *
  * <p>One launch per token instead of one per operation: the grid stays resident and moves from
- * phase to phase through {@link KernelContext#gridBarrier()}. Per layer there are five phases,
- * each ending at a grid barrier:
+ * phase to phase through {@link KernelContext#gridBarrier()}. Per layer there are five phases, each
+ * ending at a grid barrier:
  *
  * <ol>
  *   <li>RMS norm, fused QKV projection, RoPE, and the K/V write into the paged cache. A warp owns a
@@ -31,10 +31,10 @@ import uk.ac.manchester.tornado.api.types.vectors.Half2;
  * <p>Every block normalises the residual stream itself, into shared memory, instead of one block
  * normalising it for everybody: {@code dim} reads per block cost less than another barrier.
  *
- * <p>Contract with {@code TornadoVMMasterPlanMegakernel}, which checks it before building:
- * {@link #BLOCK_SIZE} threads per block, every block resident at once, {@code dim <= }{@link
- * #MAX_DIM}, {@code headSize} a multiple of 32 and at most {@link #MAX_HEAD_SIZE}, {@code dim}, {@code
- * kvDim} and {@code hiddenDim} even.
+ * <p>Contract with {@code TornadoVMMasterPlanMegakernel}, which checks it before building: {@link
+ * #BLOCK_SIZE} threads per block, every block resident at once, {@code dim <= }{@link #MAX_DIM},
+ * {@code headSize} a multiple of 32 and at most {@link #MAX_HEAD_SIZE}, {@code dim}, {@code kvDim}
+ * and {@code hiddenDim} even.
  */
 public final class LlamaMegakernel {
 
@@ -145,7 +145,9 @@ public final class LlamaMegakernel {
 
         for (int l = 0; l < layers; l++) {
             int layerOff = KvBlockAddress.layerOffset(l, kvDim, blockCfg);
-            int cacheOff = KvBlockAddress.offset(blockTable, slot, pos, layerOff, kvDim, blockCfg, blockStride);
+            int cacheOff =
+                    KvBlockAddress.offset(
+                            blockTable, slot, pos, layerOff, kvDim, blockCfg, blockStride);
 
             // 1. RMS norm, QKV, RoPE, K/V into the cache.
             normalize(context, x, norms, l * dim, dim, eps, vec, reduce, tid, warp);
@@ -189,12 +191,23 @@ public final class LlamaMegakernel {
                     acc[k] = 0.0f;
                 }
                 for (int t = start + warp; t < end; t += WARPS) {
-                    int base = KvBlockAddress.offset(blockTable, slot, t, layerOff, kvDim, blockCfg, blockStride) + kvHeadOff;
+                    int base =
+                            KvBlockAddress.offset(
+                                            blockTable,
+                                            slot,
+                                            t,
+                                            layerOff,
+                                            kvDim,
+                                            blockCfg,
+                                            blockStride)
+                                    + kvHeadOff;
                     float partial = 0.0f;
                     for (int k = 0; k < HEAD_VALUES_PER_LANE; k++) {
                         int d = lane + 32 * k;
                         if (d < headSize) {
-                            partial += scratch.get(qOff + h * headSize + d) * keyCache.get(base + d).getFloat32();
+                            partial +=
+                                    scratch.get(qOff + h * headSize + d)
+                                            * keyCache.get(base + d).getFloat32();
                         }
                     }
                     float score = context.simdSum(partial) * invSqrtHead;
@@ -205,7 +218,9 @@ public final class LlamaMegakernel {
                     for (int k = 0; k < HEAD_VALUES_PER_LANE; k++) {
                         int d = lane + 32 * k;
                         if (d < headSize) {
-                            acc[k] = acc[k] * correction + weight * valueCache.get(base + d).getFloat32();
+                            acc[k] =
+                                    acc[k] * correction
+                                            + weight * valueCache.get(base + d).getFloat32();
                         }
                     }
                     runningMax = newMax;
@@ -287,7 +302,15 @@ public final class LlamaMegakernel {
 
             // 5. Down projection and the residual.
             for (int row = globalWarp; row < dim; row += totalWarps) {
-                float s = dotGlobal(context, w2, (l * dim + row) * hiddenDim, scratch, hbOff, hiddenDim, lane);
+                float s =
+                        dotGlobal(
+                                context,
+                                w2,
+                                (l * dim + row) * hiddenDim,
+                                scratch,
+                                hbOff,
+                                hiddenDim,
+                                lane);
                 if (lane == 0) {
                     x.set(row, x.get(row) + s);
                 }
@@ -304,6 +327,7 @@ public final class LlamaMegakernel {
             }
         }
     }
+
     // @formatter:on
 
     /** {@code vec = x * rsqrt(mean(x^2) + eps) * norms[normOff..]}, by every block for itself. */
@@ -341,8 +365,8 @@ public final class LlamaMegakernel {
 
     /**
      * One warp's dot product of an F16 row with the shared vector; every lane gets the sum. Four
-     * independent loads per lane per iteration, so a warp keeps enough bytes in flight to stream the
-     * row at memory bandwidth.
+     * independent loads per lane per iteration, so a warp keeps enough bytes in flight to stream
+     * the row at memory bandwidth.
      */
     private static float dotShared(
             KernelContext context, HalfFloatArray w, int rowOff, float[] vec, int n, int lane) {
@@ -388,9 +412,15 @@ public final class LlamaMegakernel {
             Half2 p2 = w.getHalf2(rowOff + j + 128);
             Half2 p3 = w.getHalf2(rowOff + j + 192);
             s0 += Half2.lowFloat(p0) * v.get(vOff + j) + Half2.highFloat(p0) * v.get(vOff + j + 1);
-            s1 += Half2.lowFloat(p1) * v.get(vOff + j + 64) + Half2.highFloat(p1) * v.get(vOff + j + 65);
-            s2 += Half2.lowFloat(p2) * v.get(vOff + j + 128) + Half2.highFloat(p2) * v.get(vOff + j + 129);
-            s3 += Half2.lowFloat(p3) * v.get(vOff + j + 192) + Half2.highFloat(p3) * v.get(vOff + j + 193);
+            s1 +=
+                    Half2.lowFloat(p1) * v.get(vOff + j + 64)
+                            + Half2.highFloat(p1) * v.get(vOff + j + 65);
+            s2 +=
+                    Half2.lowFloat(p2) * v.get(vOff + j + 128)
+                            + Half2.highFloat(p2) * v.get(vOff + j + 129);
+            s3 +=
+                    Half2.lowFloat(p3) * v.get(vOff + j + 192)
+                            + Half2.highFloat(p3) * v.get(vOff + j + 193);
         }
         for (; j < n; j += 64) {
             Half2 p = w.getHalf2(rowOff + j);

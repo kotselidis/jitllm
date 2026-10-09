@@ -90,6 +90,19 @@ class Commands(unittest.TestCase):
         self.reject("serve", "-m", "stub.gguf", "--gpu", "--continuous-batching", "2",
                     "--with-native-libraries")
 
+    def test_megakernel_is_opt_in_and_experimental(self):
+        help_text = launcher.create_parser("run").format_help()
+        advanced = help_text[help_text.index("Advanced Options"):]
+        self.assertIn("--megakernel", advanced)
+        self.assertIn("[experimental] Decode each token with one", advanced)
+        default = self.parse("run", "-m", "stub.gguf", "--prompt", "hi")
+        self.assertFalse(default.megakernel)
+        self.assertIsNone(default.megakernel_blocks_per_sm)
+        args = self.parse("run", "-m", "stub.gguf", "--prompt", "hi", "--megakernel",
+                          "--megakernel-blocks-per-sm", "2")
+        self.assertTrue(args.megakernel)
+        self.assertEqual(2, args.megakernel_blocks_per_sm)
+
     def test_continuous_batching_is_listed_as_experimental(self):
         serve_help = launcher.create_parser("serve").format_help()
         advanced = serve_help[serve_help.index("Advanced Options"):]
