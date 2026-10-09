@@ -113,10 +113,11 @@ public class Qwen3FP16FFNLayers
         this.gqa = config.numberOfHeads() / config.numberOfKeyValueHeads();
         // FP16 paged split-KV only; the packed-half2 variant and the FP32 cache keep their kernels.
         this.laneAttention =
-                useFp16KVCache()
-                        && !packedHalf2Attention
-                        && !singleWorkgroupAttention
-                        && LaneAttentionPolicy.laneCooperativeAttention(nEmbdHead);
+                !singleWorkgroupAttention
+                        && (useFp16KVCache()
+                                ? !packedHalf2Attention
+                                        && LaneAttentionPolicy.laneCooperativeAttention(nEmbdHead)
+                                : LaneAttentionPolicy.laneCooperativeAttentionFp32Cache(nEmbdHead));
         setupFFNLayers();
     }
 
@@ -538,11 +539,15 @@ public class Qwen3FP16FFNLayers
                         attentionSplits); // number of KV splits per head
             } else {
                 unifiedLayer.task(
-                        tp + "attention",
-                        SplitKvAttentionPolicy.narrow()
+                        tp + attentionTaskName(),
+                        laneAttention
                                 ? TransformerPagedKvKernels
-                                        ::processHeadsFlashAttentionSplitKVPaged32
-                                : TransformerPagedKvKernels::processHeadsFlashAttentionSplitKVPaged,
+                                        ::processHeadsFlashAttentionSplitKVPagedLaneHead128
+                                : SplitKvAttentionPolicy.narrow()
+                                        ? TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPaged32
+                                        : TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPaged,
                         context,
                         qwen3State.workspace.wrapQ, // query vectors
                         qwen3State.workspace.wrapKeyCache, // key cache

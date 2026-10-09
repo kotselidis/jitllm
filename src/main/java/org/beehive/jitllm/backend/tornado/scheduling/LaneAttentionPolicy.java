@@ -69,4 +69,22 @@ public final class LaneAttentionPolicy {
                         .capabilities()
                         .supports(DeviceCapability.SHUFFLE_REDUCED_FP16_GEMV);
     }
+
+    // @formatter:off
+    /**
+     * Whether split-KV decode attention over the FP32 cache runs the lane-cooperative kernel.
+     *
+     * <p>Granted where {@link DeviceCapability#SUBGROUP_SHUFFLE_32} holds (Metal), whose FP32 cache
+     * otherwise runs {@code processHeadsFlashAttentionSplitKVPaged32}: one thread per key, each
+     * reading a whole key row and folding a 128-wide accumulator through threadgroup memory for
+     * every key. Same 128-wide precondition as {@link #laneCooperativeAttention}. CUDA's FP32 cache
+     * keeps its kernel; it was not measured there.
+     */
+    // @formatter:on
+    public static boolean laneCooperativeAttentionFp32Cache(int headSize) {
+        return headSize == SUPPORTED_HEAD_SIZE
+                && TornadoDevices.current()
+                        .capabilities()
+                        .supports(DeviceCapability.SUBGROUP_SHUFFLE_32);
+    }
 }

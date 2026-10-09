@@ -5,6 +5,7 @@ import org.beehive.jitllm.backend.tornado.kernels.Qwen3PagedKvKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.scheduling.LaneAttentionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.backend.tornado.scheduling.SplitKvAttentionPolicy;
@@ -103,6 +104,12 @@ public class Qwen3Q8_0FFNLayers
                                 config.numberOfHeads() * attentionSplits, nEmbdHead);
         WorkerGrid attentionCombineWorker =
                 WorkerGridFactory.createAttentionWorker(config.numberOfHeads(), nEmbdHead);
+        // One warp-group per (head, split) for the lane-cooperative kernel; unused when it is not
+        // selected.
+        WorkerGrid laneAttentionWorker =
+                WorkerGridFactory.createLaneAttentionWorker(
+                        config.numberOfHeads() * attentionSplits,
+                        LaneAttentionPolicy.WARPS_PER_GROUP);
         // attn_output_proj worker (output projection)
         int matmul1Global = config.dim() * LOCAL_WORK_GROUP_SIZE_ALLOC;
         WorkerGrid matmul1Worker =
@@ -130,7 +137,9 @@ public class Qwen3Q8_0FFNLayers
             gridScheduler.addWorkerGrid("layer_" + i + ".rope_and_kv_cache", ropeWorker);
             gridScheduler.addWorkerGrid(
                     "layer_" + i + ".attention",
-                    singleWorkgroupAttention ? attentionCombineWorker : parallelAttentionWorker);
+                    singleWorkgroupAttention
+                            ? attentionCombineWorker
+                            : laneAttention() ? laneAttentionWorker : parallelAttentionWorker);
             if (!singleWorkgroupAttention) {
                 gridScheduler.addWorkerGrid(
                         "layer_" + i + ".attention_combine", attentionCombineWorker);
@@ -360,10 +369,14 @@ public class Qwen3Q8_0FFNLayers
             } else {
                 unifiedLayer.task(
                         "attention",
-                        SplitKvAttentionPolicy.narrow()
+                        laneAttention()
                                 ? TransformerPagedKvKernels
-                                        ::processHeadsFlashAttentionSplitKVPaged32
-                                : TransformerPagedKvKernels::processHeadsFlashAttentionSplitKVPaged,
+                                        ::processHeadsFlashAttentionSplitKVPagedLaneHead128
+                                : SplitKvAttentionPolicy.narrow()
+                                        ? TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPaged32
+                                        : TransformerPagedKvKernels
+                                                ::processHeadsFlashAttentionSplitKVPaged,
                         context,
                         qwen3State.workspace.wrapQ, // query vectors
                         qwen3State.workspace.wrapKeyCache, // key cache
@@ -602,5 +615,16 @@ public class Qwen3Q8_0FFNLayers
      */
     protected String weightSourceGraphName(int layerIndex) {
         return null;
+    }
+
+    /**
+     * Whether split-KV attention over the FP32 cache runs the lane-cooperative kernel; see {@link
+     * LaneAttentionPolicy#laneCooperativeAttentionFp32Cache}. A method rather than a field because
+     * the head width is set in the constructor, after field initializers run.
+     */
+    private boolean laneAttention() {
+        return !singleWorkgroupAttention
+                && !useFp16KVCache()
+                && LaneAttentionPolicy.laneCooperativeAttentionFp32Cache(nEmbdHead);
     }
 }
