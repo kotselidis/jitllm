@@ -64,6 +64,8 @@ public final class TransformerPagedKvBatchPrefillSimdgroupKernels {
         float[] ss = context.allocateFloatLocalArray(4 * 256);
         float[] ds = context.allocateFloatLocalArray(4 * 64);
         float[] vt = context.allocateFloatLocalArray(8 * 128);
+        float[] rmax = context.allocateFloatLocalArray(4 * 32);
+        float[] rsum = context.allocateFloatLocalArray(4 * 32);
         int tid = context.localIdx;
         int sg = tid >> 5;
         int lane = tid & 31;
@@ -98,7 +100,9 @@ public final class TransformerPagedKvBatchPrefillSimdgroupKernels {
         // every
         // row by zero for the others, so a row that read unwritten cache would poison the valid
         // ones.
-        int myPos = start + TornadoMath.min(t0 + sgq + lane, active - 1);
+        int row = lane >> 2;
+        int sub = lane & 3;
+        int myPos = start + TornadoMath.min(t0 + sgq + row, active - 1);
         int sOff = sg << 8;
         int dOff = sg << 6;
         float m = Float.NEGATIVE_INFINITY;
@@ -201,27 +205,36 @@ public final class TransformerPagedKvBatchPrefillSimdgroupKernels {
             context.simdgroupMatrixStore(s2, ss, sOff + 16, 32);
             context.simdgroupMatrixStore(s3, ss, sOff + 24, 32);
             context.localBarrier();
-            if (lane < 8) {
-                int rowOff = sOff + (lane << 5);
-                float mx = m;
-                for (int j = 0; j < 32; j++) {
-                    if (kb0 + j <= myPos) {
-                        mx = TornadoMath.max(mx, ss[rowOff + j] * scale);
-                    }
+            int rowOff = sOff + (row << 5) + (sub << 3);
+            float pmx = Float.NEGATIVE_INFINITY;
+            for (int j = 0; j < 8; j++) {
+                if (kb0 + (sub << 3) + j <= myPos) {
+                    pmx = TornadoMath.max(pmx, ss[rowOff + j] * scale);
                 }
-                float alpha = (m == Float.NEGATIVE_INFINITY) ? 0.0f : TornadoMath.exp(m - mx);
-                float sum = 0.0f;
-                for (int j = 0; j < 32; j++) {
-                    float p = 0.0f;
-                    if (kb0 + j <= myPos) {
-                        p = TornadoMath.exp(ss[rowOff + j] * scale - mx);
-                    }
-                    ss[rowOff + j] = p;
-                    sum += p;
+            }
+            rmax[(sg << 5) + lane] = pmx;
+            context.localBarrier();
+            int rq = (sg << 5) + (row << 2);
+            float mx =
+                    TornadoMath.max(
+                            TornadoMath.max(m, TornadoMath.max(rmax[rq], rmax[rq + 1])),
+                            TornadoMath.max(rmax[rq + 2], rmax[rq + 3]));
+            float alpha = (m == Float.NEGATIVE_INFINITY) ? 0.0f : TornadoMath.exp(m - mx);
+            float psum = 0.0f;
+            for (int j = 0; j < 8; j++) {
+                float p = 0.0f;
+                if (kb0 + (sub << 3) + j <= myPos) {
+                    p = TornadoMath.exp(ss[rowOff + j] * scale - mx);
                 }
-                l = l * alpha + sum;
-                m = mx;
-                ds[dOff + lane * 9] = alpha;
+                ss[rowOff + j] = p;
+                psum += p;
+            }
+            rsum[(sg << 5) + lane] = psum;
+            context.localBarrier();
+            l = l * alpha + ((rsum[rq] + rsum[rq + 1]) + (rsum[rq + 2] + rsum[rq + 3]));
+            m = mx;
+            if (sub == 0) {
+                ds[dOff + row * 9] = alpha;
             }
             context.localBarrier();
             Matrix8x8Float da = context.simdgroupMatrixLoad(ds, dOff, 8);
@@ -855,8 +868,8 @@ public final class TransformerPagedKvBatchPrefillSimdgroupKernels {
             }
             context.localBarrier();
         }
-        if (lane < 8) {
-            ds[dOff + lane * 9] = (l > 0.0f) ? 1.0f / l : 0.0f;
+        if (sub == 0) {
+            ds[dOff + row * 9] = (l > 0.0f) ? 1.0f / l : 0.0f;
         }
         context.localBarrier();
         Matrix8x8Float dn = context.simdgroupMatrixLoad(ds, dOff, 8);

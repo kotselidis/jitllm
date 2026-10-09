@@ -51,8 +51,8 @@ public final class BatchPrefillGemmPolicy {
      * {@code -Djitllm.metal.simdgroupAttention=false} selects the lane-cooperative kernel.
      *
      * <p>Measured on an M4 Pro, Qwen3-0.6B, batch 256, SIMD-group projections (pp512 / pp2048
-     * tok/s): F16 2913 / 1452 lane-cooperative, 3586 / 2439 SIMD-group; Q8_0 2912 / 1453
-     * lane-cooperative, 3591 / 2435 SIMD-group. Greedy text identical; the CPU/GPU parity tests
+     * tok/s): F16 2913 / 1452 lane-cooperative, 3698 / 2645 SIMD-group; Q8_0 2912 / 1453
+     * lane-cooperative, 3664 / 2636 SIMD-group. Greedy text identical; the CPU/GPU parity tests
      * pass.
      */
     // @formatter:on
