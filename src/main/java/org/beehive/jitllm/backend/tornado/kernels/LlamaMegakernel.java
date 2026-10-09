@@ -339,15 +339,33 @@ public final class LlamaMegakernel {
         context.localBarrier();
     }
 
-    /** One warp's dot product of an F16 row with the shared vector; every lane gets the sum. */
+    /**
+     * One warp's dot product of an F16 row with the shared vector; every lane gets the sum. Four
+     * independent loads per lane per iteration, so a warp keeps enough bytes in flight to stream the
+     * row at memory bandwidth.
+     */
     private static float dotShared(
             KernelContext context, HalfFloatArray w, int rowOff, float[] vec, int n, int lane) {
-        float sum = 0.0f;
-        for (int j = 2 * lane; j < n; j += 64) {
-            Half2 pair = w.getHalf2(rowOff + j);
-            sum += Half2.lowFloat(pair) * vec[j] + Half2.highFloat(pair) * vec[j + 1];
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        float s3 = 0.0f;
+        int j = 2 * lane;
+        for (; j < n - 192; j += 256) {
+            Half2 p0 = w.getHalf2(rowOff + j);
+            Half2 p1 = w.getHalf2(rowOff + j + 64);
+            Half2 p2 = w.getHalf2(rowOff + j + 128);
+            Half2 p3 = w.getHalf2(rowOff + j + 192);
+            s0 += Half2.lowFloat(p0) * vec[j] + Half2.highFloat(p0) * vec[j + 1];
+            s1 += Half2.lowFloat(p1) * vec[j + 64] + Half2.highFloat(p1) * vec[j + 65];
+            s2 += Half2.lowFloat(p2) * vec[j + 128] + Half2.highFloat(p2) * vec[j + 129];
+            s3 += Half2.lowFloat(p3) * vec[j + 192] + Half2.highFloat(p3) * vec[j + 193];
         }
-        return context.simdSum(sum);
+        for (; j < n; j += 64) {
+            Half2 p = w.getHalf2(rowOff + j);
+            s0 += Half2.lowFloat(p) * vec[j] + Half2.highFloat(p) * vec[j + 1];
+        }
+        return context.simdSum((s0 + s1) + (s2 + s3));
     }
 
     /** As {@link #dotShared}, against a vector in global memory. */
@@ -359,11 +377,25 @@ public final class LlamaMegakernel {
             int vOff,
             int n,
             int lane) {
-        float sum = 0.0f;
-        for (int j = 2 * lane; j < n; j += 64) {
-            Half2 pair = w.getHalf2(rowOff + j);
-            sum += Half2.lowFloat(pair) * v.get(vOff + j) + Half2.highFloat(pair) * v.get(vOff + j + 1);
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        float s3 = 0.0f;
+        int j = 2 * lane;
+        for (; j < n - 192; j += 256) {
+            Half2 p0 = w.getHalf2(rowOff + j);
+            Half2 p1 = w.getHalf2(rowOff + j + 64);
+            Half2 p2 = w.getHalf2(rowOff + j + 128);
+            Half2 p3 = w.getHalf2(rowOff + j + 192);
+            s0 += Half2.lowFloat(p0) * v.get(vOff + j) + Half2.highFloat(p0) * v.get(vOff + j + 1);
+            s1 += Half2.lowFloat(p1) * v.get(vOff + j + 64) + Half2.highFloat(p1) * v.get(vOff + j + 65);
+            s2 += Half2.lowFloat(p2) * v.get(vOff + j + 128) + Half2.highFloat(p2) * v.get(vOff + j + 129);
+            s3 += Half2.lowFloat(p3) * v.get(vOff + j + 192) + Half2.highFloat(p3) * v.get(vOff + j + 193);
         }
-        return context.simdSum(sum);
+        for (; j < n; j += 64) {
+            Half2 p = w.getHalf2(rowOff + j);
+            s0 += Half2.lowFloat(p) * v.get(vOff + j) + Half2.highFloat(p) * v.get(vOff + j + 1);
+        }
+        return context.simdSum((s0 + s1) + (s2 + s3));
     }
 }

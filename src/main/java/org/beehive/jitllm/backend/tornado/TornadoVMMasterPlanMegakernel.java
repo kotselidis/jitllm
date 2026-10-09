@@ -25,6 +25,7 @@ import uk.ac.manchester.tornado.api.runtime.TornadoRuntimeProvider;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.runtime.common.TornadoOptions;
 
 /**
  * Single-token decode as one persistent kernel per token ({@link LlamaMegakernel}).
@@ -36,7 +37,8 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  *
  * <p>The grid is {@code blocksPerSM} blocks of {@link LlamaMegakernel#BLOCK_SIZE} threads per
  * multiprocessor ({@code -Djitllm.megakernel.blocksPerSM}, default 1). It must fit on the device at
- * once: the cooperative launch refuses a grid that does not, by name.
+ * once: the cooperative launch refuses a grid that does not, by name. Above one block per
+ * multiprocessor the kernel is compiled with a register cap that lets that many fit.
  */
 public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan {
 
@@ -45,10 +47,13 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
     private static final String GRAPH = "megakernel";
     private static final String TASK = "forward";
     private static final int MAX_SPLITS = 16;
+    /** 32-bit registers per multiprocessor on every architecture since Kepler. */
+    private static final int REGISTERS_PER_SM = 65536;
 
     private final State state;
     private final Model model;
     private final TornadoMetricsReporter metrics;
+    private final int blocksPerSM;
     private final int blocks;
     private final int splits;
 
@@ -114,7 +119,8 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         LlamaTornadoWeights w = (LlamaTornadoWeights) model.weights();
 
         int multiprocessors = TornadoRuntimeProvider.getTornadoRuntime().getBackend(0).getDefaultDevice().getPhysicalDevice().getDeviceMaxComputeUnits();
-        this.blocks = multiprocessors * Integer.getInteger(PROPERTY + ".blocksPerSM", 1);
+        this.blocksPerSM = Integer.getInteger(PROPERTY + ".blocksPerSM", 1);
+        this.blocks = multiprocessors * blocksPerSM;
         // Enough (head, split) units to give every block one, within the scratch.
         this.splits = Math.max(1, Math.min(MAX_SPLITS, (blocks + c.numberOfHeads() - 1) / c.numberOfHeads()));
 
@@ -158,6 +164,11 @@ public final class TornadoVMMasterPlanMegakernel implements TornadoVMMasterPlan 
         metrics.enableOn(executionPlan);
         if (CUDA_GRAPHS) {
             executionPlan.withAllGraphs().withCUDAGraph();
+        }
+        if (blocksPerSM > 1) {
+            // Every block must be resident, so the register file has to hold blocksPerSM of them.
+            int registers = (REGISTERS_PER_SM / (LlamaMegakernel.BLOCK_SIZE * blocksPerSM)) & ~7;
+            executionPlan.withCompilerFlags(TornadoVMBackendType.CUDA, (TornadoOptions.DEFAULT_CUDA_COMPILER_FLAGS + " --maxrregcount=" + registers).trim());
         }
         executionPlan.withStagedTransfers();
         executionPlan.withPreCompilation();
