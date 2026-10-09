@@ -59,6 +59,14 @@ public final class LlamaMegakernel {
     private static final int WARPS = BLOCK_SIZE / 32;
     private static final int HEAD_VALUES_PER_LANE = MAX_HEAD_SIZE / 32;
 
+    /**
+     * The widest residual stream the fused down projection supports: each lane keeps {@code dim /
+     * 32} down-projection sums in registers.
+     */
+    public static final int FUSED_MAX_DIM = 2048;
+
+    private static final int FUSED_VALUES_PER_LANE = FUSED_MAX_DIM / 32;
+
     // Layout of the meta array.
     public static final int META_DIM = 0;
     public static final int META_KV_DIM = 1;
@@ -74,8 +82,13 @@ public final class LlamaMegakernel {
 
     /** 1 to pick the greedy token in the kernel ({@code sampledToken}), 0 to only write logits. */
     public static final int META_DEVICE_SAMPLE = 11;
+    /**
+     * 1 when {@code w2} is stored transposed, rows padded to {@link #FUSED_MAX_DIM}, and the down
+     * projection is fused into gate/up.
+     */
+    public static final int META_FUSED_DOWN = 12;
 
-    public static final int META_SIZE = 12;
+    public static final int META_SIZE = 13;
 
     private LlamaMegakernel() {}
 
@@ -85,7 +98,7 @@ public final class LlamaMegakernel {
      */
     public static int scratchSize(
             int dim, int hiddenDim, int heads, int headSize, int splits, int blocks) {
-        return dim + hiddenDim + heads * splits * (headSize + 2) + 2 * blocks * WARPS;
+        return dim + hiddenDim + heads * splits * (headSize + 2) + 2 * blocks * WARPS + blocks * dim;
     }
 
     /**
@@ -132,6 +145,8 @@ public final class LlamaMegakernel {
         float[] mergeSum = context.allocateFloatLocalArray(WARPS);
         float[] mergeAcc = context.allocateFloatLocalArray(WARPS * MAX_HEAD_SIZE);
         float[] acc = new float[HEAD_VALUES_PER_LANE];
+        float[] down = new float[FUSED_VALUES_PER_LANE];
+        int fusedDown = meta.get(META_FUSED_DOWN);
 
         int dim = meta.get(META_DIM);
         int kvDim = meta.get(META_KV_DIM);
@@ -319,49 +334,106 @@ public final class LlamaMegakernel {
             }
             context.gridBarrier();
 
-            // 4. RMS norm, gate and up projections, SwiGLU.
-            normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp);
-            for (int row = globalWarp; row < hiddenDim; row += totalWarps) {
-                int rowOff = (l * hiddenDim + row) * dim;
-                float gate = dotShared(context, w1, rowOff, vec, dim, lane);
-                float up = dotShared(context, w3, rowOff, vec, dim, lane);
-                if (lane == 0) {
-                    scratch.set(hbOff + row, gate / (1.0f + TornadoMath.exp(-gate)) * up);
+            if (fusedDown != 0) {
+                // 4+5 fused. w2 is stored [hidden][FUSED_MAX_DIM]: the warp that produces
+                // hb[row] streams row `row` of it into per-lane register sums, so the down
+                // projection's reads overlap gate/up's instead of following them in a phase of
+                // their own. The block sums its warps in a fixed order, writes one partial, and
+                // after the barrier the partials are added in block order: deterministic, though
+                // not the layered plan's summation order. Rows are padded so the inner loop has
+                // no bounds test, which would keep the compiler from batching its loads.
+                normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp);
+                for (int k = 0; k < FUSED_VALUES_PER_LANE; k++) {
+                    down[k] = 0.0f;
                 }
-            }
-            if (globalWarp < dim) {
-                prefetchRow(context, w2, (l * dim + globalWarp) * hiddenDim, hiddenDim, lane);
-            }
-            context.gridBarrier();
-
-            // 5. Down projection and the residual, against the hidden vector in shared memory
-            // when it fits.
-            if (hiddenDim <= VEC_SIZE) {
-                for (int i = tid; i < hiddenDim; i += BLOCK_SIZE) {
-                    vec[i] = scratch.get(hbOff + i);
-                }
-                context.localBarrier();
-                for (int row = globalWarp; row < dim; row += totalWarps) {
-                    float s =
-                            dotShared(
-                                    context, w2, (l * dim + row) * hiddenDim, vec, hiddenDim, lane);
-                    if (lane == 0) {
-                        x.set(row, x.get(row) + s);
+                for (int row = globalWarp; row < hiddenDim; row += totalWarps) {
+                    int rowOff = (l * hiddenDim + row) * dim;
+                    float gate = dotShared(context, w1, rowOff, vec, dim, lane);
+                    float up = dotShared(context, w3, rowOff, vec, dim, lane);
+                    float h = gate / (1.0f + TornadoMath.exp(-gate)) * up;
+                    int downOff = (l * hiddenDim + row) * FUSED_MAX_DIM + 2 * lane;
+                    for (int k = 0; k < FUSED_VALUES_PER_LANE / 2; k++) {
+                        Half2 p = w2.getHalf2(downOff + k * 64);
+                        down[2 * k] += h * Half2.lowFloat(p);
+                        down[2 * k + 1] += h * Half2.highFloat(p);
                     }
                 }
+                context.localBarrier();
+                for (int w = 0; w < WARPS; w++) {
+                    if (warp == w) {
+                        for (int k = 0; k < FUSED_VALUES_PER_LANE / 2; k++) {
+                            int j = k * 64 + 2 * lane;
+                            if (j < dim) {
+                                if (w == 0) {
+                                    vec[j] = down[2 * k];
+                                    vec[j + 1] = down[2 * k + 1];
+                                } else {
+                                    vec[j] += down[2 * k];
+                                    vec[j + 1] += down[2 * k + 1];
+                                }
+                            }
+                        }
+                    }
+                    context.localBarrier();
+                }
+                int partOff = attOff + heads * splits * partStride + 2 * totalWarps;
+                for (int i = tid; i < dim; i += BLOCK_SIZE) {
+                    scratch.set(partOff + block * dim + i, vec[i]);
+                }
+                context.gridBarrier();
+                // The residual: the blocks' partials in block order.
+                for (int i = context.globalIdx; i < dim; i += context.globalGroupSizeX) {
+                    float sum = x.get(i);
+                    for (int b = 0; b < blocks; b++) {
+                        sum += scratch.get(partOff + b * dim + i);
+                    }
+                    x.set(i, sum);
+                }
             } else {
-                for (int row = globalWarp; row < dim; row += totalWarps) {
-                    float s =
-                            dotGlobal(
-                                    context,
-                                    w2,
-                                    (l * dim + row) * hiddenDim,
-                                    scratch,
-                                    hbOff,
-                                    hiddenDim,
-                                    lane);
+                // 4. RMS norm, gate and up projections, SwiGLU.
+                normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp);
+                for (int row = globalWarp; row < hiddenDim; row += totalWarps) {
+                    int rowOff = (l * hiddenDim + row) * dim;
+                    float gate = dotShared(context, w1, rowOff, vec, dim, lane);
+                    float up = dotShared(context, w3, rowOff, vec, dim, lane);
                     if (lane == 0) {
-                        x.set(row, x.get(row) + s);
+                        scratch.set(hbOff + row, gate / (1.0f + TornadoMath.exp(-gate)) * up);
+                    }
+                }
+                if (globalWarp < dim) {
+                    prefetchRow(context, w2, (l * dim + globalWarp) * hiddenDim, hiddenDim, lane);
+                }
+                context.gridBarrier();
+
+                // 5. Down projection and the residual, against the hidden vector in shared memory
+                // when it fits.
+                if (hiddenDim <= VEC_SIZE) {
+                    for (int i = tid; i < hiddenDim; i += BLOCK_SIZE) {
+                        vec[i] = scratch.get(hbOff + i);
+                    }
+                    context.localBarrier();
+                    for (int row = globalWarp; row < dim; row += totalWarps) {
+                        float s =
+                                dotShared(
+                                        context, w2, (l * dim + row) * hiddenDim, vec, hiddenDim, lane);
+                        if (lane == 0) {
+                            x.set(row, x.get(row) + s);
+                        }
+                    }
+                } else {
+                    for (int row = globalWarp; row < dim; row += totalWarps) {
+                        float s =
+                                dotGlobal(
+                                        context,
+                                        w2,
+                                        (l * dim + row) * hiddenDim,
+                                        scratch,
+                                        hbOff,
+                                        hiddenDim,
+                                        lane);
+                        if (lane == 0) {
+                            x.set(row, x.get(row) + s);
+                        }
                     }
                 }
             }
