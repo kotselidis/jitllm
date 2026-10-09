@@ -1,0 +1,382 @@
+package org.beehive.jitllm.backend.tornado.kernels;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assume.assumeTrue;
+
+import org.beehive.jitllm.backend.tornado.scheduling.BatchPrefillGemmPolicy;
+import org.junit.Test;
+import uk.ac.manchester.tornado.api.GridScheduler;
+import uk.ac.manchester.tornado.api.KernelContext;
+import uk.ac.manchester.tornado.api.TaskGraph;
+import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
+import uk.ac.manchester.tornado.api.WorkerGrid1D;
+import uk.ac.manchester.tornado.api.enums.DataTransferMode;
+import uk.ac.manchester.tornado.api.types.HalfFloat;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
+import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
+
+// @formatter:off
+/**
+ * {@link TransformerBatchPrefillSimdgroupKernels} against host references, for whole tiles and for
+ * batches and row counts that end inside a tile (the fragment-at-a-time write-back).
+ *
+ * <p>Activations and weights are small multiples of a quarter and Q8_0 scales are powers of two, so
+ * every product and partial sum is exact in {@code float}: the projections must match their
+ * reference bit for bit, which catches an index or transposition error that a tolerance could hide.
+ * Only the gate/up kernels' {@code SiLU} is compared with a tolerance.
+ */
+// @formatter:on
+public class TransformerBatchPrefillSimdgroupKernelsAccelTest {
+
+    private static final float UNTOUCHED = -12345.5f;
+
+    private static float value(int a, int b) {
+        return (((a * 7 + b * 3) % 9) - 4) * 0.25f;
+    }
+
+    private static float weight(int row, int k) {
+        return (((row * 5 + k * 11) % 7) - 3) * 0.25f;
+    }
+
+    private static HalfFloatArray fp16Weights(int rows, int n) {
+        HalfFloatArray w = new HalfFloatArray(rows * n);
+        for (int r = 0; r < rows; r++) {
+            for (int k = 0; k < n; k++) {
+                w.set(r * n + k, new HalfFloat(weight(r, k)));
+            }
+        }
+        return w;
+    }
+
+    /** Q8_0 rows: per 32 columns a half scale of {@code 0.25 * 2^(block % 3)} and int8 values. */
+    private static ByteArray q8Weights(int rows, int n) {
+        int blocks = n / 32;
+        ByteArray w = new ByteArray(rows * blocks * 34);
+        for (int r = 0; r < rows; r++) {
+            for (int b = 0; b < blocks; b++) {
+                int base = (r * blocks + b) * 34;
+                short bits = Float.floatToFloat16(q8Scale(b));
+                w.set(base, (byte) bits);
+                w.set(base + 1, (byte) (bits >> 8));
+                for (int i = 0; i < 32; i++) {
+                    w.set(base + 2 + i, (byte) q8Value(r, b * 32 + i));
+                }
+            }
+        }
+        return w;
+    }
+
+    private static float q8Scale(int block) {
+        return 0.25f * (1 << (block % 3));
+    }
+
+    private static int q8Value(int row, int k) {
+        return ((row * 13 + k * 5) % 23) - 11;
+    }
+
+    private static float q8Weight(int row, int k) {
+        return q8Value(row, k) * q8Scale(k / 32);
+    }
+
+    private interface Weights {
+        float at(int row, int k);
+    }
+
+    private static FloatArray activations(int batch, int n) {
+        FloatArray x = new FloatArray(batch * n);
+        for (int b = 0; b < batch; b++) {
+            for (int k = 0; k < n; k++) {
+                x.set(b * n + k, value(b, k));
+            }
+        }
+        return x;
+    }
+
+    private static float dot(FloatArray x, int b, int n, Weights w, int row) {
+        float sum = 0.0f;
+        for (int k = 0; k < n; k++) {
+            sum += x.get(b * n + k) * w.at(row, k);
+        }
+        return sum;
+    }
+
+    private static void run(TaskGraph graph, String name, int groups) {
+        WorkerGrid1D worker =
+                new WorkerGrid1D(groups * TransformerBatchPrefillSimdgroupKernels.THREADS);
+        worker.setLocalWork(TransformerBatchPrefillSimdgroupKernels.THREADS, 1, 1);
+        GridScheduler scheduler = new GridScheduler();
+        scheduler.addWorkerGrid(name + ".t", worker);
+        try (TornadoExecutionPlan plan = new TornadoExecutionPlan(graph.snapshot())) {
+            plan.withGridScheduler(scheduler).execute();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static void assumeMetal() {
+        assumeTrue("SIMD-group matrices are Metal only", BatchPrefillGemmPolicy.tiled());
+    }
+
+    private static void checkResidual(boolean q8, int n, int d, int batch) {
+        assumeMetal();
+        FloatArray x = activations(batch, n);
+        FloatArray out = new FloatArray(batch * d);
+        float[] expected = new float[batch * d];
+        Weights w =
+                q8
+                        ? TransformerBatchPrefillSimdgroupKernelsAccelTest::q8Weight
+                        : TransformerBatchPrefillSimdgroupKernelsAccelTest::weight;
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < d; r++) {
+                float start = value(r, b + 1);
+                out.set(b * d + r, start);
+                expected[b * d + r] = start + dot(x, b, n, w, r);
+            }
+        }
+        String name = "simdgroupResidual" + (q8 ? "Q8" : "FP16") + d + "x" + batch;
+        TaskGraph graph =
+                new TaskGraph(name).transferToDevice(DataTransferMode.EVERY_EXECUTION, x, out);
+        if (q8) {
+            ByteArray wq = q8Weights(d, n);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, wq);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmQ8WithResidual,
+                    new KernelContext(),
+                    x,
+                    out,
+                    wq,
+                    n,
+                    d,
+                    batch);
+        } else {
+            HalfFloatArray wh = fp16Weights(d, n);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, wh);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmFP16WithResidual,
+                    new KernelContext(),
+                    x,
+                    out,
+                    wh,
+                    n,
+                    d,
+                    batch);
+        }
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+        run(graph, name, ((d + 63) / 64) * ((batch + 63) / 64));
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(name + " element " + i, expected[i], out.get(i), 0.0f);
+        }
+    }
+
+    private static void checkGateUp(boolean q8, int dim, int hiddenDim, int batch) {
+        assumeMetal();
+        FloatArray x = activations(batch, dim);
+        FloatArray rms = new FloatArray(dim);
+        rms.init(1.0f);
+        FloatArray scale = new FloatArray(batch);
+        scale.init(1.0f);
+        FloatArray hb = new FloatArray(batch * hiddenDim);
+        hb.init(UNTOUCHED);
+        Weights w1 =
+                q8
+                        ? TransformerBatchPrefillSimdgroupKernelsAccelTest::q8Weight
+                        : TransformerBatchPrefillSimdgroupKernelsAccelTest::weight;
+        Weights w3 = q8 ? (r, k) -> q8Weight(r + 1, k) : (r, k) -> weight(r + 1, k);
+        String name = "simdgroupGateUp" + (q8 ? "Q8" : "FP16") + hiddenDim + "x" + batch;
+        TaskGraph graph =
+                new TaskGraph(name)
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, x, rms, scale, hb);
+        if (q8) {
+            ByteArray g = q8Weights(hiddenDim + 1, dim);
+            ByteArray g1 = new ByteArray(hiddenDim * (dim / 32) * 34);
+            ByteArray g3 = new ByteArray(hiddenDim * (dim / 32) * 34);
+            int rowBytes = (dim / 32) * 34;
+            for (int i = 0; i < hiddenDim * rowBytes; i++) {
+                g1.set(i, g.get(i));
+                g3.set(i, g.get(i + rowBytes));
+            }
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, g1, g3);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmRmsNormFFNGateUpQ8,
+                    new KernelContext(),
+                    x,
+                    hb,
+                    rms,
+                    scale,
+                    g1,
+                    g3,
+                    dim,
+                    hiddenDim,
+                    batch);
+        } else {
+            HalfFloatArray g = fp16Weights(hiddenDim + 1, dim);
+            HalfFloatArray g1 = new HalfFloatArray(hiddenDim * dim);
+            HalfFloatArray g3 = new HalfFloatArray(hiddenDim * dim);
+            for (int i = 0; i < hiddenDim * dim; i++) {
+                g1.set(i, g.get(i));
+                g3.set(i, g.get(i + dim));
+            }
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, g1, g3);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmRmsNormFFNGateUpFP16,
+                    new KernelContext(),
+                    x,
+                    hb,
+                    rms,
+                    scale,
+                    g1,
+                    g3,
+                    dim,
+                    hiddenDim,
+                    batch);
+        }
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, hb);
+        run(graph, name, ((hiddenDim + 31) / 32) * ((batch + 63) / 64));
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < hiddenDim; r++) {
+                float gate = dot(x, b, dim, w1, r);
+                float up = dot(x, b, dim, w3, r);
+                float expected = (gate / (1.0f + (float) Math.exp(-gate))) * up;
+                assertEquals(
+                        name + " token " + b + " row " + r,
+                        expected,
+                        hb.get(b * hiddenDim + r),
+                        1e-4f * Math.max(1.0f, Math.abs(expected)));
+            }
+        }
+    }
+
+    private static void checkQkv(boolean q8, int dim, int qDim, int kvDim, int batch) {
+        assumeMetal();
+        FloatArray xf = activations(batch, dim);
+        FloatArray q = new FloatArray(batch * qDim);
+        FloatArray k = new FloatArray(batch * kvDim);
+        FloatArray v = new FloatArray(batch * kvDim);
+        q.init(UNTOUCHED);
+        k.init(UNTOUCHED);
+        v.init(UNTOUCHED);
+        String name = "simdgroupQkv" + (q8 ? "Q8" : "FP16") + batch;
+        TaskGraph graph = new TaskGraph(name);
+        if (q8) {
+            ByteArray wq = q8Weights(qDim, dim);
+            ByteArray wk = q8Weights(kvDim, dim);
+            ByteArray wv = q8Weights(kvDim, dim);
+            graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, xf, q, k, v);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, wq, wk, wv);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmQKVQ8,
+                    new KernelContext(),
+                    xf,
+                    q,
+                    k,
+                    v,
+                    wq,
+                    wk,
+                    wv,
+                    dim,
+                    qDim,
+                    kvDim,
+                    batch);
+        } else {
+            HalfFloatArray xh = new HalfFloatArray(batch * dim);
+            for (int i = 0; i < batch * dim; i++) {
+                xh.set(i, new HalfFloat(xf.get(i)));
+            }
+            HalfFloatArray wq = fp16Weights(qDim, dim);
+            HalfFloatArray wk = fp16Weights(kvDim, dim);
+            HalfFloatArray wv = fp16Weights(kvDim, dim);
+            graph.transferToDevice(DataTransferMode.EVERY_EXECUTION, xh, q, k, v);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, wq, wk, wv);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmQKVFP16,
+                    new KernelContext(),
+                    xh,
+                    q,
+                    k,
+                    v,
+                    wq,
+                    wk,
+                    wv,
+                    dim,
+                    qDim,
+                    kvDim,
+                    batch);
+        }
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, q, k, v);
+        run(graph, name, ((qDim + 2 * kvDim) / 64) * ((batch + 63) / 64));
+        Weights w =
+                q8
+                        ? TransformerBatchPrefillSimdgroupKernelsAccelTest::q8Weight
+                        : TransformerBatchPrefillSimdgroupKernelsAccelTest::weight;
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < qDim; r++) {
+                assertEquals(
+                        name + " q " + b + "," + r,
+                        dot(xf, b, dim, w, r),
+                        q.get(b * qDim + r),
+                        0.0f);
+            }
+            for (int r = 0; r < kvDim; r++) {
+                assertEquals(
+                        name + " k " + b + "," + r,
+                        dot(xf, b, dim, w, r),
+                        k.get(b * kvDim + r),
+                        0.0f);
+                assertEquals(
+                        name + " v " + b + "," + r,
+                        dot(xf, b, dim, w, r),
+                        v.get(b * kvDim + r),
+                        0.0f);
+            }
+        }
+    }
+
+    @Test
+    public void fp16ResidualWholeTiles() {
+        checkResidual(false, 96, 128, 128);
+    }
+
+    @Test
+    public void fp16ResidualPartialTiles() {
+        checkResidual(false, 96, 72, 70);
+    }
+
+    @Test
+    public void q8ResidualWholeTiles() {
+        checkResidual(true, 96, 128, 128);
+    }
+
+    @Test
+    public void q8ResidualPartialTiles() {
+        checkResidual(true, 96, 72, 70);
+    }
+
+    @Test
+    public void fp16GateUp() {
+        checkGateUp(false, 64, 40, 70);
+    }
+
+    @Test
+    public void q8GateUp() {
+        checkGateUp(true, 64, 40, 70);
+    }
+
+    @Test
+    public void fp16QkvWholeAndPartialTiles() {
+        checkQkv(false, 64, 128, 64, 128);
+        checkQkv(false, 64, 128, 64, 70);
+    }
+
+    @Test
+    public void q8QkvWholeAndPartialTiles() {
+        checkQkv(true, 64, 128, 64, 128);
+        checkQkv(true, 64, 128, 64, 70);
+    }
+}

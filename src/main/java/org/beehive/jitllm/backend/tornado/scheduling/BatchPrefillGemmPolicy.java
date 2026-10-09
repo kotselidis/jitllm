@@ -24,4 +24,22 @@ public final class BatchPrefillGemmPolicy {
     public static boolean tiled() {
         return TornadoDevices.current().backend().equals(BackendId.METAL);
     }
+
+    // @formatter:off
+    /**
+     * Whether the tiled projections run on SIMD-group matrices ({@link
+     * org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillSimdgroupKernels}) instead
+     * of scalar FMAs. On by default with {@link #tiled()}; {@code
+     * -Djitllm.metal.simdgroupGemm=false} selects the scalar kernels.
+     *
+     * <p>Measured on an M4 Pro, Qwen3-0.6B, batch 256 (pp512 / pp2048 tok/s): F16 1965 / 1175
+     * scalar, 2929 / 1461 SIMD-group; Q8_0 1944 / 1166 scalar, 2931 / 1462 SIMD-group. Greedy text
+     * identical; the CPU/GPU parity tests pass. Q8_0 weights are staged as {@code float}: rounding
+     * the dequantized weights to {@code half} was faster but failed the batched-prefill parity
+     * budget.
+     */
+    // @formatter:on
+    public static boolean simdgroup() {
+        return tiled() && !"false".equals(System.getProperty("jitllm.metal.simdgroupGemm"));
+    }
 }

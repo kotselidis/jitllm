@@ -5,6 +5,7 @@ import java.util.stream.IntStream;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen3Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen3PagedKvKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillSimdgroupKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.layers.BatchPrefillTransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.scheduling.BatchPrefillGemmPolicy;
@@ -159,7 +160,9 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         layer.task(
                 "batch_qkv",
                 tiledQkv()
-                        ? TransformerBatchPrefillKernels::batchedGemmQKVQ8
+                        ? (simdgroupGemm()
+                                ? TransformerBatchPrefillSimdgroupKernels::batchedGemmQKVQ8
+                                : TransformerBatchPrefillKernels::batchedGemmQKVQ8)
                         : Qwen3Kernels::batchedFusedQKVMatmulQ8_0,
                 context,
                 state.workspace.wrapXbBatch,
@@ -278,7 +281,9 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         layer.task(
                 "batch_attn_out",
                 tiledGemm()
-                        ? TransformerBatchPrefillKernels::batchedGemmQ8WithResidual
+                        ? (simdgroupGemm()
+                                ? TransformerBatchPrefillSimdgroupKernels::batchedGemmQ8WithResidual
+                                : TransformerBatchPrefillKernels::batchedGemmQ8WithResidual)
                         : TransformerBatchPrefillKernels::batchedMatVecWithResidualQ8,
                 context,
                 state.workspace.wrapXbBatch,
@@ -301,7 +306,10 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         layer.task(
                 "batch_ffn_gate_up",
                 tiledGemm()
-                        ? TransformerBatchPrefillKernels::batchedGemmRmsNormFFNGateUpQ8
+                        ? (simdgroupGemm()
+                                ? TransformerBatchPrefillSimdgroupKernels
+                                        ::batchedGemmRmsNormFFNGateUpQ8
+                                : TransformerBatchPrefillKernels::batchedGemmRmsNormFFNGateUpQ8)
                         : TransformerBatchPrefillKernels::batchedFusedRmsNormFFNGateUpQ8,
                 context,
                 state.workspace.wrapXBatch,
@@ -317,7 +325,9 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
         layer.task(
                 "batch_ffn_down",
                 tiledGemm()
-                        ? TransformerBatchPrefillKernels::batchedGemmQ8WithResidual
+                        ? (simdgroupGemm()
+                                ? TransformerBatchPrefillSimdgroupKernels::batchedGemmQ8WithResidual
+                                : TransformerBatchPrefillKernels::batchedGemmQ8WithResidual)
                         : TransformerBatchPrefillKernels::batchedMatVecWithResidualQ8,
                 context,
                 state.workspace.wrapHbBatch,
@@ -363,15 +373,18 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
                 WorkerGridFactory.genericWorker(
                         batchSize * config.numberOfHeads() * optLocal, optLocal);
 
+        int gemmLocal = simdgroupGemm() ? TransformerBatchPrefillSimdgroupKernels.THREADS : 256;
+        int hidTile = simdgroupGemm() ? 32 : 64;
         WorkerGrid gemmDimWorker =
                 WorkerGridFactory.genericWorker(
-                        ((dim + 63) / 64) * ((batchSize + 63) / 64) * 256, 256);
+                        ((dim + 63) / 64) * ((batchSize + 63) / 64) * gemmLocal, gemmLocal);
         WorkerGrid gemmHidWorker =
                 WorkerGridFactory.genericWorker(
-                        ((hidDim + 63) / 64) * ((batchSize + 63) / 64) * 256, 256);
+                        ((hidDim + hidTile - 1) / hidTile) * ((batchSize + 63) / 64) * gemmLocal,
+                        gemmLocal);
         WorkerGrid gemmQkvWorker =
                 WorkerGridFactory.genericWorker(
-                        ((qDim + 2 * kvDim) / 64) * ((batchSize + 63) / 64) * 256, 256);
+                        ((qDim + 2 * kvDim) / 64) * ((batchSize + 63) / 64) * gemmLocal, gemmLocal);
         WorkerGrid matVecDimWorker =
                 WorkerGridFactory.genericWorker(
                         batchSize * dim * LOCAL_WORK_GROUP_SIZE, LOCAL_WORK_GROUP_SIZE);
@@ -445,6 +458,11 @@ public class Qwen3Q8_0LayersBatchPrefill implements BatchPrefillTransformerLayer
     /** The tiled projection kernels; see {@link BatchPrefillGemmPolicy}. */
     private static boolean tiledGemm() {
         return BatchPrefillGemmPolicy.tiled();
+    }
+
+    /** The tiled projections on SIMD-group matrices; see {@link BatchPrefillGemmPolicy}. */
+    private static boolean simdgroupGemm() {
+        return BatchPrefillGemmPolicy.simdgroup();
     }
 
     /** The tiled QKV kernel needs every 64-row tile to lie in one of Q, K and V. */
