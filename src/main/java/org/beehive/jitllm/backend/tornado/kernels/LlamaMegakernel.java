@@ -82,13 +82,23 @@ public final class LlamaMegakernel {
 
     /** 1 to pick the greedy token in the kernel ({@code sampledToken}), 0 to only write logits. */
     public static final int META_DEVICE_SAMPLE = 11;
+
     /**
      * 1 when {@code w2} is stored transposed, rows padded to {@link #FUSED_MAX_DIM}, and the down
      * projection is fused into gate/up.
      */
     public static final int META_FUSED_DOWN = 12;
 
-    public static final int META_SIZE = 13;
+    /**
+     * 1 for the single-pass RMS norm, which keeps x in registers between its two passes. Off by
+     * default (it measures the same, 5.65 against 5.66 ms). It is kept as an option because
+     * removing its code made the whole kernel 0.25 ms slower per token on an A10 (5.64 against 5.89
+     * ms), with identical CUDA source otherwise and the same register count: ptxas lays out and
+     * schedules the kernel differently. Re-measure before deleting it.
+     */
+    public static final int META_NORM_ONE_PASS = 13;
+
+    public static final int META_SIZE = 14;
 
     private LlamaMegakernel() {}
 
@@ -98,7 +108,11 @@ public final class LlamaMegakernel {
      */
     public static int scratchSize(
             int dim, int hiddenDim, int heads, int headSize, int splits, int blocks) {
-        return dim + hiddenDim + heads * splits * (headSize + 2) + 2 * blocks * WARPS + blocks * dim;
+        return dim
+                + hiddenDim
+                + heads * splits * (headSize + 2)
+                + 2 * blocks * WARPS
+                + blocks * dim;
     }
 
     /**
@@ -147,6 +161,7 @@ public final class LlamaMegakernel {
         float[] acc = new float[HEAD_VALUES_PER_LANE];
         float[] down = new float[FUSED_VALUES_PER_LANE];
         int fusedDown = meta.get(META_FUSED_DOWN);
+        int onePass = meta.get(META_NORM_ONE_PASS);
 
         int dim = meta.get(META_DIM);
         int kvDim = meta.get(META_KV_DIM);
@@ -186,7 +201,7 @@ public final class LlamaMegakernel {
                             blockTable, slot, pos, layerOff, kvDim, blockCfg, blockStride);
 
             // 1. RMS norm, QKV, RoPE, K/V into the cache.
-            normalize(context, x, norms, l * dim, dim, eps, vec, reduce, tid, warp);
+            normalize(context, x, norms, l * dim, dim, eps, vec, reduce, tid, warp, onePass);
             for (int p = globalWarp; p < qkvRows / 2; p += totalWarps) {
                 int row = 2 * p;
                 int rowOff = (l * qkvRows + row) * dim;
@@ -342,7 +357,18 @@ public final class LlamaMegakernel {
                 // after the barrier the partials are added in block order: deterministic, though
                 // not the layered plan's summation order. Rows are padded so the inner loop has
                 // no bounds test, which would keep the compiler from batching its loads.
-                normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp);
+                normalize(
+                        context,
+                        x,
+                        norms,
+                        (layers + l) * dim,
+                        dim,
+                        eps,
+                        vec,
+                        reduce,
+                        tid,
+                        warp,
+                        onePass);
                 for (int k = 0; k < FUSED_VALUES_PER_LANE; k++) {
                     down[k] = 0.0f;
                 }
@@ -381,7 +407,6 @@ public final class LlamaMegakernel {
                     scratch.set(partOff + block * dim + i, vec[i]);
                 }
                 context.gridBarrier();
-                // The residual: the blocks' partials in block order.
                 for (int i = context.globalIdx; i < dim; i += context.globalGroupSizeX) {
                     float sum = x.get(i);
                     for (int b = 0; b < blocks; b++) {
@@ -391,7 +416,18 @@ public final class LlamaMegakernel {
                 }
             } else {
                 // 4. RMS norm, gate and up projections, SwiGLU.
-                normalize(context, x, norms, (layers + l) * dim, dim, eps, vec, reduce, tid, warp);
+                normalize(
+                        context,
+                        x,
+                        norms,
+                        (layers + l) * dim,
+                        dim,
+                        eps,
+                        vec,
+                        reduce,
+                        tid,
+                        warp,
+                        onePass);
                 for (int row = globalWarp; row < hiddenDim; row += totalWarps) {
                     int rowOff = (l * hiddenDim + row) * dim;
                     float gate = dotShared(context, w1, rowOff, vec, dim, lane);
@@ -415,7 +451,12 @@ public final class LlamaMegakernel {
                     for (int row = globalWarp; row < dim; row += totalWarps) {
                         float s =
                                 dotShared(
-                                        context, w2, (l * dim + row) * hiddenDim, vec, hiddenDim, lane);
+                                        context,
+                                        w2,
+                                        (l * dim + row) * hiddenDim,
+                                        vec,
+                                        hiddenDim,
+                                        lane);
                         if (lane == 0) {
                             x.set(row, x.get(row) + s);
                         }
@@ -454,7 +495,7 @@ public final class LlamaMegakernel {
 
         // Final norm and the vocabulary projection. Each warp keeps the best of its rows, the
         // first one on a tie, as the host's greedy argmax does.
-        normalize(context, x, norms, 2 * layers * dim, dim, eps, vec, reduce, tid, warp);
+        normalize(context, x, norms, 2 * layers * dim, dim, eps, vec, reduce, tid, warp, onePass);
         float best = Float.NEGATIVE_INFINITY;
         int bestRow = 0;
         for (int row = globalWarp; row < vocabulary; row += totalWarps) {
@@ -519,11 +560,24 @@ public final class LlamaMegakernel {
             float[] vec,
             float[] reduce,
             int tid,
-            int warp) {
+            int warp,
+            int onePass) {
+        float[] held = new float[MAX_DIM / BLOCK_SIZE];
         float partial = 0.0f;
-        for (int i = tid; i < dim; i += BLOCK_SIZE) {
-            float v = x.get(i);
-            partial += v * v;
+        if (onePass != 0) {
+            for (int k = 0; k < MAX_DIM / BLOCK_SIZE; k++) {
+                int i = tid + k * BLOCK_SIZE;
+                if (i < dim) {
+                    float v = x.get(i);
+                    held[k] = v;
+                    partial += v * v;
+                }
+            }
+        } else {
+            for (int i = tid; i < dim; i += BLOCK_SIZE) {
+                float v = x.get(i);
+                partial += v * v;
+            }
         }
         float warpSum = context.simdSum(partial);
         if (tid % 32 == 0) {
@@ -535,8 +589,17 @@ public final class LlamaMegakernel {
             total += reduce[w];
         }
         float scale = 1.0f / TornadoMath.sqrt(total / dim + eps);
-        for (int i = tid; i < dim; i += BLOCK_SIZE) {
-            vec[i] = x.get(i) * scale * norms.get(normOff + i);
+        if (onePass != 0) {
+            for (int k = 0; k < MAX_DIM / BLOCK_SIZE; k++) {
+                int i = tid + k * BLOCK_SIZE;
+                if (i < dim) {
+                    vec[i] = held[k] * scale * norms.get(normOff + i);
+                }
+            }
+        } else {
+            for (int i = tid; i < dim; i += BLOCK_SIZE) {
+                vec[i] = x.get(i) * scale * norms.get(normOff + i);
+            }
         }
         context.localBarrier();
     }
