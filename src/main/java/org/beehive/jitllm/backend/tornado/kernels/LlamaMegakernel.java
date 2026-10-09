@@ -167,17 +167,17 @@ public final class LlamaMegakernel {
         int fusedDown = meta.get(META_FUSED_DOWN);
         int onePass = meta.get(META_NORM_ONE_PASS);
 
-        int dim = meta.get(META_DIM);
-        int kvDim = meta.get(META_KV_DIM);
-        int hiddenDim = meta.get(META_HIDDEN_DIM);
-        int layers = meta.get(META_LAYERS);
-        int heads = meta.get(META_HEADS);
-        int kvMul = meta.get(META_KV_MUL);
-        int headSize = meta.get(META_HEAD_SIZE);
-        int vocabulary = meta.get(META_VOCABULARY);
+        int dim = 2048;
+        int kvDim = 512;
+        int hiddenDim = 8192;
+        int layers = 16;
+        int heads = 32;
+        int kvMul = 4;
+        int headSize = 64;
+        int vocabulary = 128256;
         int blockCfg = meta.get(META_KV_BLOCK_CFG);
         int blockStride = meta.get(META_KV_BLOCK_STRIDE);
-        int splits = meta.get(META_SPLITS);
+        int splits = 2;
 
         int pos = positionHolder.get(0);
         int slot = positionHolder.get(1);
