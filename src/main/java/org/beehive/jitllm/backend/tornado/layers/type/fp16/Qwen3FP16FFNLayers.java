@@ -8,6 +8,7 @@ import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayer
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
 import org.beehive.jitllm.backend.tornado.scheduling.Fp16GemvReductionPolicy;
+import org.beehive.jitllm.backend.tornado.scheduling.Fp16GemvUnrollPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.LaneAttentionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.RmsReductionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
@@ -394,7 +395,9 @@ public class Qwen3FP16FFNLayers
         if (useWarpMatmul) {
             unifiedLayer.task(
                     tp + reductionVariant("attn_rms_qkv_projection"),
-                    Qwen3Kernels::fusedRmsNormQKVMatmulWarp,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? Qwen3Kernels::fusedRmsNormQKVMatmulWarpUnrolled
+                            : Qwen3Kernels::fusedRmsNormQKVMatmulWarp),
                     context,
                     qwen3State.workspace.wrapX,
                     qwen3State.workspace.wrapQ,
@@ -584,7 +587,11 @@ public class Qwen3FP16FFNLayers
         if (useWarpMatmul) {
             unifiedLayer.task(
                     tp + reductionVariant("attn_output_proj"),
-                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualSimd32,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32Unrolled
+                            : TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32),
                     context,
                     qwen3State.workspace.wrapXb,
                     qwen3State.workspace.wrapX,
@@ -634,7 +641,9 @@ public class Qwen3FP16FFNLayers
         if (useWarpMatmul) {
             unifiedLayer.task(
                     tp + reductionVariant("rms_ffn_gate_up"),
-                    TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarp,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarpUnrolled
+                            : TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarp),
                     context,
                     qwen3State.workspace.wrapX,
                     qwen3State.workspace.wrapHb,
@@ -665,7 +674,11 @@ public class Qwen3FP16FFNLayers
         if (useWarpMatmul) {
             unifiedLayer.task(
                     tp + reductionVariant("ffn_down_proj"),
-                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualSimd32,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32Unrolled
+                            : TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32),
                     context,
                     qwen3State.workspace.wrapHb,
                     qwen3State.workspace.wrapX,

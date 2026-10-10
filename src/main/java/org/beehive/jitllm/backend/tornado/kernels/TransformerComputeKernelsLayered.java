@@ -149,6 +149,59 @@ public class TransformerComputeKernelsLayered {
         float scale = rmsScale.get(0);
         int rowOffset = rowId * dim;
 
+        float sum1 = 0.0f;
+        float sum3 = 0.0f;
+        for (int j = localId; j < dim; j += 32) {
+            float normalized = rmsWeights.get(j) * scale * x.get(j);
+            sum1 += w1.get(rowOffset + j).getFloat32() * normalized;
+            sum3 += w3.get(rowOffset + j).getFloat32() * normalized;
+        }
+
+        sum1 += context.simdShuffleDown(sum1, 16);
+        sum1 += context.simdShuffleDown(sum1, 8);
+        sum1 += context.simdShuffleDown(sum1, 4);
+        sum1 += context.simdShuffleDown(sum1, 2);
+        sum1 += context.simdShuffleDown(sum1, 1);
+
+        sum3 += context.simdShuffleDown(sum3, 16);
+        sum3 += context.simdShuffleDown(sum3, 8);
+        sum3 += context.simdShuffleDown(sum3, 4);
+        sum3 += context.simdShuffleDown(sum3, 2);
+        sum3 += context.simdShuffleDown(sum3, 1);
+
+        if (localId == 0) {
+            float silu = sum1 / (1.0f + TornadoMath.exp(-sum1));
+            hb.set(rowId, silu * sum3);
+        }
+    }
+
+    /**
+     * {@link #fusedRmsNormFFNGateUpWarp} with four independent loads in flight per lane, then the
+     * tail of a row that is not a multiple of 128 wide. Selected on Metal by {@code
+     * Fp16GemvUnrollPolicy}; the other backends keep {@link #fusedRmsNormFFNGateUpWarp}.
+     */
+    public static void fusedRmsNormFFNGateUpWarpUnrolled(
+            KernelContext context,
+            FloatArray x,
+            FloatArray hb,
+            FloatArray rmsWeights,
+            FloatArray rmsScale,
+            HalfFloatArray w1,
+            HalfFloatArray w3,
+            int dim,
+            int hiddenDim,
+            int localWorkGroupSize) {
+
+        int rowId = context.groupIdx;
+        int localId = context.localIdx;
+
+        if (rowId >= hiddenDim) {
+            return;
+        }
+
+        float scale = rmsScale.get(0);
+        int rowOffset = rowId * dim;
+
         float sum1a = 0.0f;
         float sum1b = 0.0f;
         float sum1c = 0.0f;
@@ -1134,6 +1187,42 @@ public class TransformerComputeKernelsLayered {
         }
 
         int rowOffset = rowId * n;
+        float partialSum = 0.0f;
+        for (int j = localId; j < n; j += 32) {
+            partialSum += w.get(rowOffset + j).getFloat32() * x.get(j).getFloat32();
+        }
+
+        partialSum += context.simdShuffleDown(partialSum, 16);
+        partialSum += context.simdShuffleDown(partialSum, 8);
+        partialSum += context.simdShuffleDown(partialSum, 4);
+        partialSum += context.simdShuffleDown(partialSum, 2);
+        partialSum += context.simdShuffleDown(partialSum, 1);
+
+        if (localId == 0) {
+            hb.set(rowId, partialSum);
+        }
+    }
+
+    /**
+     * {@link #matrixVectorGenericSimd32} with four independent loads in flight per lane, then the
+     * tail of a row that is not a multiple of 128 wide. Selected on Metal by {@code
+     * Fp16GemvUnrollPolicy}; the other backends keep {@link #matrixVectorGenericSimd32}.
+     */
+    public static void matrixVectorGenericSimd32Unrolled(
+            KernelContext context,
+            HalfFloatArray x,
+            FloatArray hb,
+            HalfFloatArray w,
+            int n,
+            int d) {
+        int rowId = context.groupIdx;
+        int localId = context.localIdx;
+
+        if (rowId >= d) {
+            return;
+        }
+
+        int rowOffset = rowId * n;
         float partialSum0 = 0.0f;
         float partialSum1 = 0.0f;
         float partialSum2 = 0.0f;
@@ -1209,6 +1298,38 @@ public class TransformerComputeKernelsLayered {
      * the existing decode worker shape: one 32-lane workgroup per output row.
      */
     public static void matrixVectorGenericWithResidualSimd32(
+            KernelContext context, FloatArray x, FloatArray hb, HalfFloatArray w, int n, int d) {
+        int rowId = context.groupIdx;
+        int localId = context.localIdx;
+
+        if (rowId >= d) {
+            return;
+        }
+
+        int rowOffset = rowId * n;
+        float partialSum = 0.0f;
+        for (int j = localId; j < n; j += 32) {
+            partialSum += w.get(rowOffset + j).getFloat32() * x.get(j);
+        }
+
+        partialSum += context.simdShuffleDown(partialSum, 16);
+        partialSum += context.simdShuffleDown(partialSum, 8);
+        partialSum += context.simdShuffleDown(partialSum, 4);
+        partialSum += context.simdShuffleDown(partialSum, 2);
+        partialSum += context.simdShuffleDown(partialSum, 1);
+
+        if (localId == 0) {
+            hb.set(rowId, hb.get(rowId) + partialSum);
+        }
+    }
+
+    /**
+     * {@link #matrixVectorGenericWithResidualSimd32} with four independent loads in flight per
+     * lane, then the tail of a row that is not a multiple of 128 wide. Selected on Metal by {@code
+     * Fp16GemvUnrollPolicy}; the other backends keep {@link
+     * #matrixVectorGenericWithResidualSimd32}.
+     */
+    public static void matrixVectorGenericWithResidualSimd32Unrolled(
             KernelContext context, FloatArray x, FloatArray hb, HalfFloatArray w, int n, int d) {
         int rowId = context.groupIdx;
         int localId = context.localIdx;

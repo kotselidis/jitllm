@@ -368,6 +368,84 @@ public class Qwen3Kernels {
         // partial across control flow, which produced incorrect PTX for the shuffle.
         if (rowId < qDim) {
             int rowOffset = rowId * inputDim;
+            float partialSum = 0.0f;
+            for (int j = localId; j < inputDim; j += 32) {
+                partialSum +=
+                        wq.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
+            }
+            partialSum += context.simdShuffleDown(partialSum, 16);
+            partialSum += context.simdShuffleDown(partialSum, 8);
+            partialSum += context.simdShuffleDown(partialSum, 4);
+            partialSum += context.simdShuffleDown(partialSum, 2);
+            partialSum += context.simdShuffleDown(partialSum, 1);
+            if (localId == 0) {
+                q.set(rowId, partialSum);
+            }
+        } else if (rowId < qDim + kvDim) {
+            int kRow = rowId - qDim;
+            int rowOffset = kRow * inputDim;
+            float partialSum = 0.0f;
+            for (int j = localId; j < inputDim; j += 32) {
+                partialSum +=
+                        wk.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
+            }
+            partialSum += context.simdShuffleDown(partialSum, 16);
+            partialSum += context.simdShuffleDown(partialSum, 8);
+            partialSum += context.simdShuffleDown(partialSum, 4);
+            partialSum += context.simdShuffleDown(partialSum, 2);
+            partialSum += context.simdShuffleDown(partialSum, 1);
+            if (localId == 0) {
+                k.set(kRow, partialSum);
+            }
+        } else if (rowId < qDim + 2 * kvDim) {
+            int vRow = rowId - qDim - kvDim;
+            int rowOffset = vRow * inputDim;
+            float partialSum = 0.0f;
+            for (int j = localId; j < inputDim; j += 32) {
+                partialSum +=
+                        wv.get(rowOffset + j).getFloat32() * (rmsWeights.get(j) * scale * x.get(j));
+            }
+            partialSum += context.simdShuffleDown(partialSum, 16);
+            partialSum += context.simdShuffleDown(partialSum, 8);
+            partialSum += context.simdShuffleDown(partialSum, 4);
+            partialSum += context.simdShuffleDown(partialSum, 2);
+            partialSum += context.simdShuffleDown(partialSum, 1);
+            if (localId == 0) {
+                v.set(vRow, partialSum);
+            }
+        }
+    }
+
+    /**
+     * {@link #fusedRmsNormQKVMatmulWarp} with four independent loads in flight per lane, then the
+     * tail of a row that is not a multiple of 128 wide. Selected on Metal by {@code
+     * Fp16GemvUnrollPolicy}; the other backends keep {@link #fusedRmsNormQKVMatmulWarp}.
+     */
+    public static void fusedRmsNormQKVMatmulWarpUnrolled(
+            KernelContext context,
+            FloatArray x,
+            FloatArray q,
+            FloatArray k,
+            FloatArray v,
+            FloatArray rmsWeights,
+            FloatArray rmsScale,
+            HalfFloatArray wq,
+            HalfFloatArray wk,
+            HalfFloatArray wv,
+            int inputDim,
+            int qDim,
+            int kvDim,
+            int localWorkGroupSize) {
+
+        int rowId = context.groupIdx;
+        int localId = context.localIdx;
+        float scale = rmsScale.get(0);
+
+        // Three independent blocks (mirrors the shared-memory variant): each does its own loop +
+        // warp reduction + write. Keeping the reduction inside each branch avoids carrying the
+        // partial across control flow, which produced incorrect PTX for the shuffle.
+        if (rowId < qDim) {
+            int rowOffset = rowId * inputDim;
             float partialSum0 = 0.0f;
             float partialSum1 = 0.0f;
             float partialSum2 = 0.0f;

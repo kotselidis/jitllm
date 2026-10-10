@@ -5,6 +5,7 @@ import org.beehive.jitllm.backend.tornado.kernels.Qwen3Kernels;
 import org.beehive.jitllm.backend.tornado.kernels.Qwen3PagedKvKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.scheduling.Fp16GemvUnrollPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
@@ -246,7 +247,9 @@ public class Qwen2FP16FFNLayers
         unifiedLayer.task(
                 "attn_rms_qkv_projection",
                 useSimd32Reduction
-                        ? Qwen3Kernels::fusedRmsNormQKVMatmulWarp
+                        ? (Fp16GemvUnrollPolicy.unrolled()
+                                ? Qwen3Kernels::fusedRmsNormQKVMatmulWarpUnrolled
+                                : Qwen3Kernels::fusedRmsNormQKVMatmulWarp)
                         : Qwen3Kernels::fusedRmsNormQKVMatmul,
                 context,
                 qwen2State.workspace.wrapX, // input: raw hidden state (FP32)
@@ -363,7 +366,11 @@ public class Qwen2FP16FFNLayers
         if (useSimd32Reduction) {
             unifiedLayer.task(
                     "attn_output_proj",
-                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualSimd32,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32Unrolled
+                            : TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32),
                     context,
                     qwen2State.workspace.wrapXb, // input: attention output
                     qwen2State.workspace.wrapX, // output: wrapX += Wo · wrapXb
@@ -414,7 +421,10 @@ public class Qwen2FP16FFNLayers
         unifiedLayer.task(
                 "rms_ffn_gate_up",
                 useSimd32Reduction
-                        ? TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarp
+                        ? (Fp16GemvUnrollPolicy.unrolled()
+                                ? TransformerComputeKernelsLayered
+                                        ::fusedRmsNormFFNGateUpWarpUnrolled
+                                : TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarp)
                         : TransformerComputeKernelsLayered::fusedRmsNormFFNGateUp,
                 context,
                 qwen2State.workspace.wrapX, // input: raw hidden state (FP32)
@@ -432,7 +442,11 @@ public class Qwen2FP16FFNLayers
             unifiedLayer
                     .task(
                             "ffn_down_proj",
-                            TransformerComputeKernelsLayered::matrixVectorGenericWithResidualSimd32,
+                            (Fp16GemvUnrollPolicy.unrolled()
+                                    ? TransformerComputeKernelsLayered
+                                            ::matrixVectorGenericWithResidualSimd32Unrolled
+                                    : TransformerComputeKernelsLayered
+                                            ::matrixVectorGenericWithResidualSimd32),
                             context,
                             qwen2State.workspace.wrapHb, // input: FFN intermediate
                             qwen2State.workspace.wrapX, // output: wrapX += W2 · wrapHb

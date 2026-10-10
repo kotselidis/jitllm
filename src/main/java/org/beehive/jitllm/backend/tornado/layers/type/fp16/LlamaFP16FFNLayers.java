@@ -4,6 +4,7 @@ import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerPagedKvKernels;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.scheduling.Fp16GemvUnrollPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.LaneAttentionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.RmsReductionPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
@@ -377,7 +378,11 @@ public class LlamaFP16FFNLayers
         if (useSimd32Reduction) {
             unifiedLayer.task(
                     "attn_output_proj",
-                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualSimd32,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32Unrolled
+                            : TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32),
                     context,
                     state.workspace.wrapXb,
                     state.workspace.wrapX,
@@ -427,7 +432,9 @@ public class LlamaFP16FFNLayers
         if (useSimd32Reduction) {
             unifiedLayer.task(
                     "rms_ffn_gate_up",
-                    TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarp,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarpUnrolled
+                            : TransformerComputeKernelsLayered::fusedRmsNormFFNGateUpWarp),
                     context,
                     state.workspace.wrapX,
                     state.workspace.wrapHb,
@@ -459,7 +466,11 @@ public class LlamaFP16FFNLayers
         if (useSimd32Reduction) {
             unifiedLayer.task(
                     "ffn_down_proj",
-                    TransformerComputeKernelsLayered::matrixVectorGenericWithResidualSimd32,
+                    (Fp16GemvUnrollPolicy.unrolled()
+                            ? TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32Unrolled
+                            : TransformerComputeKernelsLayered
+                                    ::matrixVectorGenericWithResidualSimd32),
                     context,
                     state.workspace.wrapHb,
                     state.workspace.wrapX,
