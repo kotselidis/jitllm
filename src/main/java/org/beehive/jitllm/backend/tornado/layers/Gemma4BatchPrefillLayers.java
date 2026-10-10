@@ -5,6 +5,8 @@ import java.util.List;
 import org.beehive.jitllm.backend.tornado.kernels.Gemma4AttentionKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Gemma4BatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillSimdgroupKernels;
+import org.beehive.jitllm.backend.tornado.scheduling.BatchPrefillGemmPolicy;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.backend.tornado.tensor.TornadoTensor;
 import org.beehive.jitllm.inference.state.Gemma4State;
@@ -64,7 +66,9 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
 
     @Override
     public String describeProjections() {
-        return "FP16 tensor-core MMA (quantized weights dequantized where needed)";
+        return simdgroup
+                ? "Metal SIMD-group GEMMs (Q8_0 weights dequantized as they are staged)"
+                : "FP16 tensor-core MMA (quantized weights dequantized where needed)";
     }
 
     /** One workgroup per token for the RMS reductions, as the other MMA prefill families use. */
@@ -173,6 +177,17 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
     private final HalfFloatArray[] woF16;
     private final HalfFloatArray[] gateUpF16;
     private final HalfFloatArray[] downF16;
+
+    // @formatter:off
+    /**
+     * Whether the projections run on the Metal SIMD-group GEMMs ({@code simdgroup_matrix}) instead
+     * of the tensor-core ones; see {@link BatchPrefillGemmPolicy#simdgroup()}.
+     */
+    // @formatter:on
+    private final boolean simdgroup = BatchPrefillGemmPolicy.simdgroup();
+
+    /** The SIMD-group projections with their output counts, for their grids. */
+    private final java.util.Map<String, Integer> simdgroupTasks = new java.util.LinkedHashMap<>();
 
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
@@ -431,6 +446,57 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 n);
     }
 
+    // @formatter:off
+    /**
+     * {@code out[m * ldo + off + r] = x[m] . w[r]} on the Metal SIMD-group GEMMs, the FP16
+     * activations read as they are staged: one projection written into its columns of a packed row.
+     */
+    // @formatter:on
+    private void simdgroupGemm(
+            TaskGraph layer,
+            String task,
+            HalfFloatArray x,
+            Object w,
+            FloatArray out,
+            int n,
+            int d,
+            int ldo,
+            int off) {
+        simdgroupTasks.put(layer.getTaskGraphName() + "." + task, d);
+        if (w instanceof TornadoTensor t) {
+            if (t.dataType() != DataType.Q8_0) {
+                throw new UnsupportedOperationException(
+                        "gemma4 batched prefill on Metal reads Q8_0 projections only, not "
+                                + t.dataType());
+            }
+            layer.task(
+                    task,
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmHalfQ8Strided,
+                    context,
+                    x,
+                    out,
+                    t.asByteArray(),
+                    n,
+                    d,
+                    batchSize,
+                    ldo,
+                    off);
+        } else {
+            layer.task(
+                    task,
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmHalfFP16Strided,
+                    context,
+                    x,
+                    out,
+                    (HalfFloatArray) w,
+                    n,
+                    d,
+                    batchSize,
+                    ldo,
+                    off);
+        }
+    }
+
     /** The key cache in the representation the state allocated. */
     private Object keyCache() {
         return fp16KeyValue ? state.workspace.wrapKeyCacheFP16 : state.workspace.wrapKeyCache;
@@ -667,7 +733,38 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                                     weights.wqLayered[layerIndex],
                                     weights.wkLayered[layerIndex],
                                     weights.wvLayered[layerIndex]);
-            if (qkvF16[layerIndex] != null) {
+            if (simdgroup) {
+                simdgroupGemm(
+                        layer,
+                        "qkvProj",
+                        state.workspace.wrapXbFP16Batch,
+                        weights.wqLayered[layerIndex],
+                        state.workspace.qkvResultBatch,
+                        dim,
+                        qDim,
+                        stride,
+                        0);
+                simdgroupGemm(
+                        layer,
+                        "kProj",
+                        state.workspace.wrapXbFP16Batch,
+                        weights.wkLayered[layerIndex],
+                        state.workspace.qkvResultBatch,
+                        dim,
+                        kvDim,
+                        stride,
+                        qDim);
+                simdgroupGemm(
+                        layer,
+                        "vProj",
+                        state.workspace.wrapXbFP16Batch,
+                        weights.wvLayered[layerIndex],
+                        state.workspace.qkvResultBatch,
+                        dim,
+                        kvDim,
+                        stride,
+                        qDim + kvDim);
+            } else if (qkvF16[layerIndex] != null) {
                 nativeGemm(
                         layer,
                         "qkvProj",
@@ -757,7 +854,18 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         cacheBaseOffset);
             }
         } else {
-            if (qkvF16[layerIndex] != null) {
+            if (simdgroup) {
+                simdgroupGemm(
+                        layer,
+                        "qkvProj",
+                        state.workspace.wrapXbFP16Batch,
+                        weights.wqLayered[layerIndex],
+                        state.workspace.qkvResultBatch,
+                        dim,
+                        qDim,
+                        stride,
+                        0);
+            } else if (qkvF16[layerIndex] != null) {
                 nativeGemm(
                         layer,
                         "qkvProj",
@@ -880,7 +988,18 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     HEAD_LOCAL_SIZE);
         }
 
-        if (woF16[layerIndex] != null) {
+        if (simdgroup) {
+            simdgroupGemm(
+                    layer,
+                    "woProj",
+                    state.workspace.attnOutFP16,
+                    weights.woLayered[layerIndex],
+                    state.workspace.woOut,
+                    qDim,
+                    dim,
+                    dim,
+                    0);
+        } else if (woF16[layerIndex] != null) {
             nativeGemm(
                     layer,
                     "woProj",
@@ -980,7 +1099,28 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
                 state.workspace.ffnScaleBatch,
                 dim);
-        if (gateUpF16[layerIndex] != null) {
+        if (simdgroup) {
+            simdgroupGemm(
+                    layer,
+                    "gateProj",
+                    state.workspace.normedXFFNFP16,
+                    weights.w1Layered[layerIndex],
+                    state.workspace.gateUpResultBatch,
+                    dim,
+                    ffnLen,
+                    2 * ffnLen,
+                    0);
+            simdgroupGemm(
+                    layer,
+                    "upProj",
+                    state.workspace.normedXFFNFP16,
+                    weights.w3Layered[layerIndex],
+                    state.workspace.gateUpResultBatch,
+                    dim,
+                    ffnLen,
+                    2 * ffnLen,
+                    ffnLen);
+        } else if (gateUpF16[layerIndex] != null) {
             nativeGemm(
                     layer,
                     "gateUpProj",
@@ -1026,7 +1166,18 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 state.workspace.wrapHbFP16Batch,
                 state.workspace.gateUpResultBatch,
                 ffnLen);
-        if (downF16[layerIndex] != null) {
+        if (simdgroup) {
+            simdgroupGemm(
+                    layer,
+                    "w2Proj",
+                    state.workspace.wrapHbFP16Batch,
+                    weights.w2Layered[layerIndex],
+                    state.workspace.w2Out,
+                    ffnLen,
+                    dim,
+                    dim,
+                    0);
+        } else if (downF16[layerIndex] != null) {
             nativeGemm(
                     layer,
                     "w2Proj",
@@ -1114,7 +1265,18 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 context,
                 state.workspace.wrapXBatch,
                 state.workspace.wrapXFP16Batch);
-        if (nativeProjections) {
+        if (simdgroup) {
+            simdgroupGemm(
+                    layer,
+                    "pleGateProj",
+                    state.workspace.wrapXFP16Batch,
+                    pleGateF16[layerIndex],
+                    state.workspace.wrapPerLayerGateBatch,
+                    dim,
+                    nEmbdPerLayer,
+                    nEmbdPerLayer,
+                    0);
+        } else if (nativeProjections) {
             nativeGemm(
                     layer,
                     "pleGateProj",
@@ -1145,7 +1307,18 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 peOffset,
                 nEmbdPerLayer,
                 perLayerTotal);
-        if (nativeProjections) {
+        if (simdgroup) {
+            simdgroupGemm(
+                    layer,
+                    "pleProj",
+                    state.workspace.wrapPerLayerGateFP16Batch,
+                    pleProjF16[layerIndex],
+                    state.workspace.wrapPerLayerOutBatch,
+                    nEmbdPerLayer,
+                    dim,
+                    dim,
+                    0);
+        } else if (nativeProjections) {
             nativeGemm(
                     layer,
                     "pleProj",
@@ -1219,7 +1392,18 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                 context,
                 state.workspace.wrapXBatch,
                 state.workspace.wrapXFP16Batch);
-        if (nativeProjections) {
+        if (simdgroup) {
+            simdgroupGemm(
+                    layer,
+                    "pleModelProj",
+                    state.workspace.wrapXFP16Batch,
+                    pleModelProjF16,
+                    state.workspace.wrapPerLayerProjScratchBatch,
+                    dim,
+                    perLayerTotal,
+                    perLayerTotal,
+                    0);
+        } else if (nativeProjections) {
             nativeGemm(
                     layer,
                     "pleModelProj",
@@ -1323,11 +1507,11 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                                             weights.wkLayered[l],
                                             weights.wvLayered[l])
                                     : allQ8(weights.wqLayered[l]));
-            if (!nativeProjections) {
+            if (!nativeProjections && !simdgroup) {
                 scheduler.addWorkerGrid(
                         p + "qkvProj", mmaGrid(paddedBatch, hasOwnKv ? qDim + 2 * kvDim : qDim));
             }
-            if (!nativeProjections && !qkvDirect) {
+            if (!nativeProjections && !simdgroup && !qkvDirect) {
                 scheduler.addWorkerGrid(p + "qDequant", elementwise(qDim * dim, 256));
                 if (hasOwnKv) {
                     scheduler.addWorkerGrid(p + "kDequant", elementwise(kvDim * dim, 256));
@@ -1358,8 +1542,8 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                                     Gemma4AttentionKernels.TC_LANES)
                             : WorkerGridFactory.genericWorker(
                                     paddedBatch * nHead * HEAD_LOCAL_SIZE, HEAD_LOCAL_SIZE));
-            if (nativeProjections) {
-                // cuBLAS
+            if (nativeProjections || simdgroup) {
+                // cuBLAS, or the SIMD-group grids below
             } else if (SPLIT_K) {
                 scheduler.addWorkerGrid(p + "woProj", mmaSplitKGrid(paddedBatch, dim));
                 scheduler.addWorkerGrid(p + "woReduce", reduceWorker);
@@ -1374,18 +1558,19 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
 
             scheduler.addWorkerGrid(p + "batch_ffn_rms", rmsWorker);
             scheduler.addWorkerGrid(p + "batch_ffn_rms_apply", dimApplyWorker);
-            if (!nativeProjections) {
+            if (!nativeProjections && !simdgroup) {
                 scheduler.addWorkerGrid(p + "gateUpProj", mmaGrid(paddedBatch, 2 * ffnLen));
             }
             if (!nativeProjections
+                    && !simdgroup
                     && (DEQUANT_GATE_UP || !allQ8(weights.w1Layered[l], weights.w3Layered[l]))) {
                 WorkerGrid dequantWorker = elementwise(ffnLen * dim, 256);
                 scheduler.addWorkerGrid(p + "gateDequant", dequantWorker);
                 scheduler.addWorkerGrid(p + "upDequant", dequantWorker);
             }
             scheduler.addWorkerGrid(p + "batch_geglu", elementwise(batchSize * ffnLen, 256));
-            if (nativeProjections) {
-                // cuBLAS
+            if (nativeProjections || simdgroup) {
+                // cuBLAS, or the SIMD-group grids below
             } else if (SPLIT_K) {
                 scheduler.addWorkerGrid(p + "w2Proj", mmaSplitKGrid(paddedBatch, dim));
                 scheduler.addWorkerGrid(p + "w2Reduce", reduceWorker);
@@ -1399,11 +1584,11 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             scheduler.addWorkerGrid(p + "batch_post_ffn_apply", dimApplyWorker);
 
             scheduler.addWorkerGrid(p + "batch_x_cast", dimApplyWorker);
-            if (!nativeProjections) {
+            if (!nativeProjections && !simdgroup) {
                 scheduler.addWorkerGrid(p + "pleGateProj", pleGateWorker);
             }
             scheduler.addWorkerGrid(p + "batch_ple_gate_gelu", pleGateGeluWorker);
-            if (!nativeProjections) {
+            if (!nativeProjections && !simdgroup) {
                 scheduler.addWorkerGrid(p + "pleProj", mmaDimWorker);
             }
             scheduler.addWorkerGrid(p + "batch_ple_post_rms", rmsWorker);
@@ -1416,7 +1601,7 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
         String p0 = "batchPrefillLayer_0.";
         scheduler.addWorkerGrid(p0 + "batch_scale_embedding", dimApplyWorker);
         scheduler.addWorkerGrid(p0 + "batch_embed_cast", dimApplyWorker);
-        if (!nativeProjections) {
+        if (!nativeProjections && !simdgroup) {
             scheduler.addWorkerGrid(p0 + "pleModelProj", mmaGrid(paddedBatch, perLayerTotal));
         }
         scheduler.addWorkerGrid(
@@ -1425,6 +1610,14 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                         batchSize * config.numberOfLayers() * HEAD_LOCAL_SIZE, HEAD_LOCAL_SIZE));
         scheduler.addWorkerGrid(
                 p0 + "batch_ple_merge", elementwise(batchSize * perLayerTotal, 256));
+        int sgLocal = TransformerBatchPrefillSimdgroupKernels.THREADS;
+        for (var task : simdgroupTasks.entrySet()) {
+            scheduler.addWorkerGrid(
+                    task.getKey(),
+                    WorkerGridFactory.genericWorker(
+                            ((task.getValue() + 63) / 64) * ((batchSize + 63) / 64) * sgLocal,
+                            sgLocal));
+        }
     }
 
     public List<ImmutableTaskGraph> getLayerImmutableTaskGraphs() {

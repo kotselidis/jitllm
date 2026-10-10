@@ -45,10 +45,15 @@ public final class BatchPrefillSupport {
         return switch (c.architecture()) {
             case "gemma4" ->
                     c.tensorCores()
+                                    || (BackendId.METAL.equals(c.backend())
+                                            && c.weights()
+                                                    == org.beehive.jitllm.runtime.tensor.DataType
+                                                            .Q8_0)
                             ? Optional.empty()
                             : Optional.of(
-                                    "the gemma4 batched prefill is written for tensor cores"
-                                            + " only, which this device does not have");
+                                    "the gemma4 batched prefill is written for tensor cores,"
+                                            + " and for Q8_0 weights on the Metal SIMD-group"
+                                            + " kernels, neither of which this combination has");
             case "llama" ->
                     c.weights() == org.beehive.jitllm.runtime.tensor.DataType.Q4_0
                                     && !BackendId.METAL.equals(c.backend())
@@ -135,7 +140,8 @@ public final class BatchPrefillSupport {
                     "mistral",
                     "phi3",
                     "granite",
-                    "qwen35");
+                    "qwen35",
+                    "gemma4");
 
     /** The batched-prefill chunk Metal runs by default; see {@link #defaultFor}. */
     public static final int METAL_DEFAULT_PREFILL_BATCH = 256;
@@ -148,10 +154,10 @@ public final class BatchPrefillSupport {
      * <p>The families in {@link #METAL_BATCHED_FAMILIES}, in F16 and Q8_0, prefill an order of
      * magnitude faster in batches of {@value #METAL_DEFAULT_PREFILL_BATCH} than one token at a time
      * on an Apple GPU (M4 Pro, pp512: Qwen3-0.6B F16 151 to 4171 tok/s; Llama-3.2-1B F16 40 to
-     * 2372, Q8_0 45 to 2075; Qwen3.5-0.8B Q4_0 60 to 2057); greedy text is identical. Q4_0 is
-     * batched by default for llama and qwen35 only. Other families keep single-token prefill on
-     * Metal until their batched kernels are tuned there. Only a single-token policy is changed, so
-     * an explicit choice is never overridden.
+     * 2372, Q8_0 45 to 2075; Qwen3.5-0.8B Q4_0 60 to 2057; Gemma-4-E2B Q8_0 68 to 749); greedy text
+     * is identical. Q4_0 is batched by default for llama and qwen35 only. Other families keep
+     * single-token prefill on Metal until their batched kernels are tuned there. Only a
+     * single-token policy is changed, so an explicit choice is never overridden.
      */
     // @formatter:on
     public static ExecutionPolicy defaultFor(Model model, ExecutionPolicy policy) {

@@ -642,4 +642,93 @@ public class TransformerBatchPrefillSimdgroupKernelsAccelTest {
             }
         }
     }
+
+    /**
+     * The strided projections write exactly their columns of a wider packed row from FP16
+     * activations, partial tiles included, and leave every other column alone.
+     */
+    private static void checkHalfStrided(boolean q8) {
+        assumeMetal();
+        int n = 128;
+        int d = 72;
+        int batch = 70;
+        int off = 40;
+        int ldo = off + d + 24;
+        FloatArray xf = activations(batch, n);
+        HalfFloatArray x = new HalfFloatArray(batch * n);
+        for (int i = 0; i < batch * n; i++) {
+            x.set(i, new HalfFloat(xf.get(i)));
+        }
+        FloatArray out = new FloatArray(batch * ldo);
+        out.init(UNTOUCHED);
+        String name = q8 ? "simdgroupHalfQ8Strided" : "simdgroupHalfFP16Strided";
+        TaskGraph graph =
+                new TaskGraph(name).transferToDevice(DataTransferMode.EVERY_EXECUTION, x, out);
+        if (q8) {
+            ByteArray w = q8Weights(d, n);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmHalfQ8Strided,
+                    new KernelContext(),
+                    x,
+                    out,
+                    w,
+                    n,
+                    d,
+                    batch,
+                    ldo,
+                    off);
+        } else {
+            HalfFloatArray w = fp16Weights(d, n);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmHalfFP16Strided,
+                    new KernelContext(),
+                    x,
+                    out,
+                    w,
+                    n,
+                    d,
+                    batch,
+                    ldo,
+                    off);
+        }
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+        run(graph, name, ((d + 63) / 64) * ((batch + 63) / 64));
+        Weights w =
+                q8
+                        ? TransformerBatchPrefillSimdgroupKernelsAccelTest::q8Weight
+                        : TransformerBatchPrefillSimdgroupKernelsAccelTest::weight;
+        for (int b = 0; b < batch; b++) {
+            for (int c = 0; c < ldo; c++) {
+                float got = out.get(b * ldo + c);
+                if (c < off || c >= off + d) {
+                    assertEquals(
+                            name + " column " + c + " is not this projection's",
+                            UNTOUCHED,
+                            got,
+                            0.0f);
+                } else {
+                    float expected = dot(xf, b, n, w, c - off);
+                    assertEquals(
+                            name + " token " + b + " row " + (c - off),
+                            expected,
+                            got,
+                            1e-4f * Math.max(1.0f, Math.abs(expected)));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void halfActivationsQ8Strided() {
+        checkHalfStrided(true);
+    }
+
+    @Test
+    public void halfActivationsFP16Strided() {
+        checkHalfStrided(false);
+    }
 }
