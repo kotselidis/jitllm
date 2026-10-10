@@ -154,8 +154,8 @@ public final class BatchPrefillSupport {
      * <p>The families in {@link #METAL_BATCHED_FAMILIES}, in F16 and Q8_0, prefill an order of
      * magnitude faster in batches of {@value #METAL_DEFAULT_PREFILL_BATCH} than one token at a time
      * on an Apple GPU (M4 Pro, pp512: Qwen3-0.6B F16 151 to 4171 tok/s; Llama-3.2-1B F16 40 to
-     * 2372, Q8_0 45 to 2075; Qwen3.5-0.8B Q4_0 60 to 2057; Gemma-4-E2B Q8_0 68 to 749); greedy text
-     * is identical. Q4_0 is batched by default for llama and qwen35 only. Other families keep
+     * 2372, Q8_0 45 to 2075; Qwen3.5-0.8B Q4_0 60 to 2057; Gemma-4-E2B Q8_0 68 to 1067); greedy
+     * text is identical. Q4_0 is batched by default for llama and qwen35 only. Other families keep
      * single-token prefill on Metal until their batched kernels are tuned there. Only a
      * single-token policy is changed, so an explicit choice is never overridden.
      */

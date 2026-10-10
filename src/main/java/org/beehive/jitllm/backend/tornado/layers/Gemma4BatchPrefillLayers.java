@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import org.beehive.jitllm.backend.tornado.kernels.Gemma4AttentionKernels;
 import org.beehive.jitllm.backend.tornado.kernels.Gemma4BatchPrefillKernels;
+import org.beehive.jitllm.backend.tornado.kernels.Gemma4BatchPrefillSimdgroupAttentionKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillSimdgroupKernels;
 import org.beehive.jitllm.backend.tornado.scheduling.BatchPrefillGemmPolicy;
@@ -385,6 +386,9 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
      */
     // @formatter:on
     private boolean tensorCoreAttention(int layerIndex) {
+        if (simdgroupAttention(layerIndex)) {
+            return false;
+        }
         return fp16KeyValue
                 && config.headDim(layerIndex) % Gemma4AttentionKernels.TC_HEAD == 0
                 && org.beehive.jitllm.backend.tornado.TensorCoreSupport
@@ -495,6 +499,21 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     ldo,
                     off);
         }
+    }
+
+    // @formatter:off
+    /**
+     * Whether a layer's prefill attention runs on the Metal SIMD-group kernels: over the FP32
+     * cache, for the 256- and 512-wide heads they are written for. On with the SIMD-group
+     * projections; {@code -Djitllm.metal.simdgroupAttention=false} keeps the scalar kernel.
+     */
+    // @formatter:on
+    private boolean simdgroupAttention(int layerIndex) {
+        int headDim = config.headDim(layerIndex);
+        return simdgroup
+                && !fp16KeyValue
+                && (headDim == 256 || headDim == 512)
+                && !"false".equals(System.getProperty("jitllm.metal.simdgroupAttention"));
     }
 
     /** The key cache in the representation the state allocated. */
@@ -922,7 +941,28 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
                     stride);
         }
 
-        if (tensorCoreAttention(layerIndex)) {
+        if (simdgroupAttention(layerIndex)) {
+            layer.task(
+                    "batch_attention",
+                    headDim == 256
+                            ? Gemma4BatchPrefillSimdgroupAttentionKernels
+                                    ::batchedSlidingWindowAttentionHead256
+                            : Gemma4BatchPrefillSimdgroupAttentionKernels
+                                    ::batchedSlidingWindowAttentionHead512,
+                    context,
+                    state.workspace.batchStartPosHolder,
+                    state.workspace.qkvResultBatch,
+                    state.workspace.wrapKeyCache,
+                    state.workspace.wrapValueCache,
+                    state.workspace.attnOutFP16,
+                    nHead,
+                    headDim,
+                    kvDim,
+                    kvMul,
+                    stride,
+                    cacheBaseOffset,
+                    windowSize);
+        } else if (tensorCoreAttention(layerIndex)) {
             layer.task(
                     "batch_attention",
                     Gemma4AttentionKernels::attentionPrefillTensorCoreFP16,
@@ -1533,15 +1573,27 @@ public class Gemma4BatchPrefillLayers implements BatchPrefillTransformerLayerTas
             // width is not a multiple of 128, which nothing rounds it to.
             scheduler.addWorkerGrid(
                     p + "batch_attention",
-                    tensorCoreAttention(l)
+                    simdgroupAttention(l)
                             ? WorkerGridFactory.genericWorker(
-                                    paddedBatch
-                                            / Gemma4AttentionKernels.TC_QUERIES
+                                    ((batchSize
+                                                            + Gemma4BatchPrefillSimdgroupAttentionKernels
+                                                                    .QUERY_TILE
+                                                            - 1)
+                                                    / Gemma4BatchPrefillSimdgroupAttentionKernels
+                                                            .QUERY_TILE)
                                             * nHead
-                                            * Gemma4AttentionKernels.TC_LANES,
-                                    Gemma4AttentionKernels.TC_LANES)
-                            : WorkerGridFactory.genericWorker(
-                                    paddedBatch * nHead * HEAD_LOCAL_SIZE, HEAD_LOCAL_SIZE));
+                                            * Gemma4BatchPrefillSimdgroupAttentionKernels.THREADS,
+                                    Gemma4BatchPrefillSimdgroupAttentionKernels.THREADS)
+                            : tensorCoreAttention(l)
+                                    ? WorkerGridFactory.genericWorker(
+                                            paddedBatch
+                                                    / Gemma4AttentionKernels.TC_QUERIES
+                                                    * nHead
+                                                    * Gemma4AttentionKernels.TC_LANES,
+                                            Gemma4AttentionKernels.TC_LANES)
+                                    : WorkerGridFactory.genericWorker(
+                                            paddedBatch * nHead * HEAD_LOCAL_SIZE,
+                                            HEAD_LOCAL_SIZE));
             if (nativeProjections || simdgroup) {
                 // cuBLAS, or the SIMD-group grids below
             } else if (SPLIT_K) {
