@@ -530,4 +530,76 @@ public class TransformerBatchPrefillSimdgroupKernelsAccelTest {
         checkGateUpFused(false, 64, 40, 70);
         checkGateUpFused(true, 64, 40, 70);
     }
+
+    /** Q4_0 rows: per 32 columns a half scale of {@code 0.25 * 2^(block % 3)} and nibbles 0..15. */
+    private static ByteArray q4Weights(int rows, int n) {
+        int blocks = n / 32;
+        ByteArray w = new ByteArray(rows * blocks * 18);
+        for (int r = 0; r < rows; r++) {
+            for (int b = 0; b < blocks; b++) {
+                int base = (r * blocks + b) * 18;
+                short bits = Float.floatToFloat16(q8Scale(b));
+                w.set(base, (byte) bits);
+                w.set(base + 1, (byte) (bits >> 8));
+                for (int i = 0; i < 16; i++) {
+                    int lo = q4Nibble(r, b * 32 + i);
+                    int hi = q4Nibble(r, b * 32 + 16 + i);
+                    w.set(base + 2 + i, (byte) (lo | (hi << 4)));
+                }
+            }
+        }
+        return w;
+    }
+
+    private static int q4Nibble(int row, int k) {
+        return (row * 7 + k * 3) % 16;
+    }
+
+    private static float q4Weight(int row, int k) {
+        return (q4Nibble(row, k) - 8) * q8Scale(k / 32);
+    }
+
+    @Test
+    public void q4ResidualQkvAndGateUp() {
+        assumeMetal();
+        int n = 128;
+        int d = 72;
+        int batch = 70;
+        FloatArray x = activations(batch, n);
+        FloatArray out = new FloatArray(batch * d);
+        float[] expected = new float[batch * d];
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < d; r++) {
+                out.set(b * d + r, value(r, b + 1));
+                expected[b * d + r] =
+                        value(r, b + 1)
+                                + dot(
+                                        x,
+                                        b,
+                                        n,
+                                        TransformerBatchPrefillSimdgroupKernelsAccelTest::q4Weight,
+                                        r);
+            }
+        }
+        ByteArray w = q4Weights(d, n);
+        TaskGraph graph =
+                new TaskGraph("simdgroupQ4Residual")
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, x, out);
+        graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+        graph.task(
+                "t",
+                TransformerBatchPrefillSimdgroupKernels::batchedGemmQ4_0WithResidual,
+                new KernelContext(),
+                x,
+                out,
+                w,
+                n,
+                d,
+                batch);
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+        run(graph, "simdgroupQ4Residual", ((d + 63) / 64) * ((batch + 63) / 64));
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals("q4 residual element " + i, expected[i], out.get(i), 0.0f);
+        }
+    }
 }

@@ -49,6 +49,13 @@ public final class BatchPrefillSupport {
                             : Optional.of(
                                     "the gemma4 batched prefill is written for tensor cores"
                                             + " only, which this device does not have");
+            case "llama" ->
+                    c.weights() == org.beehive.jitllm.runtime.tensor.DataType.Q4_0
+                                    && !BackendId.METAL.equals(c.backend())
+                            ? Optional.of(
+                                    "the llama Q4_0 batched prefill runs the Metal SIMD-group"
+                                            + " kernels only")
+                            : Optional.empty();
             case "phi3" ->
                     BackendId.METAL.equals(c.backend())
                             ? Optional.empty()
@@ -142,8 +149,12 @@ public final class BatchPrefillSupport {
             return policy;
         }
         var type = model.weights().dataType();
+        boolean q4Llama =
+                type == org.beehive.jitllm.runtime.tensor.DataType.Q4_0
+                        && "llama".equals(model.architectureId().toString());
         if (type != org.beehive.jitllm.runtime.tensor.DataType.F16
-                && type != org.beehive.jitllm.runtime.tensor.DataType.Q8_0) {
+                && type != org.beehive.jitllm.runtime.tensor.DataType.Q8_0
+                && !q4Llama) {
             return policy;
         }
         if (unsupportedOnCurrentDevice(model).isPresent()) {
