@@ -37,7 +37,9 @@ public final class BatchPrefillGemmPolicy {
      * identical; the CPU/GPU parity tests pass. Q8_0 weights are staged as {@code float}: rounding
      * the dequantized weights to {@code half} was faster but failed the batched-prefill parity
      * budget. FP16 stages through two alternating buffers (one barrier per k-slice): kernel time at
-     * batch 256 fell 11% for gate/up and the down projection and 5% for QKV.
+     * batch 256 fell 11% for gate/up and the down projection and 5% for QKV. Reading the staged
+     * tiles with vector-width loads ({@code getFloat4} / {@code getHalf4}) took Qwen3-0.6B pp512 /
+     * pp2048 to 4171 / 2886 tok/s for F16 and 3802 / 2693 for Q8_0.
      */
     // @formatter:on
     public static boolean simdgroup() {

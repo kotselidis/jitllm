@@ -8,6 +8,8 @@ import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.matrix.Matrix8x8Float;
 import uk.ac.manchester.tornado.api.types.matrix.Matrix8x8Half;
+import uk.ac.manchester.tornado.api.types.vectors.Float4;
+import uk.ac.manchester.tornado.api.types.vectors.Half4;
 
 // @formatter:off
 /**
@@ -20,16 +22,17 @@ import uk.ac.manchester.tornado.api.types.matrix.Matrix8x8Half;
  * <p>A workgroup of 256 threads (eight SIMD groups in a 2x4 layout) computes a 64-token tile of the
  * output, 64 weight rows wide (32 for the gate/up kernels, which compute two projections). Per step
  * a 32-wide slice of the activations and of the weights ({@code half} for FP16, dequantized {@code
- * float} for Q8_0) is staged in threadgroup memory, rows padded to {@value #LDS} elements. Each
- * SIMD group multiplies a 32-token block of its share of the rows, reading weight fragments with
- * transposed loads because weight rows hold the contraction dimension contiguously. The next slice
- * is read into registers while the current one is multiplied and then stored into the second of two
- * staging buffers, so a slice costs one barrier; the contraction length must therefore be a
- * multiple of 64. Each thread stages a Q8_0 row's consecutive columns so that it reads the block
- * scale once. Accumulation is in {@code float}. Whole tiles are stored straight to device memory
- * (the residual kernels start from the output instead of zero); tiles that cross the end of the
- * batch or of the rows go one 8x8 fragment at a time through the staging buffers so that the
- * elements past the ends are skipped.
+ * float} for Q8_0) is staged in threadgroup memory, rows padded to {@value #LDS} elements;
+ * activations and FP16 weights are read four columns at a time ({@code getFloat4} / {@code
+ * getHalf4}), so row lengths must be multiples of 4. Each SIMD group multiplies a 32-token block of
+ * its share of the rows, reading weight fragments with transposed loads because weight rows hold
+ * the contraction dimension contiguously. The next slice is read into registers while the current
+ * one is multiplied and then stored into the second of two staging buffers, so a slice costs one
+ * barrier; the contraction length must therefore be a multiple of 64. Each thread stages a Q8_0
+ * row's consecutive columns so that it reads the block scale once. Accumulation is in {@code
+ * float}. Whole tiles are stored straight to device memory (the residual kernels start from the
+ * output instead of zero); tiles that cross the end of the batch or of the rows go one 8x8 fragment
+ * at a time through the staging buffers so that the elements past the ends are skipped.
  */
 // @formatter:on
 public final class TransformerBatchPrefillSimdgroupKernels {
@@ -73,6 +76,8 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         int lane = tid & 31;
         int kk0 = tid & 31;
         int rr0 = tid >> 5;
+        int vr = tid >> 3;
+        int vc = (tid & 7) << 2;
         int sgRow = (sg >> 2) << 5;
         int sgCol = (sg & 3) * 16;
         int rowTiles = ((qDim + 2 * kvDim) + 63) >> 6;
@@ -89,127 +94,129 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         Matrix8x8Float c21 = context.simdgroupMatrixZero();
         Matrix8x8Float c30 = context.simdgroupMatrixZero();
         Matrix8x8Float c31 = context.simdgroupMatrixZero();
-        float px0;
-        float px1;
-        float px2;
-        float px3;
-        float px4;
-        float px5;
-        float px6;
-        float px7;
-        float pw0;
-        float pw1;
-        float pw2;
-        float pw3;
-        float pw4;
-        float pw5;
-        float pw6;
-        float pw7;
-        px0 = x.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * dim + 0 + kk0).getFloat32();
-        px1 = x.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * dim + 0 + kk0).getFloat32();
-        px2 = x.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * dim + 0 + kk0).getFloat32();
-        px3 = x.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * dim + 0 + kk0).getFloat32();
-        px4 = x.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * dim + 0 + kk0).getFloat32();
-        px5 = x.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * dim + 0 + kk0).getFloat32();
-        px6 = x.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * dim + 0 + kk0).getFloat32();
-        px7 = x.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * dim + 0 + kk0).getFloat32();
+        float px0_0;
+        float px0_1;
+        float px0_2;
+        float px0_3;
+        float px1_0;
+        float px1_1;
+        float px1_2;
+        float px1_3;
+        float pw0_0;
+        float pw0_1;
+        float pw0_2;
+        float pw0_3;
+        float pw1_0;
+        float pw1_1;
+        float pw1_2;
+        float pw1_3;
+        Half4 hx00 = x.getHalf4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + 0 + vc);
+        px0_0 = hx00.getX().getFloat32();
+        px0_1 = hx00.getY().getFloat32();
+        px0_2 = hx00.getZ().getFloat32();
+        px0_3 = hx00.getW().getFloat32();
+        Half4 hx01 = x.getHalf4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + 0 + vc);
+        px1_0 = hx01.getX().getFloat32();
+        px1_1 = hx01.getY().getFloat32();
+        px1_2 = hx01.getZ().getFloat32();
+        px1_3 = hx01.getW().getFloat32();
         if (which == 0) {
-            pw0 = wq.get((local0 + rr0 + 0) * dim + 0 + kk0).getFloat32();
-            pw1 = wq.get((local0 + rr0 + 8) * dim + 0 + kk0).getFloat32();
-            pw2 = wq.get((local0 + rr0 + 16) * dim + 0 + kk0).getFloat32();
-            pw3 = wq.get((local0 + rr0 + 24) * dim + 0 + kk0).getFloat32();
-            pw4 = wq.get((local0 + rr0 + 32) * dim + 0 + kk0).getFloat32();
-            pw5 = wq.get((local0 + rr0 + 40) * dim + 0 + kk0).getFloat32();
-            pw6 = wq.get((local0 + rr0 + 48) * dim + 0 + kk0).getFloat32();
-            pw7 = wq.get((local0 + rr0 + 56) * dim + 0 + kk0).getFloat32();
+            Half4 hw00 = wq.getHalf4((local0 + vr + 0) * dim + 0 + vc);
+            pw0_0 = hw00.getX().getFloat32();
+            pw0_1 = hw00.getY().getFloat32();
+            pw0_2 = hw00.getZ().getFloat32();
+            pw0_3 = hw00.getW().getFloat32();
+            Half4 hw01 = wq.getHalf4((local0 + vr + 32) * dim + 0 + vc);
+            pw1_0 = hw01.getX().getFloat32();
+            pw1_1 = hw01.getY().getFloat32();
+            pw1_2 = hw01.getZ().getFloat32();
+            pw1_3 = hw01.getW().getFloat32();
         } else if (which == 1) {
-            pw0 = wk.get((local0 + rr0 + 0) * dim + 0 + kk0).getFloat32();
-            pw1 = wk.get((local0 + rr0 + 8) * dim + 0 + kk0).getFloat32();
-            pw2 = wk.get((local0 + rr0 + 16) * dim + 0 + kk0).getFloat32();
-            pw3 = wk.get((local0 + rr0 + 24) * dim + 0 + kk0).getFloat32();
-            pw4 = wk.get((local0 + rr0 + 32) * dim + 0 + kk0).getFloat32();
-            pw5 = wk.get((local0 + rr0 + 40) * dim + 0 + kk0).getFloat32();
-            pw6 = wk.get((local0 + rr0 + 48) * dim + 0 + kk0).getFloat32();
-            pw7 = wk.get((local0 + rr0 + 56) * dim + 0 + kk0).getFloat32();
+            Half4 hw00 = wk.getHalf4((local0 + vr + 0) * dim + 0 + vc);
+            pw0_0 = hw00.getX().getFloat32();
+            pw0_1 = hw00.getY().getFloat32();
+            pw0_2 = hw00.getZ().getFloat32();
+            pw0_3 = hw00.getW().getFloat32();
+            Half4 hw01 = wk.getHalf4((local0 + vr + 32) * dim + 0 + vc);
+            pw1_0 = hw01.getX().getFloat32();
+            pw1_1 = hw01.getY().getFloat32();
+            pw1_2 = hw01.getZ().getFloat32();
+            pw1_3 = hw01.getW().getFloat32();
         } else {
-            pw0 = wv.get((local0 + rr0 + 0) * dim + 0 + kk0).getFloat32();
-            pw1 = wv.get((local0 + rr0 + 8) * dim + 0 + kk0).getFloat32();
-            pw2 = wv.get((local0 + rr0 + 16) * dim + 0 + kk0).getFloat32();
-            pw3 = wv.get((local0 + rr0 + 24) * dim + 0 + kk0).getFloat32();
-            pw4 = wv.get((local0 + rr0 + 32) * dim + 0 + kk0).getFloat32();
-            pw5 = wv.get((local0 + rr0 + 40) * dim + 0 + kk0).getFloat32();
-            pw6 = wv.get((local0 + rr0 + 48) * dim + 0 + kk0).getFloat32();
-            pw7 = wv.get((local0 + rr0 + 56) * dim + 0 + kk0).getFloat32();
+            Half4 hw00 = wv.getHalf4((local0 + vr + 0) * dim + 0 + vc);
+            pw0_0 = hw00.getX().getFloat32();
+            pw0_1 = hw00.getY().getFloat32();
+            pw0_2 = hw00.getZ().getFloat32();
+            pw0_3 = hw00.getW().getFloat32();
+            Half4 hw01 = wv.getHalf4((local0 + vr + 32) * dim + 0 + vc);
+            pw1_0 = hw01.getX().getFloat32();
+            pw1_1 = hw01.getY().getFloat32();
+            pw1_2 = hw01.getZ().getFloat32();
+            pw1_3 = hw01.getW().getFloat32();
         }
-        xs[(rr0 + 0) * LDS + kk0] = px0;
-        xs[(rr0 + 8) * LDS + kk0] = px1;
-        xs[(rr0 + 16) * LDS + kk0] = px2;
-        xs[(rr0 + 24) * LDS + kk0] = px3;
-        xs[(rr0 + 32) * LDS + kk0] = px4;
-        xs[(rr0 + 40) * LDS + kk0] = px5;
-        xs[(rr0 + 48) * LDS + kk0] = px6;
-        xs[(rr0 + 56) * LDS + kk0] = px7;
-        ws[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-        ws[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-        ws[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-        ws[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-        ws[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-        ws[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-        ws[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-        ws[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+        xs[(vr + 0) * LDS + vc + 0] = px0_0;
+        xs[(vr + 0) * LDS + vc + 1] = px0_1;
+        xs[(vr + 0) * LDS + vc + 2] = px0_2;
+        xs[(vr + 0) * LDS + vc + 3] = px0_3;
+        xs[(vr + 32) * LDS + vc + 0] = px1_0;
+        xs[(vr + 32) * LDS + vc + 1] = px1_1;
+        xs[(vr + 32) * LDS + vc + 2] = px1_2;
+        xs[(vr + 32) * LDS + vc + 3] = px1_3;
+        ws[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+        ws[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+        ws[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+        ws[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+        ws[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+        ws[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+        ws[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+        ws[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
         context.localBarrier();
         for (int k0 = 0; k0 < dim; k0 += 64) {
-            px0 =
-                    x.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            px1 =
-                    x.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            px2 =
-                    x.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            px3 =
-                    x.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            px4 =
-                    x.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            px5 =
-                    x.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            px6 =
-                    x.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            px7 =
-                    x.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
+            Half4 hxk0320 =
+                    x.getHalf4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + k0 + 32 + vc);
+            px0_0 = hxk0320.getX().getFloat32();
+            px0_1 = hxk0320.getY().getFloat32();
+            px0_2 = hxk0320.getZ().getFloat32();
+            px0_3 = hxk0320.getW().getFloat32();
+            Half4 hxk0321 =
+                    x.getHalf4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + k0 + 32 + vc);
+            px1_0 = hxk0321.getX().getFloat32();
+            px1_1 = hxk0321.getY().getFloat32();
+            px1_2 = hxk0321.getZ().getFloat32();
+            px1_3 = hxk0321.getW().getFloat32();
             if (which == 0) {
-                pw0 = wq.get((local0 + rr0 + 0) * dim + k0 + 32 + kk0).getFloat32();
-                pw1 = wq.get((local0 + rr0 + 8) * dim + k0 + 32 + kk0).getFloat32();
-                pw2 = wq.get((local0 + rr0 + 16) * dim + k0 + 32 + kk0).getFloat32();
-                pw3 = wq.get((local0 + rr0 + 24) * dim + k0 + 32 + kk0).getFloat32();
-                pw4 = wq.get((local0 + rr0 + 32) * dim + k0 + 32 + kk0).getFloat32();
-                pw5 = wq.get((local0 + rr0 + 40) * dim + k0 + 32 + kk0).getFloat32();
-                pw6 = wq.get((local0 + rr0 + 48) * dim + k0 + 32 + kk0).getFloat32();
-                pw7 = wq.get((local0 + rr0 + 56) * dim + k0 + 32 + kk0).getFloat32();
+                Half4 hwk0320 = wq.getHalf4((local0 + vr + 0) * dim + k0 + 32 + vc);
+                pw0_0 = hwk0320.getX().getFloat32();
+                pw0_1 = hwk0320.getY().getFloat32();
+                pw0_2 = hwk0320.getZ().getFloat32();
+                pw0_3 = hwk0320.getW().getFloat32();
+                Half4 hwk0321 = wq.getHalf4((local0 + vr + 32) * dim + k0 + 32 + vc);
+                pw1_0 = hwk0321.getX().getFloat32();
+                pw1_1 = hwk0321.getY().getFloat32();
+                pw1_2 = hwk0321.getZ().getFloat32();
+                pw1_3 = hwk0321.getW().getFloat32();
             } else if (which == 1) {
-                pw0 = wk.get((local0 + rr0 + 0) * dim + k0 + 32 + kk0).getFloat32();
-                pw1 = wk.get((local0 + rr0 + 8) * dim + k0 + 32 + kk0).getFloat32();
-                pw2 = wk.get((local0 + rr0 + 16) * dim + k0 + 32 + kk0).getFloat32();
-                pw3 = wk.get((local0 + rr0 + 24) * dim + k0 + 32 + kk0).getFloat32();
-                pw4 = wk.get((local0 + rr0 + 32) * dim + k0 + 32 + kk0).getFloat32();
-                pw5 = wk.get((local0 + rr0 + 40) * dim + k0 + 32 + kk0).getFloat32();
-                pw6 = wk.get((local0 + rr0 + 48) * dim + k0 + 32 + kk0).getFloat32();
-                pw7 = wk.get((local0 + rr0 + 56) * dim + k0 + 32 + kk0).getFloat32();
+                Half4 hwk0320 = wk.getHalf4((local0 + vr + 0) * dim + k0 + 32 + vc);
+                pw0_0 = hwk0320.getX().getFloat32();
+                pw0_1 = hwk0320.getY().getFloat32();
+                pw0_2 = hwk0320.getZ().getFloat32();
+                pw0_3 = hwk0320.getW().getFloat32();
+                Half4 hwk0321 = wk.getHalf4((local0 + vr + 32) * dim + k0 + 32 + vc);
+                pw1_0 = hwk0321.getX().getFloat32();
+                pw1_1 = hwk0321.getY().getFloat32();
+                pw1_2 = hwk0321.getZ().getFloat32();
+                pw1_3 = hwk0321.getW().getFloat32();
             } else {
-                pw0 = wv.get((local0 + rr0 + 0) * dim + k0 + 32 + kk0).getFloat32();
-                pw1 = wv.get((local0 + rr0 + 8) * dim + k0 + 32 + kk0).getFloat32();
-                pw2 = wv.get((local0 + rr0 + 16) * dim + k0 + 32 + kk0).getFloat32();
-                pw3 = wv.get((local0 + rr0 + 24) * dim + k0 + 32 + kk0).getFloat32();
-                pw4 = wv.get((local0 + rr0 + 32) * dim + k0 + 32 + kk0).getFloat32();
-                pw5 = wv.get((local0 + rr0 + 40) * dim + k0 + 32 + kk0).getFloat32();
-                pw6 = wv.get((local0 + rr0 + 48) * dim + k0 + 32 + kk0).getFloat32();
-                pw7 = wv.get((local0 + rr0 + 56) * dim + k0 + 32 + kk0).getFloat32();
+                Half4 hwk0320 = wv.getHalf4((local0 + vr + 0) * dim + k0 + 32 + vc);
+                pw0_0 = hwk0320.getX().getFloat32();
+                pw0_1 = hwk0320.getY().getFloat32();
+                pw0_2 = hwk0320.getZ().getFloat32();
+                pw0_3 = hwk0320.getW().getFloat32();
+                Half4 hwk0321 = wv.getHalf4((local0 + vr + 32) * dim + k0 + 32 + vc);
+                pw1_0 = hwk0321.getX().getFloat32();
+                pw1_1 = hwk0321.getY().getFloat32();
+                pw1_2 = hwk0321.getZ().getFloat32();
+                pw1_3 = hwk0321.getW().getFloat32();
             }
             for (int kk = 0; kk < 32; kk += 8) {
                 Matrix8x8Float x0 = context.simdgroupMatrixLoad(xs, (sgRow + 0) * LDS + kk, LDS);
@@ -229,75 +236,69 @@ public final class TransformerBatchPrefillSimdgroupKernels {
                 c30 = context.simdgroupMatrixMultiplyAccumulate(x3, cw0, c30);
                 c31 = context.simdgroupMatrixMultiplyAccumulate(x3, cw1, c31);
             }
-            xs1[(rr0 + 0) * LDS + kk0] = px0;
-            xs1[(rr0 + 8) * LDS + kk0] = px1;
-            xs1[(rr0 + 16) * LDS + kk0] = px2;
-            xs1[(rr0 + 24) * LDS + kk0] = px3;
-            xs1[(rr0 + 32) * LDS + kk0] = px4;
-            xs1[(rr0 + 40) * LDS + kk0] = px5;
-            xs1[(rr0 + 48) * LDS + kk0] = px6;
-            xs1[(rr0 + 56) * LDS + kk0] = px7;
-            ws1[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-            ws1[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-            ws1[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-            ws1[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-            ws1[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-            ws1[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-            ws1[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-            ws1[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+            xs1[(vr + 0) * LDS + vc + 0] = px0_0;
+            xs1[(vr + 0) * LDS + vc + 1] = px0_1;
+            xs1[(vr + 0) * LDS + vc + 2] = px0_2;
+            xs1[(vr + 0) * LDS + vc + 3] = px0_3;
+            xs1[(vr + 32) * LDS + vc + 0] = px1_0;
+            xs1[(vr + 32) * LDS + vc + 1] = px1_1;
+            xs1[(vr + 32) * LDS + vc + 2] = px1_2;
+            xs1[(vr + 32) * LDS + vc + 3] = px1_3;
+            ws1[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+            ws1[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+            ws1[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+            ws1[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+            ws1[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+            ws1[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+            ws1[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+            ws1[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
             context.localBarrier();
             if (k0 + 64 < dim) {
-                px0 =
-                        x.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                px1 =
-                        x.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                px2 =
-                        x.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                px3 =
-                        x.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                px4 =
-                        x.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                px5 =
-                        x.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                px6 =
-                        x.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                px7 =
-                        x.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
+                Half4 hxk0640 =
+                        x.getHalf4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + k0 + 64 + vc);
+                px0_0 = hxk0640.getX().getFloat32();
+                px0_1 = hxk0640.getY().getFloat32();
+                px0_2 = hxk0640.getZ().getFloat32();
+                px0_3 = hxk0640.getW().getFloat32();
+                Half4 hxk0641 =
+                        x.getHalf4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + k0 + 64 + vc);
+                px1_0 = hxk0641.getX().getFloat32();
+                px1_1 = hxk0641.getY().getFloat32();
+                px1_2 = hxk0641.getZ().getFloat32();
+                px1_3 = hxk0641.getW().getFloat32();
                 if (which == 0) {
-                    pw0 = wq.get((local0 + rr0 + 0) * dim + k0 + 64 + kk0).getFloat32();
-                    pw1 = wq.get((local0 + rr0 + 8) * dim + k0 + 64 + kk0).getFloat32();
-                    pw2 = wq.get((local0 + rr0 + 16) * dim + k0 + 64 + kk0).getFloat32();
-                    pw3 = wq.get((local0 + rr0 + 24) * dim + k0 + 64 + kk0).getFloat32();
-                    pw4 = wq.get((local0 + rr0 + 32) * dim + k0 + 64 + kk0).getFloat32();
-                    pw5 = wq.get((local0 + rr0 + 40) * dim + k0 + 64 + kk0).getFloat32();
-                    pw6 = wq.get((local0 + rr0 + 48) * dim + k0 + 64 + kk0).getFloat32();
-                    pw7 = wq.get((local0 + rr0 + 56) * dim + k0 + 64 + kk0).getFloat32();
+                    Half4 hwk0640 = wq.getHalf4((local0 + vr + 0) * dim + k0 + 64 + vc);
+                    pw0_0 = hwk0640.getX().getFloat32();
+                    pw0_1 = hwk0640.getY().getFloat32();
+                    pw0_2 = hwk0640.getZ().getFloat32();
+                    pw0_3 = hwk0640.getW().getFloat32();
+                    Half4 hwk0641 = wq.getHalf4((local0 + vr + 32) * dim + k0 + 64 + vc);
+                    pw1_0 = hwk0641.getX().getFloat32();
+                    pw1_1 = hwk0641.getY().getFloat32();
+                    pw1_2 = hwk0641.getZ().getFloat32();
+                    pw1_3 = hwk0641.getW().getFloat32();
                 } else if (which == 1) {
-                    pw0 = wk.get((local0 + rr0 + 0) * dim + k0 + 64 + kk0).getFloat32();
-                    pw1 = wk.get((local0 + rr0 + 8) * dim + k0 + 64 + kk0).getFloat32();
-                    pw2 = wk.get((local0 + rr0 + 16) * dim + k0 + 64 + kk0).getFloat32();
-                    pw3 = wk.get((local0 + rr0 + 24) * dim + k0 + 64 + kk0).getFloat32();
-                    pw4 = wk.get((local0 + rr0 + 32) * dim + k0 + 64 + kk0).getFloat32();
-                    pw5 = wk.get((local0 + rr0 + 40) * dim + k0 + 64 + kk0).getFloat32();
-                    pw6 = wk.get((local0 + rr0 + 48) * dim + k0 + 64 + kk0).getFloat32();
-                    pw7 = wk.get((local0 + rr0 + 56) * dim + k0 + 64 + kk0).getFloat32();
+                    Half4 hwk0640 = wk.getHalf4((local0 + vr + 0) * dim + k0 + 64 + vc);
+                    pw0_0 = hwk0640.getX().getFloat32();
+                    pw0_1 = hwk0640.getY().getFloat32();
+                    pw0_2 = hwk0640.getZ().getFloat32();
+                    pw0_3 = hwk0640.getW().getFloat32();
+                    Half4 hwk0641 = wk.getHalf4((local0 + vr + 32) * dim + k0 + 64 + vc);
+                    pw1_0 = hwk0641.getX().getFloat32();
+                    pw1_1 = hwk0641.getY().getFloat32();
+                    pw1_2 = hwk0641.getZ().getFloat32();
+                    pw1_3 = hwk0641.getW().getFloat32();
                 } else {
-                    pw0 = wv.get((local0 + rr0 + 0) * dim + k0 + 64 + kk0).getFloat32();
-                    pw1 = wv.get((local0 + rr0 + 8) * dim + k0 + 64 + kk0).getFloat32();
-                    pw2 = wv.get((local0 + rr0 + 16) * dim + k0 + 64 + kk0).getFloat32();
-                    pw3 = wv.get((local0 + rr0 + 24) * dim + k0 + 64 + kk0).getFloat32();
-                    pw4 = wv.get((local0 + rr0 + 32) * dim + k0 + 64 + kk0).getFloat32();
-                    pw5 = wv.get((local0 + rr0 + 40) * dim + k0 + 64 + kk0).getFloat32();
-                    pw6 = wv.get((local0 + rr0 + 48) * dim + k0 + 64 + kk0).getFloat32();
-                    pw7 = wv.get((local0 + rr0 + 56) * dim + k0 + 64 + kk0).getFloat32();
+                    Half4 hwk0640 = wv.getHalf4((local0 + vr + 0) * dim + k0 + 64 + vc);
+                    pw0_0 = hwk0640.getX().getFloat32();
+                    pw0_1 = hwk0640.getY().getFloat32();
+                    pw0_2 = hwk0640.getZ().getFloat32();
+                    pw0_3 = hwk0640.getW().getFloat32();
+                    Half4 hwk0641 = wv.getHalf4((local0 + vr + 32) * dim + k0 + 64 + vc);
+                    pw1_0 = hwk0641.getX().getFloat32();
+                    pw1_1 = hwk0641.getY().getFloat32();
+                    pw1_2 = hwk0641.getZ().getFloat32();
+                    pw1_3 = hwk0641.getW().getFloat32();
                 }
             }
             for (int kk = 0; kk < 32; kk += 8) {
@@ -319,22 +320,22 @@ public final class TransformerBatchPrefillSimdgroupKernels {
                 c31 = context.simdgroupMatrixMultiplyAccumulate(x3, cw1, c31);
             }
             if (k0 + 64 < dim) {
-                xs[(rr0 + 0) * LDS + kk0] = px0;
-                xs[(rr0 + 8) * LDS + kk0] = px1;
-                xs[(rr0 + 16) * LDS + kk0] = px2;
-                xs[(rr0 + 24) * LDS + kk0] = px3;
-                xs[(rr0 + 32) * LDS + kk0] = px4;
-                xs[(rr0 + 40) * LDS + kk0] = px5;
-                xs[(rr0 + 48) * LDS + kk0] = px6;
-                xs[(rr0 + 56) * LDS + kk0] = px7;
-                ws[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-                ws[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-                ws[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-                ws[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-                ws[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-                ws[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-                ws[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-                ws[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+                xs[(vr + 0) * LDS + vc + 0] = px0_0;
+                xs[(vr + 0) * LDS + vc + 1] = px0_1;
+                xs[(vr + 0) * LDS + vc + 2] = px0_2;
+                xs[(vr + 0) * LDS + vc + 3] = px0_3;
+                xs[(vr + 32) * LDS + vc + 0] = px1_0;
+                xs[(vr + 32) * LDS + vc + 1] = px1_1;
+                xs[(vr + 32) * LDS + vc + 2] = px1_2;
+                xs[(vr + 32) * LDS + vc + 3] = px1_3;
+                ws[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+                ws[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+                ws[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+                ws[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+                ws[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+                ws[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+                ws[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+                ws[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
             }
             context.localBarrier();
         }
@@ -563,6 +564,8 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         int lane = tid & 31;
         int kk0 = tid & 31;
         int rr0 = tid >> 5;
+        int vr = tid >> 3;
+        int vc = (tid & 7) << 2;
         int sgRow = (sg >> 2) << 5;
         int sgCol = (sg & 3) * 16;
         int rowTiles = (d + 63) >> 6;
@@ -604,72 +607,84 @@ public final class TransformerBatchPrefillSimdgroupKernels {
                     context.simdgroupMatrixLoad(
                             outputBatch, (b0 + sgRow + 24) * d + r0 + sgCol + 8, d);
         }
-        float px0;
-        float px1;
-        float px2;
-        float px3;
-        float px4;
-        float px5;
-        float px6;
-        float px7;
-        float pw0;
-        float pw1;
-        float pw2;
-        float pw3;
-        float pw4;
-        float pw5;
-        float pw6;
-        float pw7;
-        px0 = inputBatch.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * n + 0 + kk0);
-        px1 = inputBatch.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * n + 0 + kk0);
-        px2 = inputBatch.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * n + 0 + kk0);
-        px3 = inputBatch.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * n + 0 + kk0);
-        px4 = inputBatch.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * n + 0 + kk0);
-        px5 = inputBatch.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * n + 0 + kk0);
-        px6 = inputBatch.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * n + 0 + kk0);
-        px7 = inputBatch.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * n + 0 + kk0);
-        pw0 = w.get(TornadoMath.min(r0 + rr0 + 0, d - 1) * n + 0 + kk0).getFloat32();
-        pw1 = w.get(TornadoMath.min(r0 + rr0 + 8, d - 1) * n + 0 + kk0).getFloat32();
-        pw2 = w.get(TornadoMath.min(r0 + rr0 + 16, d - 1) * n + 0 + kk0).getFloat32();
-        pw3 = w.get(TornadoMath.min(r0 + rr0 + 24, d - 1) * n + 0 + kk0).getFloat32();
-        pw4 = w.get(TornadoMath.min(r0 + rr0 + 32, d - 1) * n + 0 + kk0).getFloat32();
-        pw5 = w.get(TornadoMath.min(r0 + rr0 + 40, d - 1) * n + 0 + kk0).getFloat32();
-        pw6 = w.get(TornadoMath.min(r0 + rr0 + 48, d - 1) * n + 0 + kk0).getFloat32();
-        pw7 = w.get(TornadoMath.min(r0 + rr0 + 56, d - 1) * n + 0 + kk0).getFloat32();
-        xs[(rr0 + 0) * LDS + kk0] = px0;
-        xs[(rr0 + 8) * LDS + kk0] = px1;
-        xs[(rr0 + 16) * LDS + kk0] = px2;
-        xs[(rr0 + 24) * LDS + kk0] = px3;
-        xs[(rr0 + 32) * LDS + kk0] = px4;
-        xs[(rr0 + 40) * LDS + kk0] = px5;
-        xs[(rr0 + 48) * LDS + kk0] = px6;
-        xs[(rr0 + 56) * LDS + kk0] = px7;
-        ws[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-        ws[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-        ws[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-        ws[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-        ws[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-        ws[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-        ws[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-        ws[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+        float px0_0;
+        float px0_1;
+        float px0_2;
+        float px0_3;
+        float px1_0;
+        float px1_1;
+        float px1_2;
+        float px1_3;
+        float pw0_0;
+        float pw0_1;
+        float pw0_2;
+        float pw0_3;
+        float pw1_0;
+        float pw1_1;
+        float pw1_2;
+        float pw1_3;
+        Float4 fx00 = inputBatch.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * n + 0 + vc);
+        px0_0 = fx00.getX();
+        px0_1 = fx00.getY();
+        px0_2 = fx00.getZ();
+        px0_3 = fx00.getW();
+        Float4 fx01 = inputBatch.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * n + 0 + vc);
+        px1_0 = fx01.getX();
+        px1_1 = fx01.getY();
+        px1_2 = fx01.getZ();
+        px1_3 = fx01.getW();
+        Half4 hw00 = w.getHalf4((TornadoMath.min(r0 + vr + 0, d - 1)) * n + 0 + vc);
+        pw0_0 = hw00.getX().getFloat32();
+        pw0_1 = hw00.getY().getFloat32();
+        pw0_2 = hw00.getZ().getFloat32();
+        pw0_3 = hw00.getW().getFloat32();
+        Half4 hw01 = w.getHalf4((TornadoMath.min(r0 + vr + 32, d - 1)) * n + 0 + vc);
+        pw1_0 = hw01.getX().getFloat32();
+        pw1_1 = hw01.getY().getFloat32();
+        pw1_2 = hw01.getZ().getFloat32();
+        pw1_3 = hw01.getW().getFloat32();
+        xs[(vr + 0) * LDS + vc + 0] = px0_0;
+        xs[(vr + 0) * LDS + vc + 1] = px0_1;
+        xs[(vr + 0) * LDS + vc + 2] = px0_2;
+        xs[(vr + 0) * LDS + vc + 3] = px0_3;
+        xs[(vr + 32) * LDS + vc + 0] = px1_0;
+        xs[(vr + 32) * LDS + vc + 1] = px1_1;
+        xs[(vr + 32) * LDS + vc + 2] = px1_2;
+        xs[(vr + 32) * LDS + vc + 3] = px1_3;
+        ws[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+        ws[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+        ws[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+        ws[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+        ws[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+        ws[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+        ws[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+        ws[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
         context.localBarrier();
         for (int k0 = 0; k0 < n; k0 += 64) {
-            px0 = inputBatch.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * n + k0 + 32 + kk0);
-            px1 = inputBatch.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * n + k0 + 32 + kk0);
-            px2 = inputBatch.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * n + k0 + 32 + kk0);
-            px3 = inputBatch.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * n + k0 + 32 + kk0);
-            px4 = inputBatch.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * n + k0 + 32 + kk0);
-            px5 = inputBatch.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * n + k0 + 32 + kk0);
-            px6 = inputBatch.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * n + k0 + 32 + kk0);
-            px7 = inputBatch.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * n + k0 + 32 + kk0);
-            pw0 = w.get(TornadoMath.min(r0 + rr0 + 0, d - 1) * n + k0 + 32 + kk0).getFloat32();
-            pw1 = w.get(TornadoMath.min(r0 + rr0 + 8, d - 1) * n + k0 + 32 + kk0).getFloat32();
-            pw2 = w.get(TornadoMath.min(r0 + rr0 + 16, d - 1) * n + k0 + 32 + kk0).getFloat32();
-            pw3 = w.get(TornadoMath.min(r0 + rr0 + 24, d - 1) * n + k0 + 32 + kk0).getFloat32();
-            pw4 = w.get(TornadoMath.min(r0 + rr0 + 32, d - 1) * n + k0 + 32 + kk0).getFloat32();
-            pw5 = w.get(TornadoMath.min(r0 + rr0 + 40, d - 1) * n + k0 + 32 + kk0).getFloat32();
-            pw6 = w.get(TornadoMath.min(r0 + rr0 + 48, d - 1) * n + k0 + 32 + kk0).getFloat32();
-            pw7 = w.get(TornadoMath.min(r0 + rr0 + 56, d - 1) * n + k0 + 32 + kk0).getFloat32();
+            Float4 fxk0320 =
+                    inputBatch.getFloat4(
+                            TornadoMath.min(b0 + vr + 0, batch - 1) * n + k0 + 32 + vc);
+            px0_0 = fxk0320.getX();
+            px0_1 = fxk0320.getY();
+            px0_2 = fxk0320.getZ();
+            px0_3 = fxk0320.getW();
+            Float4 fxk0321 =
+                    inputBatch.getFloat4(
+                            TornadoMath.min(b0 + vr + 32, batch - 1) * n + k0 + 32 + vc);
+            px1_0 = fxk0321.getX();
+            px1_1 = fxk0321.getY();
+            px1_2 = fxk0321.getZ();
+            px1_3 = fxk0321.getW();
+            Half4 hwk0320 = w.getHalf4((TornadoMath.min(r0 + vr + 0, d - 1)) * n + k0 + 32 + vc);
+            pw0_0 = hwk0320.getX().getFloat32();
+            pw0_1 = hwk0320.getY().getFloat32();
+            pw0_2 = hwk0320.getZ().getFloat32();
+            pw0_3 = hwk0320.getW().getFloat32();
+            Half4 hwk0321 = w.getHalf4((TornadoMath.min(r0 + vr + 32, d - 1)) * n + k0 + 32 + vc);
+            pw1_0 = hwk0321.getX().getFloat32();
+            pw1_1 = hwk0321.getY().getFloat32();
+            pw1_2 = hwk0321.getZ().getFloat32();
+            pw1_3 = hwk0321.getW().getFloat32();
             for (int kk = 0; kk < 32; kk += 8) {
                 Matrix8x8Float x0 = context.simdgroupMatrixLoad(xs, (sgRow + 0) * LDS + kk, LDS);
                 Matrix8x8Float x1 = context.simdgroupMatrixLoad(xs, (sgRow + 8) * LDS + kk, LDS);
@@ -688,40 +703,50 @@ public final class TransformerBatchPrefillSimdgroupKernels {
                 c30 = context.simdgroupMatrixMultiplyAccumulate(x3, cw0, c30);
                 c31 = context.simdgroupMatrixMultiplyAccumulate(x3, cw1, c31);
             }
-            xs1[(rr0 + 0) * LDS + kk0] = px0;
-            xs1[(rr0 + 8) * LDS + kk0] = px1;
-            xs1[(rr0 + 16) * LDS + kk0] = px2;
-            xs1[(rr0 + 24) * LDS + kk0] = px3;
-            xs1[(rr0 + 32) * LDS + kk0] = px4;
-            xs1[(rr0 + 40) * LDS + kk0] = px5;
-            xs1[(rr0 + 48) * LDS + kk0] = px6;
-            xs1[(rr0 + 56) * LDS + kk0] = px7;
-            ws1[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-            ws1[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-            ws1[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-            ws1[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-            ws1[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-            ws1[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-            ws1[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-            ws1[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+            xs1[(vr + 0) * LDS + vc + 0] = px0_0;
+            xs1[(vr + 0) * LDS + vc + 1] = px0_1;
+            xs1[(vr + 0) * LDS + vc + 2] = px0_2;
+            xs1[(vr + 0) * LDS + vc + 3] = px0_3;
+            xs1[(vr + 32) * LDS + vc + 0] = px1_0;
+            xs1[(vr + 32) * LDS + vc + 1] = px1_1;
+            xs1[(vr + 32) * LDS + vc + 2] = px1_2;
+            xs1[(vr + 32) * LDS + vc + 3] = px1_3;
+            ws1[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+            ws1[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+            ws1[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+            ws1[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+            ws1[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+            ws1[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+            ws1[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+            ws1[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
             context.localBarrier();
             if (k0 + 64 < n) {
-                px0 = inputBatch.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * n + k0 + 64 + kk0);
-                px1 = inputBatch.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * n + k0 + 64 + kk0);
-                px2 = inputBatch.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * n + k0 + 64 + kk0);
-                px3 = inputBatch.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * n + k0 + 64 + kk0);
-                px4 = inputBatch.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * n + k0 + 64 + kk0);
-                px5 = inputBatch.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * n + k0 + 64 + kk0);
-                px6 = inputBatch.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * n + k0 + 64 + kk0);
-                px7 = inputBatch.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * n + k0 + 64 + kk0);
-                pw0 = w.get(TornadoMath.min(r0 + rr0 + 0, d - 1) * n + k0 + 64 + kk0).getFloat32();
-                pw1 = w.get(TornadoMath.min(r0 + rr0 + 8, d - 1) * n + k0 + 64 + kk0).getFloat32();
-                pw2 = w.get(TornadoMath.min(r0 + rr0 + 16, d - 1) * n + k0 + 64 + kk0).getFloat32();
-                pw3 = w.get(TornadoMath.min(r0 + rr0 + 24, d - 1) * n + k0 + 64 + kk0).getFloat32();
-                pw4 = w.get(TornadoMath.min(r0 + rr0 + 32, d - 1) * n + k0 + 64 + kk0).getFloat32();
-                pw5 = w.get(TornadoMath.min(r0 + rr0 + 40, d - 1) * n + k0 + 64 + kk0).getFloat32();
-                pw6 = w.get(TornadoMath.min(r0 + rr0 + 48, d - 1) * n + k0 + 64 + kk0).getFloat32();
-                pw7 = w.get(TornadoMath.min(r0 + rr0 + 56, d - 1) * n + k0 + 64 + kk0).getFloat32();
+                Float4 fxk0640 =
+                        inputBatch.getFloat4(
+                                TornadoMath.min(b0 + vr + 0, batch - 1) * n + k0 + 64 + vc);
+                px0_0 = fxk0640.getX();
+                px0_1 = fxk0640.getY();
+                px0_2 = fxk0640.getZ();
+                px0_3 = fxk0640.getW();
+                Float4 fxk0641 =
+                        inputBatch.getFloat4(
+                                TornadoMath.min(b0 + vr + 32, batch - 1) * n + k0 + 64 + vc);
+                px1_0 = fxk0641.getX();
+                px1_1 = fxk0641.getY();
+                px1_2 = fxk0641.getZ();
+                px1_3 = fxk0641.getW();
+                Half4 hwk0640 =
+                        w.getHalf4((TornadoMath.min(r0 + vr + 0, d - 1)) * n + k0 + 64 + vc);
+                pw0_0 = hwk0640.getX().getFloat32();
+                pw0_1 = hwk0640.getY().getFloat32();
+                pw0_2 = hwk0640.getZ().getFloat32();
+                pw0_3 = hwk0640.getW().getFloat32();
+                Half4 hwk0641 =
+                        w.getHalf4((TornadoMath.min(r0 + vr + 32, d - 1)) * n + k0 + 64 + vc);
+                pw1_0 = hwk0641.getX().getFloat32();
+                pw1_1 = hwk0641.getY().getFloat32();
+                pw1_2 = hwk0641.getZ().getFloat32();
+                pw1_3 = hwk0641.getW().getFloat32();
             }
             for (int kk = 0; kk < 32; kk += 8) {
                 Matrix8x8Float x0 = context.simdgroupMatrixLoad(xs1, (sgRow + 0) * LDS + kk, LDS);
@@ -742,22 +767,22 @@ public final class TransformerBatchPrefillSimdgroupKernels {
                 c31 = context.simdgroupMatrixMultiplyAccumulate(x3, cw1, c31);
             }
             if (k0 + 64 < n) {
-                xs[(rr0 + 0) * LDS + kk0] = px0;
-                xs[(rr0 + 8) * LDS + kk0] = px1;
-                xs[(rr0 + 16) * LDS + kk0] = px2;
-                xs[(rr0 + 24) * LDS + kk0] = px3;
-                xs[(rr0 + 32) * LDS + kk0] = px4;
-                xs[(rr0 + 40) * LDS + kk0] = px5;
-                xs[(rr0 + 48) * LDS + kk0] = px6;
-                xs[(rr0 + 56) * LDS + kk0] = px7;
-                ws[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-                ws[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-                ws[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-                ws[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-                ws[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-                ws[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-                ws[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-                ws[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+                xs[(vr + 0) * LDS + vc + 0] = px0_0;
+                xs[(vr + 0) * LDS + vc + 1] = px0_1;
+                xs[(vr + 0) * LDS + vc + 2] = px0_2;
+                xs[(vr + 0) * LDS + vc + 3] = px0_3;
+                xs[(vr + 32) * LDS + vc + 0] = px1_0;
+                xs[(vr + 32) * LDS + vc + 1] = px1_1;
+                xs[(vr + 32) * LDS + vc + 2] = px1_2;
+                xs[(vr + 32) * LDS + vc + 3] = px1_3;
+                ws[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+                ws[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+                ws[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+                ws[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+                ws[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+                ws[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+                ws[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+                ws[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
             }
             context.localBarrier();
         }
@@ -891,6 +916,8 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         int lane = tid & 31;
         int kk0 = tid & 31;
         int rr0 = tid >> 5;
+        int vr = tid >> 3;
+        int vc = (tid & 7) << 2;
         int sgRow = (sg >> 2) << 5;
         int sgCol = (sg & 3) * 8;
         int rowTiles = (hiddenDim + 31) >> 5;
@@ -905,123 +932,93 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         Matrix8x8Float u10 = context.simdgroupMatrixZero();
         Matrix8x8Float u20 = context.simdgroupMatrixZero();
         Matrix8x8Float u30 = context.simdgroupMatrixZero();
-        float px0;
-        float px1;
-        float px2;
-        float px3;
-        float px4;
-        float px5;
-        float px6;
-        float px7;
-        float pw0;
-        float pw1;
-        float pw2;
-        float pw3;
-        float pw4;
-        float pw5;
-        float pw6;
-        float pw7;
-        int xt0 = TornadoMath.min(b0 + rr0 + 0, batch - 1);
-        float xsc0 = scaleBatch.get(xt0);
-        xt0 = xt0 * dim;
-        int xt1 = TornadoMath.min(b0 + rr0 + 8, batch - 1);
-        float xsc1 = scaleBatch.get(xt1);
-        xt1 = xt1 * dim;
-        int xt2 = TornadoMath.min(b0 + rr0 + 16, batch - 1);
-        float xsc2 = scaleBatch.get(xt2);
-        xt2 = xt2 * dim;
-        int xt3 = TornadoMath.min(b0 + rr0 + 24, batch - 1);
-        float xsc3 = scaleBatch.get(xt3);
-        xt3 = xt3 * dim;
-        int xt4 = TornadoMath.min(b0 + rr0 + 32, batch - 1);
-        float xsc4 = scaleBatch.get(xt4);
-        xt4 = xt4 * dim;
-        int xt5 = TornadoMath.min(b0 + rr0 + 40, batch - 1);
-        float xsc5 = scaleBatch.get(xt5);
-        xt5 = xt5 * dim;
-        int xt6 = TornadoMath.min(b0 + rr0 + 48, batch - 1);
-        float xsc6 = scaleBatch.get(xt6);
-        xt6 = xt6 * dim;
-        int xt7 = TornadoMath.min(b0 + rr0 + 56, batch - 1);
-        float xsc7 = scaleBatch.get(xt7);
-        xt7 = xt7 * dim;
-        float rw;
-        rw = rmsWeights.get(0 + kk0);
-        px0 = rw * xsc0 * x.get(xt0 + 0 + kk0);
-        px1 = rw * xsc1 * x.get(xt1 + 0 + kk0);
-        px2 = rw * xsc2 * x.get(xt2 + 0 + kk0);
-        px3 = rw * xsc3 * x.get(xt3 + 0 + kk0);
-        px4 = rw * xsc4 * x.get(xt4 + 0 + kk0);
-        px5 = rw * xsc5 * x.get(xt5 + 0 + kk0);
-        px6 = rw * xsc6 * x.get(xt6 + 0 + kk0);
-        px7 = rw * xsc7 * x.get(xt7 + 0 + kk0);
-        pw0 = w1.get(TornadoMath.min(r0 + rr0 + 0, hiddenDim - 1) * dim + 0 + kk0).getFloat32();
-        pw1 = w1.get(TornadoMath.min(r0 + rr0 + 8, hiddenDim - 1) * dim + 0 + kk0).getFloat32();
-        pw2 = w1.get(TornadoMath.min(r0 + rr0 + 16, hiddenDim - 1) * dim + 0 + kk0).getFloat32();
-        pw3 = w1.get(TornadoMath.min(r0 + rr0 + 24, hiddenDim - 1) * dim + 0 + kk0).getFloat32();
-        pw4 =
-                w3.get(TornadoMath.min(r0 + rr0 + 32 - 32, hiddenDim - 1) * dim + 0 + kk0)
-                        .getFloat32();
-        pw5 =
-                w3.get(TornadoMath.min(r0 + rr0 + 40 - 32, hiddenDim - 1) * dim + 0 + kk0)
-                        .getFloat32();
-        pw6 =
-                w3.get(TornadoMath.min(r0 + rr0 + 48 - 32, hiddenDim - 1) * dim + 0 + kk0)
-                        .getFloat32();
-        pw7 =
-                w3.get(TornadoMath.min(r0 + rr0 + 56 - 32, hiddenDim - 1) * dim + 0 + kk0)
-                        .getFloat32();
-        xs[(rr0 + 0) * LDS + kk0] = px0;
-        xs[(rr0 + 8) * LDS + kk0] = px1;
-        xs[(rr0 + 16) * LDS + kk0] = px2;
-        xs[(rr0 + 24) * LDS + kk0] = px3;
-        xs[(rr0 + 32) * LDS + kk0] = px4;
-        xs[(rr0 + 40) * LDS + kk0] = px5;
-        xs[(rr0 + 48) * LDS + kk0] = px6;
-        xs[(rr0 + 56) * LDS + kk0] = px7;
-        ws[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-        ws[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-        ws[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-        ws[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-        ws[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-        ws[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-        ws[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-        ws[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+        float px0_0;
+        float px0_1;
+        float px0_2;
+        float px0_3;
+        float px1_0;
+        float px1_1;
+        float px1_2;
+        float px1_3;
+        float pw0_0;
+        float pw0_1;
+        float pw0_2;
+        float pw0_3;
+        float pw1_0;
+        float pw1_1;
+        float pw1_2;
+        float pw1_3;
+        float xsc0 = scaleBatch.get(TornadoMath.min(b0 + vr + 0, batch - 1));
+        float xsc1 = scaleBatch.get(TornadoMath.min(b0 + vr + 32, batch - 1));
+        Float4 rv0 = rmsWeights.getFloat4(0 + vc);
+        Float4 fx00 = x.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + 0 + vc);
+        px0_0 = rv0.getX() * xsc0 * fx00.getX();
+        px0_1 = rv0.getY() * xsc0 * fx00.getY();
+        px0_2 = rv0.getZ() * xsc0 * fx00.getZ();
+        px0_3 = rv0.getW() * xsc0 * fx00.getW();
+        Float4 fx01 = x.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + 0 + vc);
+        px1_0 = rv0.getX() * xsc1 * fx01.getX();
+        px1_1 = rv0.getY() * xsc1 * fx01.getY();
+        px1_2 = rv0.getZ() * xsc1 * fx01.getZ();
+        px1_3 = rv0.getW() * xsc1 * fx01.getW();
+        Half4 hw00 = w1.getHalf4((TornadoMath.min(r0 + vr + 0, hiddenDim - 1)) * dim + 0 + vc);
+        pw0_0 = hw00.getX().getFloat32();
+        pw0_1 = hw00.getY().getFloat32();
+        pw0_2 = hw00.getZ().getFloat32();
+        pw0_3 = hw00.getW().getFloat32();
+        Half4 hw01 =
+                w3.getHalf4((TornadoMath.min(r0 + vr + 32 - 32, hiddenDim - 1)) * dim + 0 + vc);
+        pw1_0 = hw01.getX().getFloat32();
+        pw1_1 = hw01.getY().getFloat32();
+        pw1_2 = hw01.getZ().getFloat32();
+        pw1_3 = hw01.getW().getFloat32();
+        xs[(vr + 0) * LDS + vc + 0] = px0_0;
+        xs[(vr + 0) * LDS + vc + 1] = px0_1;
+        xs[(vr + 0) * LDS + vc + 2] = px0_2;
+        xs[(vr + 0) * LDS + vc + 3] = px0_3;
+        xs[(vr + 32) * LDS + vc + 0] = px1_0;
+        xs[(vr + 32) * LDS + vc + 1] = px1_1;
+        xs[(vr + 32) * LDS + vc + 2] = px1_2;
+        xs[(vr + 32) * LDS + vc + 3] = px1_3;
+        ws[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+        ws[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+        ws[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+        ws[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+        ws[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+        ws[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+        ws[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+        ws[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
         context.localBarrier();
         for (int k0 = 0; k0 < dim; k0 += 64) {
-            rw = rmsWeights.get(k0 + 32 + kk0);
-            px0 = rw * xsc0 * x.get(xt0 + k0 + 32 + kk0);
-            px1 = rw * xsc1 * x.get(xt1 + k0 + 32 + kk0);
-            px2 = rw * xsc2 * x.get(xt2 + k0 + 32 + kk0);
-            px3 = rw * xsc3 * x.get(xt3 + k0 + 32 + kk0);
-            px4 = rw * xsc4 * x.get(xt4 + k0 + 32 + kk0);
-            px5 = rw * xsc5 * x.get(xt5 + k0 + 32 + kk0);
-            px6 = rw * xsc6 * x.get(xt6 + k0 + 32 + kk0);
-            px7 = rw * xsc7 * x.get(xt7 + k0 + 32 + kk0);
-            pw0 =
-                    w1.get(TornadoMath.min(r0 + rr0 + 0, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            pw1 =
-                    w1.get(TornadoMath.min(r0 + rr0 + 8, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            pw2 =
-                    w1.get(TornadoMath.min(r0 + rr0 + 16, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            pw3 =
-                    w1.get(TornadoMath.min(r0 + rr0 + 24, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            pw4 =
-                    w3.get(TornadoMath.min(r0 + rr0 + 32 - 32, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            pw5 =
-                    w3.get(TornadoMath.min(r0 + rr0 + 40 - 32, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            pw6 =
-                    w3.get(TornadoMath.min(r0 + rr0 + 48 - 32, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
-            pw7 =
-                    w3.get(TornadoMath.min(r0 + rr0 + 56 - 32, hiddenDim - 1) * dim + k0 + 32 + kk0)
-                            .getFloat32();
+            Float4 rvk032 = rmsWeights.getFloat4(k0 + 32 + vc);
+            Float4 fxk0320 =
+                    x.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + k0 + 32 + vc);
+            px0_0 = rvk032.getX() * xsc0 * fxk0320.getX();
+            px0_1 = rvk032.getY() * xsc0 * fxk0320.getY();
+            px0_2 = rvk032.getZ() * xsc0 * fxk0320.getZ();
+            px0_3 = rvk032.getW() * xsc0 * fxk0320.getW();
+            Float4 fxk0321 =
+                    x.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + k0 + 32 + vc);
+            px1_0 = rvk032.getX() * xsc1 * fxk0321.getX();
+            px1_1 = rvk032.getY() * xsc1 * fxk0321.getY();
+            px1_2 = rvk032.getZ() * xsc1 * fxk0321.getZ();
+            px1_3 = rvk032.getW() * xsc1 * fxk0321.getW();
+            Half4 hwk0320 =
+                    w1.getHalf4((TornadoMath.min(r0 + vr + 0, hiddenDim - 1)) * dim + k0 + 32 + vc);
+            pw0_0 = hwk0320.getX().getFloat32();
+            pw0_1 = hwk0320.getY().getFloat32();
+            pw0_2 = hwk0320.getZ().getFloat32();
+            pw0_3 = hwk0320.getW().getFloat32();
+            Half4 hwk0321 =
+                    w3.getHalf4(
+                            (TornadoMath.min(r0 + vr + 32 - 32, hiddenDim - 1)) * dim
+                                    + k0
+                                    + 32
+                                    + vc);
+            pw1_0 = hwk0321.getX().getFloat32();
+            pw1_1 = hwk0321.getY().getFloat32();
+            pw1_2 = hwk0321.getZ().getFloat32();
+            pw1_3 = hwk0321.getW().getFloat32();
             for (int kk = 0; kk < 32; kk += 8) {
                 Matrix8x8Float x0 = context.simdgroupMatrixLoad(xs, (sgRow + 0) * LDS + kk, LDS);
                 Matrix8x8Float x1 = context.simdgroupMatrixLoad(xs, (sgRow + 8) * LDS + kk, LDS);
@@ -1040,73 +1037,54 @@ public final class TransformerBatchPrefillSimdgroupKernels {
                 u20 = context.simdgroupMatrixMultiplyAccumulate(x2, uw0, u20);
                 u30 = context.simdgroupMatrixMultiplyAccumulate(x3, uw0, u30);
             }
-            xs1[(rr0 + 0) * LDS + kk0] = px0;
-            xs1[(rr0 + 8) * LDS + kk0] = px1;
-            xs1[(rr0 + 16) * LDS + kk0] = px2;
-            xs1[(rr0 + 24) * LDS + kk0] = px3;
-            xs1[(rr0 + 32) * LDS + kk0] = px4;
-            xs1[(rr0 + 40) * LDS + kk0] = px5;
-            xs1[(rr0 + 48) * LDS + kk0] = px6;
-            xs1[(rr0 + 56) * LDS + kk0] = px7;
-            ws1[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-            ws1[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-            ws1[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-            ws1[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-            ws1[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-            ws1[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-            ws1[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-            ws1[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+            xs1[(vr + 0) * LDS + vc + 0] = px0_0;
+            xs1[(vr + 0) * LDS + vc + 1] = px0_1;
+            xs1[(vr + 0) * LDS + vc + 2] = px0_2;
+            xs1[(vr + 0) * LDS + vc + 3] = px0_3;
+            xs1[(vr + 32) * LDS + vc + 0] = px1_0;
+            xs1[(vr + 32) * LDS + vc + 1] = px1_1;
+            xs1[(vr + 32) * LDS + vc + 2] = px1_2;
+            xs1[(vr + 32) * LDS + vc + 3] = px1_3;
+            ws1[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+            ws1[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+            ws1[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+            ws1[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+            ws1[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+            ws1[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+            ws1[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+            ws1[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
             context.localBarrier();
             if (k0 + 64 < dim) {
-                rw = rmsWeights.get(k0 + 64 + kk0);
-                px0 = rw * xsc0 * x.get(xt0 + k0 + 64 + kk0);
-                px1 = rw * xsc1 * x.get(xt1 + k0 + 64 + kk0);
-                px2 = rw * xsc2 * x.get(xt2 + k0 + 64 + kk0);
-                px3 = rw * xsc3 * x.get(xt3 + k0 + 64 + kk0);
-                px4 = rw * xsc4 * x.get(xt4 + k0 + 64 + kk0);
-                px5 = rw * xsc5 * x.get(xt5 + k0 + 64 + kk0);
-                px6 = rw * xsc6 * x.get(xt6 + k0 + 64 + kk0);
-                px7 = rw * xsc7 * x.get(xt7 + k0 + 64 + kk0);
-                pw0 =
-                        w1.get(TornadoMath.min(r0 + rr0 + 0, hiddenDim - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                pw1 =
-                        w1.get(TornadoMath.min(r0 + rr0 + 8, hiddenDim - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                pw2 =
-                        w1.get(TornadoMath.min(r0 + rr0 + 16, hiddenDim - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                pw3 =
-                        w1.get(TornadoMath.min(r0 + rr0 + 24, hiddenDim - 1) * dim + k0 + 64 + kk0)
-                                .getFloat32();
-                pw4 =
-                        w3.get(
-                                        TornadoMath.min(r0 + rr0 + 32 - 32, hiddenDim - 1) * dim
-                                                + k0
-                                                + 64
-                                                + kk0)
-                                .getFloat32();
-                pw5 =
-                        w3.get(
-                                        TornadoMath.min(r0 + rr0 + 40 - 32, hiddenDim - 1) * dim
-                                                + k0
-                                                + 64
-                                                + kk0)
-                                .getFloat32();
-                pw6 =
-                        w3.get(
-                                        TornadoMath.min(r0 + rr0 + 48 - 32, hiddenDim - 1) * dim
-                                                + k0
-                                                + 64
-                                                + kk0)
-                                .getFloat32();
-                pw7 =
-                        w3.get(
-                                        TornadoMath.min(r0 + rr0 + 56 - 32, hiddenDim - 1) * dim
-                                                + k0
-                                                + 64
-                                                + kk0)
-                                .getFloat32();
+                Float4 rvk064 = rmsWeights.getFloat4(k0 + 64 + vc);
+                Float4 fxk0640 =
+                        x.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + k0 + 64 + vc);
+                px0_0 = rvk064.getX() * xsc0 * fxk0640.getX();
+                px0_1 = rvk064.getY() * xsc0 * fxk0640.getY();
+                px0_2 = rvk064.getZ() * xsc0 * fxk0640.getZ();
+                px0_3 = rvk064.getW() * xsc0 * fxk0640.getW();
+                Float4 fxk0641 =
+                        x.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + k0 + 64 + vc);
+                px1_0 = rvk064.getX() * xsc1 * fxk0641.getX();
+                px1_1 = rvk064.getY() * xsc1 * fxk0641.getY();
+                px1_2 = rvk064.getZ() * xsc1 * fxk0641.getZ();
+                px1_3 = rvk064.getW() * xsc1 * fxk0641.getW();
+                Half4 hwk0640 =
+                        w1.getHalf4(
+                                (TornadoMath.min(r0 + vr + 0, hiddenDim - 1)) * dim + k0 + 64 + vc);
+                pw0_0 = hwk0640.getX().getFloat32();
+                pw0_1 = hwk0640.getY().getFloat32();
+                pw0_2 = hwk0640.getZ().getFloat32();
+                pw0_3 = hwk0640.getW().getFloat32();
+                Half4 hwk0641 =
+                        w3.getHalf4(
+                                (TornadoMath.min(r0 + vr + 32 - 32, hiddenDim - 1)) * dim
+                                        + k0
+                                        + 64
+                                        + vc);
+                pw1_0 = hwk0641.getX().getFloat32();
+                pw1_1 = hwk0641.getY().getFloat32();
+                pw1_2 = hwk0641.getZ().getFloat32();
+                pw1_3 = hwk0641.getW().getFloat32();
             }
             for (int kk = 0; kk < 32; kk += 8) {
                 Matrix8x8Float x0 = context.simdgroupMatrixLoad(xs1, (sgRow + 0) * LDS + kk, LDS);
@@ -1128,22 +1106,22 @@ public final class TransformerBatchPrefillSimdgroupKernels {
                 u30 = context.simdgroupMatrixMultiplyAccumulate(x3, uw0, u30);
             }
             if (k0 + 64 < dim) {
-                xs[(rr0 + 0) * LDS + kk0] = px0;
-                xs[(rr0 + 8) * LDS + kk0] = px1;
-                xs[(rr0 + 16) * LDS + kk0] = px2;
-                xs[(rr0 + 24) * LDS + kk0] = px3;
-                xs[(rr0 + 32) * LDS + kk0] = px4;
-                xs[(rr0 + 40) * LDS + kk0] = px5;
-                xs[(rr0 + 48) * LDS + kk0] = px6;
-                xs[(rr0 + 56) * LDS + kk0] = px7;
-                ws[(rr0 + 0) * LDS + kk0] = new HalfFloat(pw0);
-                ws[(rr0 + 8) * LDS + kk0] = new HalfFloat(pw1);
-                ws[(rr0 + 16) * LDS + kk0] = new HalfFloat(pw2);
-                ws[(rr0 + 24) * LDS + kk0] = new HalfFloat(pw3);
-                ws[(rr0 + 32) * LDS + kk0] = new HalfFloat(pw4);
-                ws[(rr0 + 40) * LDS + kk0] = new HalfFloat(pw5);
-                ws[(rr0 + 48) * LDS + kk0] = new HalfFloat(pw6);
-                ws[(rr0 + 56) * LDS + kk0] = new HalfFloat(pw7);
+                xs[(vr + 0) * LDS + vc + 0] = px0_0;
+                xs[(vr + 0) * LDS + vc + 1] = px0_1;
+                xs[(vr + 0) * LDS + vc + 2] = px0_2;
+                xs[(vr + 0) * LDS + vc + 3] = px0_3;
+                xs[(vr + 32) * LDS + vc + 0] = px1_0;
+                xs[(vr + 32) * LDS + vc + 1] = px1_1;
+                xs[(vr + 32) * LDS + vc + 2] = px1_2;
+                xs[(vr + 32) * LDS + vc + 3] = px1_3;
+                ws[(vr + 0) * LDS + vc + 0] = new HalfFloat(pw0_0);
+                ws[(vr + 0) * LDS + vc + 1] = new HalfFloat(pw0_1);
+                ws[(vr + 0) * LDS + vc + 2] = new HalfFloat(pw0_2);
+                ws[(vr + 0) * LDS + vc + 3] = new HalfFloat(pw0_3);
+                ws[(vr + 32) * LDS + vc + 0] = new HalfFloat(pw1_0);
+                ws[(vr + 32) * LDS + vc + 1] = new HalfFloat(pw1_1);
+                ws[(vr + 32) * LDS + vc + 2] = new HalfFloat(pw1_2);
+                ws[(vr + 32) * LDS + vc + 3] = new HalfFloat(pw1_3);
             }
             context.localBarrier();
         }
@@ -1195,6 +1173,8 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         int lane = tid & 31;
         int kk0 = tid & 31;
         int rr0 = tid >> 5;
+        int vr = tid >> 3;
+        int vc = (tid & 7) << 2;
         int sgRow = (sg >> 2) << 5;
         int sgCol = (sg & 3) * 16;
         int rowTiles = ((qDim + 2 * kvDim) + 63) >> 6;
@@ -1213,14 +1193,14 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         Matrix8x8Float c31 = context.simdgroupMatrixZero();
         int wrow = tid / 4;
         int wk0 = (tid % 4) * 8;
-        float px0;
-        float px1;
-        float px2;
-        float px3;
-        float px4;
-        float px5;
-        float px6;
-        float px7;
+        float px0_0;
+        float px0_1;
+        float px0_2;
+        float px0_3;
+        float px1_0;
+        float px1_1;
+        float px1_2;
+        float px1_3;
         float pw0;
         float pw1;
         float pw2;
@@ -1231,14 +1211,16 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         float pw7;
         float psc;
         int qb;
-        px0 = x.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * dim + 0 + kk0);
-        px1 = x.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * dim + 0 + kk0);
-        px2 = x.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * dim + 0 + kk0);
-        px3 = x.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * dim + 0 + kk0);
-        px4 = x.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * dim + 0 + kk0);
-        px5 = x.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * dim + 0 + kk0);
-        px6 = x.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * dim + 0 + kk0);
-        px7 = x.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * dim + 0 + kk0);
+        Float4 fx00 = x.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + 0 + vc);
+        px0_0 = fx00.getX();
+        px0_1 = fx00.getY();
+        px0_2 = fx00.getZ();
+        px0_3 = fx00.getW();
+        Float4 fx01 = x.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + 0 + vc);
+        px1_0 = fx01.getX();
+        px1_1 = fx01.getY();
+        px1_2 = fx01.getZ();
+        px1_3 = fx01.getW();
         if (which == 0) {
             qb = ((local0 + wrow) * (dim >> 5) + ((0) >> 5)) * 34;
             psc = wq.getHalfFloat(qb).getFloat32();
@@ -1274,14 +1256,14 @@ public final class TransformerBatchPrefillSimdgroupKernels {
             pw7 = (float) wv.get(qb + 2 + wk0 + 7);
         }
         for (int k0 = 0; k0 < dim; k0 += 32) {
-            xs[(rr0 + 0) * LDS + kk0] = px0;
-            xs[(rr0 + 8) * LDS + kk0] = px1;
-            xs[(rr0 + 16) * LDS + kk0] = px2;
-            xs[(rr0 + 24) * LDS + kk0] = px3;
-            xs[(rr0 + 32) * LDS + kk0] = px4;
-            xs[(rr0 + 40) * LDS + kk0] = px5;
-            xs[(rr0 + 48) * LDS + kk0] = px6;
-            xs[(rr0 + 56) * LDS + kk0] = px7;
+            xs[(vr + 0) * LDS + vc + 0] = px0_0;
+            xs[(vr + 0) * LDS + vc + 1] = px0_1;
+            xs[(vr + 0) * LDS + vc + 2] = px0_2;
+            xs[(vr + 0) * LDS + vc + 3] = px0_3;
+            xs[(vr + 32) * LDS + vc + 0] = px1_0;
+            xs[(vr + 32) * LDS + vc + 1] = px1_1;
+            xs[(vr + 32) * LDS + vc + 2] = px1_2;
+            xs[(vr + 32) * LDS + vc + 3] = px1_3;
             ws[wrow * LDS + wk0 + 0] = pw0 * psc;
             ws[wrow * LDS + wk0 + 1] = pw1 * psc;
             ws[wrow * LDS + wk0 + 2] = pw2 * psc;
@@ -1292,14 +1274,18 @@ public final class TransformerBatchPrefillSimdgroupKernels {
             ws[wrow * LDS + wk0 + 7] = pw7 * psc;
             context.localBarrier();
             if (k0 + 32 < dim) {
-                px0 = x.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * dim + k0 + 32 + kk0);
-                px1 = x.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * dim + k0 + 32 + kk0);
-                px2 = x.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * dim + k0 + 32 + kk0);
-                px3 = x.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * dim + k0 + 32 + kk0);
-                px4 = x.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * dim + k0 + 32 + kk0);
-                px5 = x.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * dim + k0 + 32 + kk0);
-                px6 = x.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * dim + k0 + 32 + kk0);
-                px7 = x.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * dim + k0 + 32 + kk0);
+                Float4 fxk0320 =
+                        x.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + k0 + 32 + vc);
+                px0_0 = fxk0320.getX();
+                px0_1 = fxk0320.getY();
+                px0_2 = fxk0320.getZ();
+                px0_3 = fxk0320.getW();
+                Float4 fxk0321 =
+                        x.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + k0 + 32 + vc);
+                px1_0 = fxk0321.getX();
+                px1_1 = fxk0321.getY();
+                px1_2 = fxk0321.getZ();
+                px1_3 = fxk0321.getW();
                 if (which == 0) {
                     qb = ((local0 + wrow) * (dim >> 5) + ((k0 + 32) >> 5)) * 34;
                     psc = wq.getHalfFloat(qb).getFloat32();
@@ -1578,6 +1564,8 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         int lane = tid & 31;
         int kk0 = tid & 31;
         int rr0 = tid >> 5;
+        int vr = tid >> 3;
+        int vc = (tid & 7) << 2;
         int sgRow = (sg >> 2) << 5;
         int sgCol = (sg & 3) * 16;
         int rowTiles = (d + 63) >> 6;
@@ -1621,14 +1609,14 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         }
         int wrow = tid / 4;
         int wk0 = (tid % 4) * 8;
-        float px0;
-        float px1;
-        float px2;
-        float px3;
-        float px4;
-        float px5;
-        float px6;
-        float px7;
+        float px0_0;
+        float px0_1;
+        float px0_2;
+        float px0_3;
+        float px1_0;
+        float px1_1;
+        float px1_2;
+        float px1_3;
         float pw0;
         float pw1;
         float pw2;
@@ -1639,14 +1627,16 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         float pw7;
         float psc;
         int qb;
-        px0 = inputBatch.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * n + 0 + kk0);
-        px1 = inputBatch.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * n + 0 + kk0);
-        px2 = inputBatch.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * n + 0 + kk0);
-        px3 = inputBatch.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * n + 0 + kk0);
-        px4 = inputBatch.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * n + 0 + kk0);
-        px5 = inputBatch.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * n + 0 + kk0);
-        px6 = inputBatch.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * n + 0 + kk0);
-        px7 = inputBatch.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * n + 0 + kk0);
+        Float4 fx00 = inputBatch.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * n + 0 + vc);
+        px0_0 = fx00.getX();
+        px0_1 = fx00.getY();
+        px0_2 = fx00.getZ();
+        px0_3 = fx00.getW();
+        Float4 fx01 = inputBatch.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * n + 0 + vc);
+        px1_0 = fx01.getX();
+        px1_1 = fx01.getY();
+        px1_2 = fx01.getZ();
+        px1_3 = fx01.getW();
         qb = ((TornadoMath.min(r0 + wrow, d - 1)) * (n >> 5) + ((0) >> 5)) * 34;
         psc = w.getHalfFloat(qb).getFloat32();
         pw0 = (float) w.get(qb + 2 + wk0 + 0);
@@ -1658,14 +1648,14 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         pw6 = (float) w.get(qb + 2 + wk0 + 6);
         pw7 = (float) w.get(qb + 2 + wk0 + 7);
         for (int k0 = 0; k0 < n; k0 += 32) {
-            xs[(rr0 + 0) * LDS + kk0] = px0;
-            xs[(rr0 + 8) * LDS + kk0] = px1;
-            xs[(rr0 + 16) * LDS + kk0] = px2;
-            xs[(rr0 + 24) * LDS + kk0] = px3;
-            xs[(rr0 + 32) * LDS + kk0] = px4;
-            xs[(rr0 + 40) * LDS + kk0] = px5;
-            xs[(rr0 + 48) * LDS + kk0] = px6;
-            xs[(rr0 + 56) * LDS + kk0] = px7;
+            xs[(vr + 0) * LDS + vc + 0] = px0_0;
+            xs[(vr + 0) * LDS + vc + 1] = px0_1;
+            xs[(vr + 0) * LDS + vc + 2] = px0_2;
+            xs[(vr + 0) * LDS + vc + 3] = px0_3;
+            xs[(vr + 32) * LDS + vc + 0] = px1_0;
+            xs[(vr + 32) * LDS + vc + 1] = px1_1;
+            xs[(vr + 32) * LDS + vc + 2] = px1_2;
+            xs[(vr + 32) * LDS + vc + 3] = px1_3;
             ws[wrow * LDS + wk0 + 0] = pw0 * psc;
             ws[wrow * LDS + wk0 + 1] = pw1 * psc;
             ws[wrow * LDS + wk0 + 2] = pw2 * psc;
@@ -1676,14 +1666,20 @@ public final class TransformerBatchPrefillSimdgroupKernels {
             ws[wrow * LDS + wk0 + 7] = pw7 * psc;
             context.localBarrier();
             if (k0 + 32 < n) {
-                px0 = inputBatch.get(TornadoMath.min(b0 + rr0 + 0, batch - 1) * n + k0 + 32 + kk0);
-                px1 = inputBatch.get(TornadoMath.min(b0 + rr0 + 8, batch - 1) * n + k0 + 32 + kk0);
-                px2 = inputBatch.get(TornadoMath.min(b0 + rr0 + 16, batch - 1) * n + k0 + 32 + kk0);
-                px3 = inputBatch.get(TornadoMath.min(b0 + rr0 + 24, batch - 1) * n + k0 + 32 + kk0);
-                px4 = inputBatch.get(TornadoMath.min(b0 + rr0 + 32, batch - 1) * n + k0 + 32 + kk0);
-                px5 = inputBatch.get(TornadoMath.min(b0 + rr0 + 40, batch - 1) * n + k0 + 32 + kk0);
-                px6 = inputBatch.get(TornadoMath.min(b0 + rr0 + 48, batch - 1) * n + k0 + 32 + kk0);
-                px7 = inputBatch.get(TornadoMath.min(b0 + rr0 + 56, batch - 1) * n + k0 + 32 + kk0);
+                Float4 fxk0320 =
+                        inputBatch.getFloat4(
+                                TornadoMath.min(b0 + vr + 0, batch - 1) * n + k0 + 32 + vc);
+                px0_0 = fxk0320.getX();
+                px0_1 = fxk0320.getY();
+                px0_2 = fxk0320.getZ();
+                px0_3 = fxk0320.getW();
+                Float4 fxk0321 =
+                        inputBatch.getFloat4(
+                                TornadoMath.min(b0 + vr + 32, batch - 1) * n + k0 + 32 + vc);
+                px1_0 = fxk0321.getX();
+                px1_1 = fxk0321.getY();
+                px1_2 = fxk0321.getZ();
+                px1_3 = fxk0321.getW();
                 qb = ((TornadoMath.min(r0 + wrow, d - 1)) * (n >> 5) + ((k0 + 32) >> 5)) * 34;
                 psc = w.getHalfFloat(qb).getFloat32();
                 pw0 = (float) w.get(qb + 2 + wk0 + 0);
@@ -1842,6 +1838,8 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         int lane = tid & 31;
         int kk0 = tid & 31;
         int rr0 = tid >> 5;
+        int vr = tid >> 3;
+        int vc = (tid & 7) << 2;
         int sgRow = (sg >> 2) << 5;
         int sgCol = (sg & 3) * 8;
         int rowTiles = (hiddenDim + 31) >> 5;
@@ -1858,14 +1856,14 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         Matrix8x8Float u30 = context.simdgroupMatrixZero();
         int wrow = tid / 4;
         int wk0 = (tid % 4) * 8;
-        float px0;
-        float px1;
-        float px2;
-        float px3;
-        float px4;
-        float px5;
-        float px6;
-        float px7;
+        float px0_0;
+        float px0_1;
+        float px0_2;
+        float px0_3;
+        float px1_0;
+        float px1_1;
+        float px1_2;
+        float px1_3;
         float pw0;
         float pw1;
         float pw2;
@@ -1876,40 +1874,19 @@ public final class TransformerBatchPrefillSimdgroupKernels {
         float pw7;
         float psc;
         int qb;
-        int xt0 = TornadoMath.min(b0 + rr0 + 0, batch - 1);
-        float xsc0 = scaleBatch.get(xt0);
-        xt0 = xt0 * dim;
-        int xt1 = TornadoMath.min(b0 + rr0 + 8, batch - 1);
-        float xsc1 = scaleBatch.get(xt1);
-        xt1 = xt1 * dim;
-        int xt2 = TornadoMath.min(b0 + rr0 + 16, batch - 1);
-        float xsc2 = scaleBatch.get(xt2);
-        xt2 = xt2 * dim;
-        int xt3 = TornadoMath.min(b0 + rr0 + 24, batch - 1);
-        float xsc3 = scaleBatch.get(xt3);
-        xt3 = xt3 * dim;
-        int xt4 = TornadoMath.min(b0 + rr0 + 32, batch - 1);
-        float xsc4 = scaleBatch.get(xt4);
-        xt4 = xt4 * dim;
-        int xt5 = TornadoMath.min(b0 + rr0 + 40, batch - 1);
-        float xsc5 = scaleBatch.get(xt5);
-        xt5 = xt5 * dim;
-        int xt6 = TornadoMath.min(b0 + rr0 + 48, batch - 1);
-        float xsc6 = scaleBatch.get(xt6);
-        xt6 = xt6 * dim;
-        int xt7 = TornadoMath.min(b0 + rr0 + 56, batch - 1);
-        float xsc7 = scaleBatch.get(xt7);
-        xt7 = xt7 * dim;
-        float rw;
-        rw = rmsWeights.get(0 + kk0);
-        px0 = rw * xsc0 * x.get(xt0 + 0 + kk0);
-        px1 = rw * xsc1 * x.get(xt1 + 0 + kk0);
-        px2 = rw * xsc2 * x.get(xt2 + 0 + kk0);
-        px3 = rw * xsc3 * x.get(xt3 + 0 + kk0);
-        px4 = rw * xsc4 * x.get(xt4 + 0 + kk0);
-        px5 = rw * xsc5 * x.get(xt5 + 0 + kk0);
-        px6 = rw * xsc6 * x.get(xt6 + 0 + kk0);
-        px7 = rw * xsc7 * x.get(xt7 + 0 + kk0);
+        float xsc0 = scaleBatch.get(TornadoMath.min(b0 + vr + 0, batch - 1));
+        float xsc1 = scaleBatch.get(TornadoMath.min(b0 + vr + 32, batch - 1));
+        Float4 rv0 = rmsWeights.getFloat4(0 + vc);
+        Float4 fx00 = x.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + 0 + vc);
+        px0_0 = rv0.getX() * xsc0 * fx00.getX();
+        px0_1 = rv0.getY() * xsc0 * fx00.getY();
+        px0_2 = rv0.getZ() * xsc0 * fx00.getZ();
+        px0_3 = rv0.getW() * xsc0 * fx00.getW();
+        Float4 fx01 = x.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + 0 + vc);
+        px1_0 = rv0.getX() * xsc1 * fx01.getX();
+        px1_1 = rv0.getY() * xsc1 * fx01.getY();
+        px1_2 = rv0.getZ() * xsc1 * fx01.getZ();
+        px1_3 = rv0.getW() * xsc1 * fx01.getW();
         if (wrow < 32) {
             qb = ((TornadoMath.min(r0 + wrow, hiddenDim - 1)) * (dim >> 5) + ((0) >> 5)) * 34;
             psc = w1.getHalfFloat(qb).getFloat32();
@@ -1934,14 +1911,14 @@ public final class TransformerBatchPrefillSimdgroupKernels {
             pw7 = (float) w3.get(qb + 2 + wk0 + 7);
         }
         for (int k0 = 0; k0 < dim; k0 += 32) {
-            xs[(rr0 + 0) * LDS + kk0] = px0;
-            xs[(rr0 + 8) * LDS + kk0] = px1;
-            xs[(rr0 + 16) * LDS + kk0] = px2;
-            xs[(rr0 + 24) * LDS + kk0] = px3;
-            xs[(rr0 + 32) * LDS + kk0] = px4;
-            xs[(rr0 + 40) * LDS + kk0] = px5;
-            xs[(rr0 + 48) * LDS + kk0] = px6;
-            xs[(rr0 + 56) * LDS + kk0] = px7;
+            xs[(vr + 0) * LDS + vc + 0] = px0_0;
+            xs[(vr + 0) * LDS + vc + 1] = px0_1;
+            xs[(vr + 0) * LDS + vc + 2] = px0_2;
+            xs[(vr + 0) * LDS + vc + 3] = px0_3;
+            xs[(vr + 32) * LDS + vc + 0] = px1_0;
+            xs[(vr + 32) * LDS + vc + 1] = px1_1;
+            xs[(vr + 32) * LDS + vc + 2] = px1_2;
+            xs[(vr + 32) * LDS + vc + 3] = px1_3;
             ws[wrow * LDS + wk0 + 0] = pw0 * psc;
             ws[wrow * LDS + wk0 + 1] = pw1 * psc;
             ws[wrow * LDS + wk0 + 2] = pw2 * psc;
@@ -1952,15 +1929,19 @@ public final class TransformerBatchPrefillSimdgroupKernels {
             ws[wrow * LDS + wk0 + 7] = pw7 * psc;
             context.localBarrier();
             if (k0 + 32 < dim) {
-                rw = rmsWeights.get(k0 + 32 + kk0);
-                px0 = rw * xsc0 * x.get(xt0 + k0 + 32 + kk0);
-                px1 = rw * xsc1 * x.get(xt1 + k0 + 32 + kk0);
-                px2 = rw * xsc2 * x.get(xt2 + k0 + 32 + kk0);
-                px3 = rw * xsc3 * x.get(xt3 + k0 + 32 + kk0);
-                px4 = rw * xsc4 * x.get(xt4 + k0 + 32 + kk0);
-                px5 = rw * xsc5 * x.get(xt5 + k0 + 32 + kk0);
-                px6 = rw * xsc6 * x.get(xt6 + k0 + 32 + kk0);
-                px7 = rw * xsc7 * x.get(xt7 + k0 + 32 + kk0);
+                Float4 rvk032 = rmsWeights.getFloat4(k0 + 32 + vc);
+                Float4 fxk0320 =
+                        x.getFloat4(TornadoMath.min(b0 + vr + 0, batch - 1) * dim + k0 + 32 + vc);
+                px0_0 = rvk032.getX() * xsc0 * fxk0320.getX();
+                px0_1 = rvk032.getY() * xsc0 * fxk0320.getY();
+                px0_2 = rvk032.getZ() * xsc0 * fxk0320.getZ();
+                px0_3 = rvk032.getW() * xsc0 * fxk0320.getW();
+                Float4 fxk0321 =
+                        x.getFloat4(TornadoMath.min(b0 + vr + 32, batch - 1) * dim + k0 + 32 + vc);
+                px1_0 = rvk032.getX() * xsc1 * fxk0321.getX();
+                px1_1 = rvk032.getY() * xsc1 * fxk0321.getY();
+                px1_2 = rvk032.getZ() * xsc1 * fxk0321.getZ();
+                px1_3 = rvk032.getW() * xsc1 * fxk0321.getW();
                 if (wrow < 32) {
                     qb =
                             ((TornadoMath.min(r0 + wrow, hiddenDim - 1)) * (dim >> 5)
