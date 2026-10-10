@@ -62,4 +62,25 @@ public final class BatchPrefillGemmPolicy {
     public static boolean simdgroupAttention() {
         return tiled() && !"false".equals(System.getProperty("jitllm.metal.simdgroupAttention"));
     }
+
+    /**
+     * Whether {@link #simdgroupAttention()} holds and a SIMD-group kernel exists for this head
+     * width.
+     */
+    public static boolean simdgroupAttention(int headSize) {
+        return simdgroupAttention() && (headSize == 64 || headSize == 96 || headSize == 128);
+    }
+
+    /**
+     * Whether the SIMD-group projections can run a model of these sizes: their double-buffered
+     * k-loop needs every contraction length, and their row tiles every projection height, to be a
+     * multiple of 64.
+     */
+    public static boolean simdgroup(int dim, int qDim, int kvDim, int hiddenDim) {
+        return simdgroup()
+                && dim % 64 == 0
+                && qDim % 64 == 0
+                && kvDim % 64 == 0
+                && hiddenDim % 64 == 0;
+    }
 }

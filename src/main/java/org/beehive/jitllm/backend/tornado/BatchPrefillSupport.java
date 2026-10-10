@@ -103,6 +103,12 @@ public final class BatchPrefillSupport {
                         + " or leave prefill batching off in the execution policy");
     }
 
+    /**
+     * The families whose batched prefill runs the Metal SIMD-group kernels; see {@link
+     * #defaultFor}.
+     */
+    static final java.util.Set<String> METAL_BATCHED_FAMILIES = java.util.Set.of("qwen3", "llama");
+
     /** The batched-prefill chunk Metal runs by default; see {@link #defaultFor}. */
     public static final int METAL_DEFAULT_PREFILL_BATCH = 256;
 
@@ -111,12 +117,12 @@ public final class BatchPrefillSupport {
      * The policy a model runs when its caller did not choose one: batched prefill on Metal for the
      * families whose batched kernels are tuned there, the given policy otherwise.
      *
-     * <p>Qwen3 in F16 and Q8_0 prefills an order of magnitude faster in batches of {@value
-     * #METAL_DEFAULT_PREFILL_BATCH} than one token at a time on an Apple GPU (Qwen3-0.6B on an M4
-     * Pro, pp512: F16 151 to 1949 tok/s, Q8_0 194 to 1928), at a cost of 2-4% in decode (137 to 132
-     * tok/s after a 943-token prompt); greedy text is identical. Other families keep single-token
-     * prefill on Metal: their batched kernels have not been tuned there and run slower than it.
-     * Only a single-token policy is changed, so an explicit choice is never overridden.
+     * <p>The families in {@link #METAL_BATCHED_FAMILIES}, in F16 and Q8_0, prefill an order of
+     * magnitude faster in batches of {@value #METAL_DEFAULT_PREFILL_BATCH} than one token at a time
+     * on an Apple GPU (M4 Pro, pp512: Qwen3-0.6B F16 151 to 4171 tok/s; Llama-3.2-1B F16 40 to
+     * 2372, Q8_0 45 to 2075); greedy text is identical. Other families keep single-token prefill on
+     * Metal until their batched kernels are tuned there. Only a single-token policy is changed, so
+     * an explicit choice is never overridden.
      */
     // @formatter:on
     public static ExecutionPolicy defaultFor(Model model, ExecutionPolicy policy) {
@@ -124,7 +130,7 @@ public final class BatchPrefillSupport {
                 || !org.beehive.jitllm.backend.tornado.device.TornadoDevices.current()
                         .backend()
                         .equals(BackendId.METAL)
-                || !"qwen3".equals(model.architectureId().toString())) {
+                || !METAL_BATCHED_FAMILIES.contains(model.architectureId().toString())) {
             return policy;
         }
         var type = model.weights().dataType();
