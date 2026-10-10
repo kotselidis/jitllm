@@ -4,6 +4,7 @@ import org.beehive.jitllm.backend.tornado.kernels.GraniteKernels;
 import org.beehive.jitllm.backend.tornado.kernels.GranitePagedKvKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerComputeKernelsLayered;
 import org.beehive.jitllm.backend.tornado.layers.AbstractTransformerLayerTaskGraphs;
+import org.beehive.jitllm.backend.tornado.scheduling.SchedulerDetectionService;
 import org.beehive.jitllm.backend.tornado.scheduling.SchedulerType;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.inference.state.GraniteState;
@@ -316,7 +317,10 @@ public class GraniteQ8_0FFNLayers
     // @formatter:off
     private TaskGraph configureAttention(
             TaskGraph unifiedLayer, int layerIndex, GraniteConfiguration config) {
-        if (schedulerType == SchedulerType.NVIDIA) {
+        // Metal runs the flash kernel too: processHeadsParallelGranitePaged produces wrong output
+        // there (Granite 3.2 2B and 4.0 1B answered with punctuation in both representations).
+        if (schedulerType == SchedulerType.NVIDIA
+                || SchedulerDetectionService.isSubgroupShuffle32Supported()) {
             // Flash Attention (optimized for NVIDIA GPUs)
             if (useFp16KVCache()) {
                 return unifiedLayer.task(

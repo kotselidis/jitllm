@@ -381,7 +381,10 @@ public class GraniteFP16FFNLayers
 
     private TaskGraph configureAttention(
             TaskGraph unifiedLayer, int layerIndex, GraniteConfiguration config) {
-        if (schedulerType == SchedulerType.NVIDIA) {
+        // Metal runs the flash kernel too: processHeadsParallelGranitePaged produces wrong output
+        // there (Granite 3.2 2B and 4.0 1B answered with punctuation in both representations).
+        if (schedulerType == SchedulerType.NVIDIA
+                || SchedulerDetectionService.isSubgroupShuffle32Supported()) {
             // Flash Attention (optimized for NVIDIA GPUs)
             if (useFp16KVCache()) {
                 return unifiedLayer.task(
