@@ -134,7 +134,8 @@ public final class BatchPrefillSupport {
                     "deepseek-r1-distill-qwen",
                     "mistral",
                     "phi3",
-                    "granite");
+                    "granite",
+                    "qwen35");
 
     /** The batched-prefill chunk Metal runs by default; see {@link #defaultFor}. */
     public static final int METAL_DEFAULT_PREFILL_BATCH = 256;
@@ -147,7 +148,8 @@ public final class BatchPrefillSupport {
      * <p>The families in {@link #METAL_BATCHED_FAMILIES}, in F16 and Q8_0, prefill an order of
      * magnitude faster in batches of {@value #METAL_DEFAULT_PREFILL_BATCH} than one token at a time
      * on an Apple GPU (M4 Pro, pp512: Qwen3-0.6B F16 151 to 4171 tok/s; Llama-3.2-1B F16 40 to
-     * 2372, Q8_0 45 to 2075); greedy text is identical. Other families keep single-token prefill on
+     * 2372, Q8_0 45 to 2075; Qwen3.5-0.8B Q4_0 60 to 2057); greedy text is identical. Q4_0 is
+     * batched by default for llama and qwen35 only. Other families keep single-token prefill on
      * Metal until their batched kernels are tuned there. Only a single-token policy is changed, so
      * an explicit choice is never overridden.
      */
@@ -161,12 +163,13 @@ public final class BatchPrefillSupport {
             return policy;
         }
         var type = model.weights().dataType();
-        boolean q4Llama =
+        boolean q4Batched =
                 type == org.beehive.jitllm.runtime.tensor.DataType.Q4_0
-                        && "llama".equals(model.architectureId().toString());
+                        && java.util.Set.of("llama", "qwen35")
+                                .contains(model.architectureId().toString());
         if (type != org.beehive.jitllm.runtime.tensor.DataType.F16
                 && type != org.beehive.jitllm.runtime.tensor.DataType.Q8_0
-                && !q4Llama) {
+                && !q4Batched) {
             return policy;
         }
         if (unsupportedOnCurrentDevice(model).isPresent()) {

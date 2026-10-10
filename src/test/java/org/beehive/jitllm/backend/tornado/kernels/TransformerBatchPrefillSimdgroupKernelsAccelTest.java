@@ -602,4 +602,44 @@ public class TransformerBatchPrefillSimdgroupKernelsAccelTest {
             assertEquals("q4 residual element " + i, expected[i], out.get(i), 0.0f);
         }
     }
+
+    /** The plain Q4_0 projection overwrites every element, partial tiles included. */
+    @Test
+    public void q4Projection() {
+        assumeMetal();
+        int n = 128;
+        int d = 72;
+        int batch = 70;
+        FloatArray x = activations(batch, n);
+        FloatArray out = new FloatArray(batch * d);
+        out.init(UNTOUCHED);
+        ByteArray w = q4Weights(d, n);
+        TaskGraph graph =
+                new TaskGraph("simdgroupQ4Projection")
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, x, out);
+        graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+        graph.task(
+                "t",
+                TransformerBatchPrefillSimdgroupKernels::batchedGemmQ4_0,
+                new KernelContext(),
+                x,
+                out,
+                w,
+                n,
+                d,
+                batch);
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+        run(graph, "simdgroupQ4Projection", ((d + 63) / 64) * ((batch + 63) / 64));
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < d; r++) {
+                float expected =
+                        dot(x, b, n, TransformerBatchPrefillSimdgroupKernelsAccelTest::q4Weight, r);
+                assertEquals(
+                        "q4 projection token " + b + " row " + r,
+                        expected,
+                        out.get(b * d + r),
+                        1e-4f * Math.max(1.0f, Math.abs(expected)));
+            }
+        }
+    }
 }
