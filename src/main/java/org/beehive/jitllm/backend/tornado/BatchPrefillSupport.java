@@ -107,7 +107,8 @@ public final class BatchPrefillSupport {
      * The families whose batched prefill runs the Metal SIMD-group kernels; see {@link
      * #defaultFor}.
      */
-    static final java.util.Set<String> METAL_BATCHED_FAMILIES = java.util.Set.of("qwen3", "llama");
+    static final java.util.Set<String> METAL_BATCHED_FAMILIES =
+            java.util.Set.of("qwen3", "llama", "qwen2", "deepseek-r1-distill-qwen", "mistral");
 
     /** The batched-prefill chunk Metal runs by default; see {@link #defaultFor}. */
     public static final int METAL_DEFAULT_PREFILL_BATCH = 256;
