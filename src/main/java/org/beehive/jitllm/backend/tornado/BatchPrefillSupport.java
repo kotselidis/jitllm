@@ -56,6 +56,12 @@ public final class BatchPrefillSupport {
                                     "the llama Q4_0 batched prefill runs the Metal SIMD-group"
                                             + " kernels only")
                             : Optional.empty();
+            case "granite" ->
+                    BackendId.METAL.equals(c.backend())
+                            ? Optional.empty()
+                            : Optional.of(
+                                    "the granite batched prefill runs the Metal SIMD-group kernels"
+                                            + " only, for its scaled residual and attention");
             case "phi3" ->
                     BackendId.METAL.equals(c.backend())
                             ? Optional.empty()
@@ -122,7 +128,13 @@ public final class BatchPrefillSupport {
      */
     static final java.util.Set<String> METAL_BATCHED_FAMILIES =
             java.util.Set.of(
-                    "qwen3", "llama", "qwen2", "deepseek-r1-distill-qwen", "mistral", "phi3");
+                    "qwen3",
+                    "llama",
+                    "qwen2",
+                    "deepseek-r1-distill-qwen",
+                    "mistral",
+                    "phi3",
+                    "granite");
 
     /** The batched-prefill chunk Metal runs by default; see {@link #defaultFor}. */
     public static final int METAL_DEFAULT_PREFILL_BATCH = 256;

@@ -35,19 +35,30 @@ public class GraniteQ8_0FFNLayers
         TaskGraph unifiedLayer = new TaskGraph(layerTaskGraphName);
 
         // === Data Setup ===
-        unifiedLayer.consumeFromDevice(state.workspace.wrapX);
-        unifiedLayer.transferToDevice(
-                DataTransferMode.FIRST_EXECUTION,
-                // Copy-in weights per layer for batched-layered layout (Q8 format)
-                weights.rms_att_weightLayered[layerIndex].asFloatArray(),
-                weights.wqLayered[layerIndex].asByteArray(),
-                weights.wkLayered[layerIndex].asByteArray(),
-                weights.wvLayered[layerIndex].asByteArray(),
-                weights.woLayered[layerIndex].asByteArray(),
-                weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
-                weights.w1Layered[layerIndex].asByteArray(),
-                weights.w2Layered[layerIndex].asByteArray(),
-                weights.w3Layered[layerIndex].asByteArray());
+        String wrapXSrc = predecessorGraphName(layerIndex);
+        if (wrapXSrc != null) {
+            unifiedLayer.consumeFromDevice(wrapXSrc, state.workspace.wrapX);
+        } else {
+            unifiedLayer.consumeFromDevice(state.workspace.wrapX);
+        }
+        Object[] layerWeights = {
+            // Copy-in weights per layer for batched-layered layout (Q8 format)
+            weights.rms_att_weightLayered[layerIndex].asFloatArray(),
+            weights.wqLayered[layerIndex].asByteArray(),
+            weights.wkLayered[layerIndex].asByteArray(),
+            weights.wvLayered[layerIndex].asByteArray(),
+            weights.woLayered[layerIndex].asByteArray(),
+            weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
+            weights.w1Layered[layerIndex].asByteArray(),
+            weights.w2Layered[layerIndex].asByteArray(),
+            weights.w3Layered[layerIndex].asByteArray()
+        };
+        String weightSrc = weightSourceGraphName(layerIndex);
+        if (weightSrc != null) {
+            unifiedLayer.consumeFromDevice(weightSrc, layerWeights);
+        } else {
+            unifiedLayer.transferToDevice(DataTransferMode.FIRST_EXECUTION, layerWeights);
+        }
         unifiedLayer = configureLayerDataTransfers(unifiedLayer, layerIndex);
 
         // === Attention Block ===
@@ -396,5 +407,22 @@ public class GraniteQ8_0FFNLayers
         return useFp16KVCache()
                 ? state.workspace.wrapValueCacheFP16
                 : state.workspace.wrapValueCache;
+    }
+
+    /**
+     * The graph {@code wrapX} is consumed from, or {@code null} for the no-arg form. The batched
+     * prefill/decode plan's decode layers name their predecessor; see {@code
+     * LlamaFP16FFNLayers#predecessorGraphName}.
+     */
+    protected String predecessorGraphName(int layerIndex) {
+        return null;
+    }
+
+    /**
+     * The graph that already uploaded this layer's weights, or {@code null} to upload them here;
+     * see {@code LlamaFP16FFNLayers#weightSourceGraphName}.
+     */
+    protected String weightSourceGraphName(int layerIndex) {
+        return null;
     }
 }

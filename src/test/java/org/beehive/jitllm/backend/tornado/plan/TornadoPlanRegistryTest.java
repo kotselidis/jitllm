@@ -65,7 +65,8 @@ public class TornadoPlanRegistryTest {
     /** Families with batched prefill but no sequential prefill/decode plan. */
     @Test
     public void batchedFamiliesDeclareStandardAndBatch() {
-        for (String architecture : Set.of("qwen2", "deepseek-r1-distill-qwen", "mistral", "phi3")) {
+        for (String architecture :
+                Set.of("qwen2", "deepseek-r1-distill-qwen", "mistral", "phi3", "granite")) {
             assertEquals(
                     architecture + " is STANDARD and BATCH_PREFILL_DECODE",
                     Set.of(ExecutionMode.STANDARD, ExecutionMode.BATCH_PREFILL_DECODE),
