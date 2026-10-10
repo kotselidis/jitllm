@@ -379,4 +379,155 @@ public class TransformerBatchPrefillSimdgroupKernelsAccelTest {
         checkQkv(true, 64, 128, 64, 128);
         checkQkv(true, 64, 128, 64, 70);
     }
+
+    /** Fused Q/K/V rows (Phi-3's {@code wqkv}): rows {@code [0, qDim)} Q, then K, then V. */
+    private static void checkQkvFused(boolean q8, int dim, int kvDim, int batch) {
+        assumeMetal();
+        int rows = dim + 2 * kvDim;
+        FloatArray x = activations(batch, dim);
+        FloatArray q = new FloatArray(batch * dim);
+        FloatArray k = new FloatArray(batch * kvDim);
+        FloatArray v = new FloatArray(batch * kvDim);
+        q.init(UNTOUCHED);
+        k.init(UNTOUCHED);
+        v.init(UNTOUCHED);
+        String name = "simdgroupQkvFused" + (q8 ? "Q8" : "FP16") + batch;
+        TaskGraph graph =
+                new TaskGraph(name).transferToDevice(DataTransferMode.EVERY_EXECUTION, x, q, k, v);
+        if (q8) {
+            ByteArray w = q8Weights(rows, dim);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmQKVFusedQ8,
+                    new KernelContext(),
+                    x,
+                    q,
+                    k,
+                    v,
+                    w,
+                    dim,
+                    dim,
+                    kvDim,
+                    batch);
+        } else {
+            HalfFloatArray w = fp16Weights(rows, dim);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmQKVFusedFP16,
+                    new KernelContext(),
+                    x,
+                    q,
+                    k,
+                    v,
+                    w,
+                    dim,
+                    dim,
+                    kvDim,
+                    batch);
+        }
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, q, k, v);
+        run(graph, name, (rows / 64) * ((batch + 63) / 64));
+        Weights w =
+                q8
+                        ? TransformerBatchPrefillSimdgroupKernelsAccelTest::q8Weight
+                        : TransformerBatchPrefillSimdgroupKernelsAccelTest::weight;
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < dim; r++) {
+                assertEquals(
+                        name + " q " + b + "," + r, dot(x, b, dim, w, r), q.get(b * dim + r), 0.0f);
+            }
+            for (int r = 0; r < kvDim; r++) {
+                assertEquals(
+                        name + " k " + b + "," + r,
+                        dot(x, b, dim, w, dim + r),
+                        k.get(b * kvDim + r),
+                        0.0f);
+                assertEquals(
+                        name + " v " + b + "," + r,
+                        dot(x, b, dim, w, dim + kvDim + r),
+                        v.get(b * kvDim + r),
+                        0.0f);
+            }
+        }
+    }
+
+    /** Fused gate and up rows (Phi-3's {@code wUp}): gate rows first, then up rows. */
+    private static void checkGateUpFused(boolean q8, int dim, int hiddenDim, int batch) {
+        assumeMetal();
+        FloatArray x = activations(batch, dim);
+        FloatArray rms = new FloatArray(dim);
+        rms.init(1.0f);
+        FloatArray scale = new FloatArray(batch);
+        scale.init(1.0f);
+        FloatArray hb = new FloatArray(batch * hiddenDim);
+        hb.init(UNTOUCHED);
+        String name = "simdgroupGateUpFused" + (q8 ? "Q8" : "FP16") + hiddenDim + "x" + batch;
+        TaskGraph graph =
+                new TaskGraph(name)
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, x, rms, scale, hb);
+        if (q8) {
+            ByteArray w = q8Weights(2 * hiddenDim, dim);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmRmsNormFFNGateUpFusedQ8,
+                    new KernelContext(),
+                    x,
+                    hb,
+                    rms,
+                    scale,
+                    w,
+                    dim,
+                    hiddenDim,
+                    batch);
+        } else {
+            HalfFloatArray w = fp16Weights(2 * hiddenDim, dim);
+            graph.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+            graph.task(
+                    "t",
+                    TransformerBatchPrefillSimdgroupKernels::batchedGemmRmsNormFFNGateUpFusedFP16,
+                    new KernelContext(),
+                    x,
+                    hb,
+                    rms,
+                    scale,
+                    w,
+                    dim,
+                    hiddenDim,
+                    batch);
+        }
+        graph.transferToHost(DataTransferMode.EVERY_EXECUTION, hb);
+        run(graph, name, ((hiddenDim + 31) / 32) * ((batch + 63) / 64));
+        Weights w =
+                q8
+                        ? TransformerBatchPrefillSimdgroupKernelsAccelTest::q8Weight
+                        : TransformerBatchPrefillSimdgroupKernelsAccelTest::weight;
+        for (int b = 0; b < batch; b++) {
+            for (int r = 0; r < hiddenDim; r++) {
+                float gate = dot(x, b, dim, w, r);
+                float up = dot(x, b, dim, w, hiddenDim + r);
+                float expected = (gate / (1.0f + (float) Math.exp(-gate))) * up;
+                assertEquals(
+                        name + " token " + b + " row " + r,
+                        expected,
+                        hb.get(b * hiddenDim + r),
+                        1e-4f * Math.max(1.0f, Math.abs(expected)));
+            }
+        }
+    }
+
+    @Test
+    public void fusedQkvWholeAndPartialTiles() {
+        checkQkvFused(false, 64, 64, 128);
+        checkQkvFused(false, 64, 64, 70);
+        checkQkvFused(true, 64, 64, 70);
+    }
+
+    @Test
+    public void fusedGateUp() {
+        checkGateUpFused(false, 64, 40, 70);
+        checkGateUpFused(true, 64, 40, 70);
+    }
 }

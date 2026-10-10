@@ -49,6 +49,12 @@ public final class BatchPrefillSupport {
                             : Optional.of(
                                     "the gemma4 batched prefill is written for tensor cores"
                                             + " only, which this device does not have");
+            case "phi3" ->
+                    BackendId.METAL.equals(c.backend())
+                            ? Optional.empty()
+                            : Optional.of(
+                                    "the phi3 batched prefill runs the Metal SIMD-group kernels"
+                                            + " only, for its fused QKV and gate/up weights");
             case "qwen35" ->
                     BackendId.OPENCL.equals(c.backend())
                             ? Optional.of(
@@ -108,7 +114,8 @@ public final class BatchPrefillSupport {
      * #defaultFor}.
      */
     static final java.util.Set<String> METAL_BATCHED_FAMILIES =
-            java.util.Set.of("qwen3", "llama", "qwen2", "deepseek-r1-distill-qwen", "mistral");
+            java.util.Set.of(
+                    "qwen3", "llama", "qwen2", "deepseek-r1-distill-qwen", "mistral", "phi3");
 
     /** The batched-prefill chunk Metal runs by default; see {@link #defaultFor}. */
     public static final int METAL_DEFAULT_PREFILL_BATCH = 256;
