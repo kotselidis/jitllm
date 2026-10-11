@@ -291,52 +291,75 @@ public final class LLMEngine implements AutoCloseable {
                     metrics.record(MetricKey.KV_BLOCKS_IN_USE, capacity.usedBlocks());
                     metrics.record(MetricKey.KV_BLOCKS_TOTAL, capacity.totalBlocks());
                 }
-                StepOutput output = executor.execute(batch);
-                for (int s = 0; s < plan.size(); s++) {
-                    ScheduledRequest request = plan.get(s).request();
-                    int fed = plan.get(s).tokens();
-                    RequestHandle handle = handles.get(request);
-                    int promptLength = request.promptTokens().length;
-                    boolean wasIngesting = request.consumed() < promptLength;
-                    request.consume(fed);
-                    advanced++;
-
-                    if (wasIngesting && request.consumed() >= promptLength) {
-                        // The prompt is fully ingested, so its KV exists and can be shared. Whole
-                        // blocks only — a partial block is not something the table can point at.
-                        int blockTokens = manager.capacity().blockSizeTokens();
-                        int covered = promptLength / blockTokens * blockTokens;
-                        manager.rememberPrefix(request.lease(), request.promptTokens(), covered);
-                    }
-
-                    if (!batch.samples()[s]) {
-                        // A prompt chunk that stopped short of the end: what it would sample is
-                        // the next prompt token, which we already have.
-                        continue;
-                    }
-
-                    int token = output.sampled()[s];
-                    if (metrics.isEnabled() && handle.tokenCount() == 0) {
-                        Long submitted = submittedAtNanos.get(request);
-                        if (submitted != null) {
-                            // TTFT covers the queue wait and the prompt, which is what a caller
-                            // experiences as latency — not just the decode that produced the token.
-                            metrics.record(
-                                    MetricKey.TIME_TO_FIRST_TOKEN, System.nanoTime() - submitted);
+                StepOutput output;
+                try {
+                    output = executor.execute(batch);
+                } catch (RuntimeException | Error failure) {
+                    // The backend broke mid-step. Every request in the step fails with the
+                    // cause, so its caller hears about it instead of waiting forever, and the
+                    // engine stays up for the next step.
+                    output = null;
+                    for (StepPlanner.Work work : plan) {
+                        ScheduledRequest request = work.request();
+                        if (!request.isTerminal()) {
+                            scheduler.fail(request, failure);
+                            terminal.add(handles.get(request));
                         }
                     }
-                    handle.appendToken(token); // before the callback, which runs outside the lock
-                    int count = generated.merge(request, 1, Integer::sum);
-                    // The stop token is the model's vocabulary; the budget is the scheduler's.
-                    boolean finished =
-                            (executor.isStopToken(token) && !request.ignoresStopTokens())
-                                    || count >= request.maxNewTokens();
-                    if (finished) {
-                        scheduler.complete(request);
-                        terminal.add(handle);
-                    }
-                    if (handle.callback() != null) {
-                        callbacks.add(() -> deliver(handle, token));
+                }
+                if (output != null) {
+                    for (int s = 0; s < plan.size(); s++) {
+                        ScheduledRequest request = plan.get(s).request();
+                        int fed = plan.get(s).tokens();
+                        RequestHandle handle = handles.get(request);
+                        int promptLength = request.promptTokens().length;
+                        boolean wasIngesting = request.consumed() < promptLength;
+                        request.consume(fed);
+                        advanced++;
+
+                        if (wasIngesting && request.consumed() >= promptLength) {
+                            // The prompt is fully ingested, so its KV exists and can be shared.
+                            // Whole
+                            // blocks only — a partial block is not something the table can point
+                            // at.
+                            int blockTokens = manager.capacity().blockSizeTokens();
+                            int covered = promptLength / blockTokens * blockTokens;
+                            manager.rememberPrefix(
+                                    request.lease(), request.promptTokens(), covered);
+                        }
+
+                        if (!batch.samples()[s]) {
+                            // A prompt chunk that stopped short of the end: what it would sample is
+                            // the next prompt token, which we already have.
+                            continue;
+                        }
+
+                        int token = output.sampled()[s];
+                        if (metrics.isEnabled() && handle.tokenCount() == 0) {
+                            Long submitted = submittedAtNanos.get(request);
+                            if (submitted != null) {
+                                // TTFT covers the queue wait and the prompt, which is what a caller
+                                // experiences as latency — not just the decode that produced the
+                                // token.
+                                metrics.record(
+                                        MetricKey.TIME_TO_FIRST_TOKEN,
+                                        System.nanoTime() - submitted);
+                            }
+                        }
+                        handle.appendToken(
+                                token); // before the callback, which runs outside the lock
+                        int count = generated.merge(request, 1, Integer::sum);
+                        // The stop token is the model's vocabulary; the budget is the scheduler's.
+                        boolean finished =
+                                (executor.isStopToken(token) && !request.ignoresStopTokens())
+                                        || count >= request.maxNewTokens();
+                        if (finished) {
+                            scheduler.complete(request);
+                            terminal.add(handle);
+                        }
+                        if (handle.callback() != null) {
+                            callbacks.add(() -> deliver(handle, token));
+                        }
                     }
                 }
             }
