@@ -10,7 +10,8 @@ record ServerOptions(
         int port,
         int batchSlots,
         int maxQueuedRequests,
-        int prefixCacheEntries) {
+        int prefixCacheEntries,
+        int maxBatchedTokens) {
     // The checks use the parameter, not continuousBatching(): in a compact constructor the
     // fields are not assigned until it returns, so the accessor would read the default.
     ServerOptions {
@@ -24,6 +25,13 @@ record ServerOptions(
         if (batchSlots <= 1 && prefixCacheEntries > 0)
             throw new IllegalArgumentException(
                     "--prefix-cache-entries requires --continuous-batching");
+        if (maxBatchedTokens != 0 && batchSlots <= 1)
+            throw new IllegalArgumentException(
+                    "--max-batched-tokens requires --continuous-batching");
+        if (maxBatchedTokens != 0 && maxBatchedTokens < batchSlots)
+            throw new IllegalArgumentException(
+                    "--max-batched-tokens must be at least the --continuous-batching slots, so"
+                            + " every running request gets its token on every step");
         if (batchSlots > 1
                 && (Boolean.getBoolean("jitllm.withPrefillDecode")
                         || Integer.getInteger("jitllm.prefillBatchSize", 1) > 1
@@ -41,6 +49,25 @@ record ServerOptions(
         }
     }
 
+    /**
+     * Compact form for callers that predate {@code --max-batched-tokens}: one token per request per
+     * step.
+     */
+    ServerOptions(
+            ModelRunConfig model,
+            String host,
+            int port,
+            int batchSlots,
+            int maxQueuedRequests,
+            int prefixCacheEntries) {
+        this(model, host, port, batchSlots, maxQueuedRequests, prefixCacheEntries, 0);
+    }
+
+    /** Whether prompts go in as chunks next to decode tokens, under a per-step token budget. */
+    boolean chunkedPrefill() {
+        return maxBatchedTokens > 0;
+    }
+
     /** Whether requests are decoded together by the experimental continuous-batch engine. */
     boolean continuousBatching() {
         return batchSlots > 1;
@@ -53,9 +80,8 @@ record ServerOptions(
     static final String CONTINUOUS_BATCHING_WARNING =
             "WARNING: continuous batching is experimental. It currently supports CUDA tensor-core"
                     + " devices, FP16 Llama/Qwen3 weights and greedy requests (temperature 0);"
-                    + " prefill chunking and"
-                    + " CUDA graphs are not supported, and its setup time and memory are not"
-                    + " reported.";
+                    + " prompt chunking (--max-batched-tokens) is FP16 Llama only, CUDA graphs are"
+                    + " not supported, and its setup time and memory are not reported.";
 
     static ServerOptions parse(String[] args) {
         Path path = null;
@@ -64,6 +90,7 @@ record ServerOptions(
         int port = 8080, context = 0, batchSlots = 1;
         int queued = Integer.getInteger("server.maxQueuedRequests", 64);
         int prefixes = Integer.getInteger("server.prefixCacheEntries", 0);
+        int batchedTokens = 0;
         boolean gpu = Boolean.getBoolean("use.tornadovm"), contextSet = false;
         for (int i = 0; i < args.length; i++) {
             String option = args[i];
@@ -142,6 +169,11 @@ record ServerOptions(
                 }
                 case "--max-queued-requests" -> queued = Integer.parseInt(value);
                 case "--prefix-cache-entries" -> prefixes = Integer.parseInt(value);
+                case "--max-batched-tokens" -> {
+                    batchedTokens = Integer.parseInt(value);
+                    if (batchedTokens < 1)
+                        throw new IllegalArgumentException("--max-batched-tokens must be positive");
+                }
                 case "--batch-prefill-size" -> {
                     int width = Integer.parseInt(value);
                     if (width < 1)
@@ -154,6 +186,12 @@ record ServerOptions(
         }
         if (path == null) throw new IllegalArgumentException("serve requires --model");
         return new ServerOptions(
-                new ModelRunConfig(path, context, gpu), host, port, batchSlots, queued, prefixes);
+                new ModelRunConfig(path, context, gpu),
+                host,
+                port,
+                batchSlots,
+                queued,
+                prefixes,
+                batchedTokens);
     }
 }

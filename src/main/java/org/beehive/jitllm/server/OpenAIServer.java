@@ -338,7 +338,7 @@ public final class OpenAIServer implements AutoCloseable {
         if (java.util.Arrays.asList(args).contains("--help")
                 || java.util.Arrays.asList(args).contains("-h")) {
             System.out.println(
-                    "Usage: OpenAIServer [serve] --model FILE [--ctx-size|--ctx N (default: model's own)] [--host 127.0.0.1] [--port 8080] [--gpu] [--continuous-batching SLOTS (experimental)] [-v]");
+                    "Usage: OpenAIServer [serve] --model FILE [--ctx-size|--ctx N (default: model's own)] [--host 127.0.0.1] [--port 8080] [--gpu] [--continuous-batching SLOTS (experimental)] [--max-batched-tokens N (experimental)] [-v]");
             return;
         }
         ServerOptions options = ServerOptions.parse(args);
@@ -372,7 +372,8 @@ public final class OpenAIServer implements AutoCloseable {
                             options.maxQueuedRequests(),
                             contextLength,
                             options.prefixCacheEntries(),
-                            served);
+                            served,
+                            options.maxBatchedTokens());
             server = new OpenAIServer(service, served, config.gpu(), contextLength);
             try {
                 if (StartupDiagnostics.verbose()) {

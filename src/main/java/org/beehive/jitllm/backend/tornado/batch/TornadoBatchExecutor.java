@@ -20,7 +20,6 @@ import org.beehive.jitllm.model.Configuration;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.model.llama.LlamaConfiguration;
 import org.beehive.jitllm.model.qwen3.Qwen3Configuration;
-import org.beehive.jitllm.runtime.batch.BatchExecutor;
 import org.beehive.jitllm.runtime.batch.BatchSlots;
 import org.beehive.jitllm.runtime.kv.KvStorage;
 import uk.ac.manchester.tornado.api.GridScheduler;
@@ -58,7 +57,7 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  * <p>FP16 weights and greedy on-device sampling only, matching what #129 demonstrated. Q8_0 and
  * temperature sampling are extensions, not omissions to be papered over.
  */
-public final class TornadoBatchExecutor implements BatchExecutor, AutoCloseable {
+public final class TornadoBatchExecutor implements TornadoServingExecutor {
 
     private static final int RMS_LOCAL = 256;
 
@@ -84,6 +83,7 @@ public final class TornadoBatchExecutor implements BatchExecutor, AutoCloseable 
     /**
      * The continuous-batch plan compiles lazily on the first step, independently of master plans.
      */
+    @Override
     public org.beehive.jitllm.runtime.backend.ExecutionInfo executionInfo() {
         var backend =
                 uk.ac.manchester.tornado.api.runtime.TornadoRuntimeProvider.getTornadoRuntime()

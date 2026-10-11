@@ -293,6 +293,8 @@ class LlamaRunner:
                 srv += ["--continuous-batching", str(args.continuous_batching),
                         "--max-queued-requests", str(args.max_queued_requests),
                         "--prefix-cache-entries", str(args.prefix_cache_entries)]
+                if args.max_batched_tokens:
+                    srv += ["--max-batched-tokens", str(args.max_batched_tokens)]
             if args.use_gpu:
                 srv.append("--gpu")
             return cmd + srv
@@ -559,8 +561,8 @@ def parse_cli_args(argv):
         batching = args.continuous_batching
         if batching is not None and batching < 2:
             parser.error("--continuous-batching needs at least 2 request slots")
-        if not batching and supplied & {"--max-queued-requests", "--prefix-cache-entries"}:
-            parser.error("--max-queued-requests and --prefix-cache-entries belong to --continuous-batching")
+        if not batching and supplied & {"--max-queued-requests", "--prefix-cache-entries", "--max-batched-tokens"}:
+            parser.error("--max-queued-requests, --prefix-cache-entries and --max-batched-tokens belong to --continuous-batching")
         if args.max_queued_requests < 1 or args.prefix_cache_entries < 0:
             parser.error("--max-queued-requests must be positive; --prefix-cache-entries must be non-negative")
         if batching and not args.use_gpu:
@@ -573,7 +575,7 @@ def parse_cli_args(argv):
         parser.error("--print-taskgraph-chain describes the accelerator plan; add --gpu")
     if mode in {"serve", "bench"} and (args.prompt is not None or args.system_prompt is not None or args.max_new_tokens is not None):
         parser.error("prompt and generation-limit options belong to run/chat; serve receives them in HTTP requests")
-    if mode != "serve" and supplied & {"--port", "--host", "--continuous-batching", "--max-queued-requests", "--prefix-cache-entries"}:
+    if mode != "serve" and supplied & {"--port", "--host", "--continuous-batching", "--max-queued-requests", "--prefix-cache-entries", "--max-batched-tokens"}:
         parser.error("HTTP server options require serve/--server")
     if mode != "bench" and supplied & {"--pp", "--tg", "--depth", "--repetitions", "--output", "--bench-args"}:
         parser.error("Benchmark options require bench/--bench")
@@ -744,6 +746,10 @@ def create_parser(command=None) -> argparse.ArgumentParser:
     advanced_group.add_argument("--prefix-cache-entries", type=int, default=0, metavar="N",
                                 help="[experimental] (serve) Prompt prefixes cached and shared "
                                      "between --continuous-batching requests; 0 is off")
+    advanced_group.add_argument("--max-batched-tokens", type=int, default=None, metavar="N",
+                                help="[experimental] (serve) Tokens one --continuous-batching step "
+                                     "carries, at least SLOTS; prompts are fed in chunks next to "
+                                     "decode tokens. FP16 Llama only. Default: one token per request")
 
     # Removed: parsed only to refuse it with the migration.
     parser.add_argument("--fp16-kv-cache", action="store_true", help=argparse.SUPPRESS)
@@ -751,7 +757,8 @@ def create_parser(command=None) -> argparse.ArgumentParser:
     parser.set_defaults(command=command, legacy_context=False)
     if command:
         generation = {"prompt", "system_prompt", "temperature", "top_p", "seed", "max_new_tokens", "stream", "suffix"}
-        server = {"host", "port", "continuous_batching", "max_queued_requests", "prefix_cache_entries"}
+        server = {"host", "port", "continuous_batching", "max_queued_requests", "prefix_cache_entries",
+                  "max_batched_tokens"}
         bench = {"bench_args", "pp", "tg", "depth", "repetitions", "output"}
         modes = {"interactive", "instruct", "server", "bench"}
         hidden = modes | (server if command != "serve" else set()) | (bench if command != "bench" else set())

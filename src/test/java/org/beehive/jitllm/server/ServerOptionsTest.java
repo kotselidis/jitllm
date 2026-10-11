@@ -113,4 +113,48 @@ public class ServerOptionsTest {
                                         new String[] {"-m", "model.gguf", "--fp16-kv-cache"}));
         assertTrue(refused.getMessage(), refused.getMessage().contains("--fp32-kv-cache"));
     }
+
+    @Test
+    public void maxBatchedTokensTurnsOnChunkedPrefillAndMustCoverEverySlot() {
+        var options =
+                ServerOptions.parse(
+                        new String[] {
+                            "-m",
+                            "model.gguf",
+                            "--gpu",
+                            "--continuous-batching",
+                            "64",
+                            "--max-batched-tokens",
+                            "256"
+                        });
+        assertTrue(options.chunkedPrefill());
+        assertEquals(256, options.maxBatchedTokens());
+        assertFalse(
+                ServerOptions.parse(
+                                new String[] {
+                                    "-m", "model.gguf", "--gpu", "--continuous-batching", "8"
+                                })
+                        .chunkedPrefill());
+
+        assertThrows(
+                "below the slot count",
+                IllegalArgumentException.class,
+                () ->
+                        ServerOptions.parse(
+                                new String[] {
+                                    "-m",
+                                    "model.gguf",
+                                    "--gpu",
+                                    "--continuous-batching",
+                                    "64",
+                                    "--max-batched-tokens",
+                                    "32"
+                                }));
+        assertThrows(
+                "without continuous batching",
+                IllegalArgumentException.class,
+                () ->
+                        ServerOptions.parse(
+                                new String[] {"-m", "model.gguf", "--max-batched-tokens", "256"}));
+    }
 }
