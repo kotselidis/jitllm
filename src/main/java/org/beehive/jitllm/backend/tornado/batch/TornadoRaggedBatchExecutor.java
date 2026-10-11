@@ -368,16 +368,30 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         int activeRows = trimRows ? Math.min(maxRows, (rows + 15) & ~15) : maxRows;
         // Query tiles for attention: each sequence's rows in runs of up to queryTileRows(), so a
         // prompt chunk's rows share key/value reads; a decode row is a tile of one.
+        // Prompt rows go to the tensor-core kernel in tiles; a generated token goes to the per-row
+        // kernel. Which kernel a row takes depends on the row alone, so invariance holds.
         IntArray tiles = layers.queryTiles();
+        IntArray decodeSlots = layers.decodeRowSlots();
         int tileCount = 0;
         int queryTile = layers.queryTileRows();
         for (int s = 0; s < sequences; s++) {
+            int start = batch.queryStart()[s];
             int end = batch.queryStart()[s + 1];
-            for (int r = batch.queryStart()[s]; r < end; r += queryTile) {
+            int promptEnd = start;
+            while (promptEnd < end && batch.promptRows()[promptEnd]) {
+                promptEnd++;
+            }
+            for (int r = start; r < promptEnd; r += queryTile) {
                 tiles.set(2 * tileCount, r);
-                tiles.set(2 * tileCount + 1, Math.min(queryTile, end - r));
+                tiles.set(2 * tileCount + 1, Math.min(queryTile, promptEnd - r));
                 tileCount++;
             }
+            for (int r = start; r < end; r++) {
+                decodeSlots.set(r, r < promptEnd ? -1 : rowSlots.get(r));
+            }
+        }
+        for (int r = rows; r < maxRows; r++) {
+            decodeSlots.set(r, -1);
         }
         for (int t = tileCount; t < maxRows; t++) {
             tiles.set(2 * t, 0);

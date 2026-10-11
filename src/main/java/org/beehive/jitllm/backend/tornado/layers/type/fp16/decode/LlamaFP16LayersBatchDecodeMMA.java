@@ -102,6 +102,10 @@ public class LlamaFP16LayersBatchDecodeMMA {
     // Per query tile, its first row and row count; written by the executor each step.
     private final IntArray queryTiles;
 
+    // A generated token's KV slot per row, -1 for a prompt row: the scalar kernel takes generated
+    // tokens, whose single row a 16-row tensor-core tile would mostly waste.
+    private final IntArray decodeRowSlots;
+
     /** Fewest positions a split reads: a shorter context uses fewer splits, down to one. */
     private final int kvSplitMin = Integer.getInteger("jitllm.ragged.kvSplitMin", 256);
 
@@ -127,6 +131,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private WorkerGrid ropeWorker;
     private WorkerGrid attnWorker;
     private WorkerGrid attnCombineWorker;
+    private WorkerGrid attnDecodeWorker;
     private WorkerGrid mmaQkvWorker;
     private WorkerGrid mmaDimWorker;
     private WorkerGrid mmaGateUpWorker;
@@ -237,6 +242,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
                         Integer.getInteger("jitllm.ragged.kvSplits", 16),
                         (decodeCtx + kvSplitMin - 1) / kvSplitMin);
         this.queryTiles = rowSlots != null ? new IntArray(2 * batchSize) : null;
+        this.decodeRowSlots = rowSlots != null ? new IntArray(batchSize) : null;
         this.stepRows = rowSlots != null ? new IntArray(1) : null;
         this.attnPartials =
                 rowSlots != null && splitKv
@@ -268,7 +274,11 @@ public class LlamaFP16LayersBatchDecodeMMA {
             }
             if (rowSlots != null) {
                 g.transferToDevice(
-                        DataTransferMode.EVERY_EXECUTION, rowSlots, stepRows, queryTiles);
+                        DataTransferMode.EVERY_EXECUTION,
+                        rowSlots,
+                        stepRows,
+                        queryTiles,
+                        decodeRowSlots);
             }
             if (attnPartials != null) {
                 g.transferToDevice(DataTransferMode.FIRST_EXECUTION, attnPartials);
@@ -295,7 +305,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 g.consumeFromDevice(pred, context, blockTable);
             }
             if (rowSlots != null) {
-                g.consumeFromDevice(pred, context, rowSlots, stepRows, queryTiles);
+                g.consumeFromDevice(pred, context, rowSlots, stepRows, queryTiles, decodeRowSlots);
             }
             if (attnPartials != null) {
                 g.consumeFromDevice(pred, context, attnPartials);
@@ -482,6 +492,26 @@ public class LlamaFP16LayersBatchDecodeMMA {
                         seqPositions,
                         rowSlots,
                         queryTiles,
+                        blockTable,
+                        state.workspace.qkvResultBatch,
+                        keyCacheBatchFP16,
+                        valueCacheBatchFP16,
+                        attnPartials,
+                        config.numberOfHeads(),
+                        config.headSize(),
+                        kvDim,
+                        config.kvMul(),
+                        layerIndex,
+                        config.numberOfLayers(),
+                        blockCfg,
+                        kvSplits | (kvSplitMin << 16));
+                // Generated tokens: the per-row grouped kernel, prompt rows skipped by slot -1.
+                g.task(
+                        "batch_attention_decode",
+                        TransformerRaggedBatchKernels::raggedSplitKvAttentionPartialGqa,
+                        context,
+                        seqPositions,
+                        decodeRowSlots,
                         blockTable,
                         state.workspace.qkvResultBatch,
                         keyCacheBatchFP16,
@@ -861,6 +891,10 @@ public class LlamaFP16LayersBatchDecodeMMA {
                                 * attnLocal,
                         attnLocal);
         attnCombineWorker = WorkerGridFactory.genericWorker(batchSize * nHeads * headSz, headSz);
+        int gqaLocal = config.kvMul() * headSz;
+        attnDecodeWorker =
+                WorkerGridFactory.genericWorker(
+                        batchSize * (nHeads / config.kvMul()) * kvSplits * gqaLocal, gqaLocal);
 
         mmaQkvWorker = mmaGrid(paddedBatch, dim + 2 * kvDim);
         mmaDimWorker = mmaGrid(paddedBatch, dim);
@@ -881,6 +915,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
             scheduler.addWorkerGrid(p + "batch_attention", attnWorker);
             if (attnPartials != null) {
                 scheduler.addWorkerGrid(p + "batch_attention_combine", attnCombineWorker);
+            }
+            if (tiled()) {
+                scheduler.addWorkerGrid(p + "batch_attention_decode", attnDecodeWorker);
             }
             scheduler.addWorkerGrid(p + "woProj", mmaDimWorker);
             scheduler.addWorkerGrid(p + "batch_ffn_rms", rmsWorker);
@@ -953,6 +990,16 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 1);
         attnCombineWorker.setGlobalWork(
                 (long) rows * config.numberOfHeads() * config.headSize(), 1, 1);
+        if (tiled()) {
+            attnDecodeWorker.setGlobalWork(
+                    (long) rows
+                            * (config.numberOfHeads() / config.kvMul())
+                            * kvSplits
+                            * config.kvMul()
+                            * config.headSize(),
+                    1,
+                    1);
+        }
         mmaQkvWorker.setGlobalWork(mmaRows / 128 * 256L, (dim + 2L * config.kvDim()) / 128, 1);
         mmaDimWorker.setGlobalWork(mmaRows / 128 * 256L, dim / 128, 1);
         mmaGateUpWorker.setGlobalWork(mmaRows / 128 * 256L, 2L * hidDim / 128, 1);
@@ -1011,6 +1058,11 @@ public class LlamaFP16LayersBatchDecodeMMA {
     /** Rows of one sequence per attention query tile: 16 / kvMul on tensor cores, else one. */
     public int queryTileRows() {
         return tiled() ? TransformerRaggedBatchKernels.FLASH_TILE_ROWS / config.kvMul() : 1;
+    }
+
+    /** The executor writes each step's generated-token slots here: -1 for a prompt row. */
+    public IntArray decodeRowSlots() {
+        return decodeRowSlots;
     }
 
     /** The executor writes each step's query tiles here: first row and row count per tile. */

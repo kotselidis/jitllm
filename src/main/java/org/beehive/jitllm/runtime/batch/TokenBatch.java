@@ -24,6 +24,8 @@ package org.beehive.jitllm.runtime.batch;
  *     count
  * @param samples per sequence: whether the logits after its last token are needed — false for a
  *     prompt chunk that does not reach the end of the prompt, whose next token is already known
+ * @param promptRows per token: whether it is a prompt token rather than a generated one. A property
+ *     of the token itself, so an executor may pick a kernel by it without breaking batch invariance
  */
 public record TokenBatch(
         int[] tokens,
@@ -31,12 +33,30 @@ public record TokenBatch(
         int[] sequenceOf,
         int[] kvSlots,
         int[] queryStart,
-        boolean[] samples) {
+        boolean[] samples,
+        boolean[] promptRows) {
+
+    /** A batch whose tokens are all treated as prompt tokens, for callers that do not tell. */
+    public TokenBatch(
+            int[] tokens,
+            int[] positions,
+            int[] sequenceOf,
+            int[] kvSlots,
+            int[] queryStart,
+            boolean[] samples) {
+        this(tokens, positions, sequenceOf, kvSlots, queryStart, samples, allTrue(tokens.length));
+    }
+
+    private static boolean[] allTrue(int n) {
+        boolean[] all = new boolean[n];
+        java.util.Arrays.fill(all, true);
+        return all;
+    }
 
     public TokenBatch {
         int t = tokens.length;
         int s = kvSlots.length;
-        if (positions.length != t || sequenceOf.length != t) {
+        if (positions.length != t || sequenceOf.length != t || promptRows.length != t) {
             throw new IllegalArgumentException(
                     "per-token arrays disagree: "
                             + t

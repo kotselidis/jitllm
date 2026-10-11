@@ -478,6 +478,7 @@ public final class LLMEngine implements AutoCloseable {
         int[] kvSlots = new int[plan.size()];
         int[] queryStart = new int[plan.size() + 1];
         boolean[] samples = new boolean[plan.size()];
+        boolean[] promptRows = new boolean[total];
         int t = 0;
         for (int s = 0; s < plan.size(); s++) {
             ScheduledRequest request = plan.get(s).request();
@@ -498,9 +499,11 @@ public final class LLMEngine implements AutoCloseable {
                                 : lastSampled;
                 positions[t] = position;
                 sequenceOf[t] = s;
+                promptRows[t] = position < request.promptTokens().length;
             }
         }
         queryStart[plan.size()] = t;
-        return new TokenBatch(tokens, positions, sequenceOf, kvSlots, queryStart, samples);
+        return new TokenBatch(
+                tokens, positions, sequenceOf, kvSlots, queryStart, samples, promptRows);
     }
 }
