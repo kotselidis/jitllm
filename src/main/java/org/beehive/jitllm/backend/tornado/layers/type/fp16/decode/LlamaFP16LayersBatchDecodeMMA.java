@@ -70,6 +70,20 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private final int maxBlocksPerSlot;
     // Ragged mode (optional): each row's KV slot, or negative for a padding row.
     private final IntArray rowSlots;
+
+    /**
+     * Ragged attention as split-K: each row's context is cut into {@code kvSplits} chunks read by
+     * separate workgroups, then combined. Off means one workgroup walks a row's whole context.
+     */
+    private final boolean splitKv = !"false".equals(System.getProperty("jitllm.ragged.splitKv"));
+
+    private final int kvSplits = Integer.getInteger("jitllm.ragged.kvSplits", 16);
+
+    /** Fewest positions a split reads: a shorter context uses fewer splits, down to one. */
+    private final int kvSplitMin = Integer.getInteger("jitllm.ragged.kvSplitMin", 256);
+
+    // Split-K partial results: per (row, head, split), headSize values plus max and sum.
+    private final FloatArray attnPartials;
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
 
@@ -79,6 +93,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private WorkerGrid ffnRmsApplyWorker;
     private WorkerGrid ropeWorker;
     private WorkerGrid attnWorker;
+    private WorkerGrid attnCombineWorker;
     private WorkerGrid mmaQkvWorker;
     private WorkerGrid mmaDimWorker;
     private WorkerGrid mmaGateUpWorker;
@@ -181,6 +196,14 @@ public class LlamaFP16LayersBatchDecodeMMA {
         if (rowSlots != null && (!paged || keyCacheBatchFP16 == null)) {
             throw new IllegalArgumentException("ragged rows need a paged FP16 key/value pool");
         }
+        this.attnPartials =
+                rowSlots != null && splitKv
+                        ? new FloatArray(
+                                batchSize
+                                        * config.numberOfHeads()
+                                        * kvSplits
+                                        * (config.headSize() + 2))
+                        : null;
         this.layerITGs =
                 IntStream.range(0, config.numberOfLayers())
                         .mapToObj(this::createLayerTaskGraph)
@@ -203,6 +226,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
             }
             if (rowSlots != null) {
                 g.transferToDevice(DataTransferMode.EVERY_EXECUTION, rowSlots);
+            }
+            if (attnPartials != null) {
+                g.transferToDevice(DataTransferMode.FIRST_EXECUTION, attnPartials);
             }
             g.transferToDevice(
                     DataTransferMode.FIRST_EXECUTION,
@@ -227,6 +253,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
             }
             if (rowSlots != null) {
                 g.consumeFromDevice(pred, context, rowSlots);
+            }
+            if (attnPartials != null) {
+                g.consumeFromDevice(pred, context, attnPartials);
             }
             g.consumeFromDevice(
                     pred,
@@ -355,7 +384,37 @@ public class LlamaFP16LayersBatchDecodeMMA {
                         dim);
             }
 
-            if (rowSlots != null) {
+            if (attnPartials != null) {
+                g.task(
+                        "batch_attention",
+                        TransformerRaggedBatchKernels::raggedSplitKvAttentionPartial,
+                        context,
+                        seqPositions,
+                        rowSlots,
+                        blockTable,
+                        state.workspace.qkvResultBatch,
+                        keyCacheBatchFP16,
+                        valueCacheBatchFP16,
+                        attnPartials,
+                        config.numberOfHeads(),
+                        config.headSize(),
+                        kvDim,
+                        config.kvMul(),
+                        layerIndex,
+                        config.numberOfLayers(),
+                        blockCfg,
+                        kvSplits | (kvSplitMin << 16));
+                g.task(
+                        "batch_attention_combine",
+                        TransformerRaggedBatchKernels::raggedSplitKvAttentionCombine,
+                        context,
+                        rowSlots,
+                        attnPartials,
+                        state.workspace.attnOutFP16,
+                        config.numberOfHeads(),
+                        config.headSize(),
+                        kvSplits);
+            } else if (rowSlots != null) {
                 g.task(
                         "batch_attention",
                         TransformerRaggedBatchKernels::raggedPagedAttentionFP16OutKVFP16,
@@ -551,8 +610,11 @@ public class LlamaFP16LayersBatchDecodeMMA {
         while (ropeLocal > 1 && ropeGlobal % ropeLocal != 0) ropeLocal--;
         ropeWorker = WorkerGridFactory.genericWorker(ropeGlobal, ropeLocal);
 
-        int attnLocal = Math.min(headSz, 128);
-        attnWorker = WorkerGridFactory.genericWorker(batchSize * nHeads * attnLocal, attnLocal);
+        int attnLocal = attnLocalSize();
+        attnWorker =
+                WorkerGridFactory.genericWorker(
+                        batchSize * nHeads * attnGroupsPerHead() * attnLocal, attnLocal);
+        attnCombineWorker = WorkerGridFactory.genericWorker(batchSize * nHeads * headSz, headSz);
 
         mmaQkvWorker = mmaGrid(paddedBatch, dim + 2 * kvDim);
         mmaDimWorker = mmaGrid(paddedBatch, dim);
@@ -568,6 +630,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
             scheduler.addWorkerGrid(p + "qkvProj", mmaQkvWorker);
             scheduler.addWorkerGrid(p + "batch_rope_kv", ropeWorker);
             scheduler.addWorkerGrid(p + "batch_attention", attnWorker);
+            if (attnPartials != null) {
+                scheduler.addWorkerGrid(p + "batch_attention_combine", attnCombineWorker);
+            }
             scheduler.addWorkerGrid(p + "woProj", mmaDimWorker);
             scheduler.addWorkerGrid(p + "batch_ffn_rms", rmsWorker);
             scheduler.addWorkerGrid(p + "batch_ffn_rms_apply", ffnRmsApplyWorker);
@@ -602,12 +667,24 @@ public class LlamaFP16LayersBatchDecodeMMA {
         ffnRmsApplyWorker.setGlobalWork((long) rows * dim, 1, 1);
         ropeWorker.setGlobalWork((long) rows * (dim / 2), 1, 1);
         attnWorker.setGlobalWork(
-                (long) rows * config.numberOfHeads() * Math.min(config.headSize(), 128), 1, 1);
+                (long) rows * config.numberOfHeads() * attnGroupsPerHead() * attnLocalSize(), 1, 1);
+        attnCombineWorker.setGlobalWork(
+                (long) rows * config.numberOfHeads() * config.headSize(), 1, 1);
         mmaQkvWorker.setGlobalWork(mmaRows / 128 * 256L, (dim + 2L * config.kvDim()) / 128, 1);
         mmaDimWorker.setGlobalWork(mmaRows / 128 * 256L, dim / 128, 1);
         mmaGateUpWorker.setGlobalWork(mmaRows / 128 * 256L, 2L * hidDim / 128, 1);
         ewDimWorker.setGlobalWork((long) rows * dim, 1, 1);
         ewHidWorker.setGlobalWork((long) rows * hidDim, 1, 1);
+    }
+
+    /** Threads per attention workgroup: one per head dimension, up to 128. */
+    private int attnLocalSize() {
+        return Math.min(config.headSize(), 128);
+    }
+
+    /** Attention workgroups per (row, head): one per split under split-K, else one. */
+    private int attnGroupsPerHead() {
+        return attnPartials != null ? kvSplits : 1;
     }
 
     public List<ImmutableTaskGraph> getLayerImmutableTaskGraphs() {
