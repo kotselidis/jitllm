@@ -1461,20 +1461,20 @@ public class TransformerRaggedBatchKernels {
     public static final int MID_ROWS = 32;
 
     /** Output columns one {@link #gemmMMAMid} workgroup computes. */
-    public static final int MID_COLS_PER_GROUP = 64;
+    public static final int MID_COLS_PER_GROUP = 32;
 
     /**
      * Tensor-core GEMM for a step of {@link #SKINNY_ROWS} + 1 to {@link #MID_ROWS} tokens: {@code
      * C[t, colOffset + n] = sum_k X[t, k] * W[n, k]} for {@code t < rows}.
      *
-     * <p>{@code gemmMMA} with a 32 x 64 tile instead of 128 x 128 and four warps instead of eight:
+     * <p>{@code gemmMMA} with a 32 x 32 tile instead of 128 x 128 and four warps instead of eight:
      * the same staging, software pipeline and m16n8k16 sequence per output value, in the same
      * ascending K order, so every value is the same bits — the engine can pick it by the step's
      * size without breaking batch invariance. A few-dozen-row step stops paying for 128 rows, and
      * the narrower tile gives the weights-bound products four times as many workgroups.
      *
      * <p>Does nothing unless {@code SKINNY_ROWS < stepRows[0] <= MID_ROWS} and {@code stepRows[1]}
-     * is set. Worker: {@code WorkerGrid2D(128, N / 64)} for one 32-row tile, local (128, 1, 1).
+     * is set. Worker: {@code WorkerGrid2D(128, N / 32)} for one 32-row tile, local (128, 1, 1).
      *
      * @param ldc row stride of {@code C}
      * @param colOffset first column of {@code C} this product writes, for packed outputs
@@ -1496,15 +1496,13 @@ public class TransformerRaggedBatchKernels {
         int warpId = tid / 32;
         int warpM = warpId / 2;
         int warpN = warpId % 2;
-        int blockCol = 64 * ctx.groupIdy;
+        int blockCol = MID_COLS_PER_GROUP * ctx.groupIdy;
 
         int[] aTile = ctx.allocateIntLocalArray(32 * 16 / 2);
-        int[] bTile = ctx.allocateIntLocalArray(16 * 64 / 2);
+        int[] bTile = ctx.allocateIntLocalArray(16 * 32 / 2);
 
         float[] c0 = ctx.mmaFragment(0.0f);
         float[] c1 = ctx.mmaFragment(0.0f);
-        float[] c2 = ctx.mmaFragment(0.0f);
-        float[] c3 = ctx.mmaFragment(0.0f);
 
         // Staging as gemmMMA's: A idx = row * 8 + kPair; B idx = sub * 64 + kRow * 4 + colPair.
         int aIdx0 = tid;
@@ -1515,23 +1513,15 @@ public class TransformerRaggedBatchKernels {
         int gB0 = (blockCol + ((bIdx0 >>> 6) << 3) + ((bIdx0 & 3) << 1)) * K + ((bIdx0 & 63) >>> 2);
         int bIdx1 = tid + 128;
         int gB1 = (blockCol + ((bIdx1 >>> 6) << 3) + ((bIdx1 & 3) << 1)) * K + ((bIdx1 & 63) >>> 2);
-        int bIdx2 = tid + 256;
-        int gB2 = (blockCol + ((bIdx2 >>> 6) << 3) + ((bIdx2 & 3) << 1)) * K + ((bIdx2 & 63) >>> 2);
-        int bIdx3 = tid + 384;
-        int gB3 = (blockCol + ((bIdx3 >>> 6) << 3) + ((bIdx3 & 3) << 1)) * K + ((bIdx3 & 63) >>> 2);
 
         int aReg0 = packHalves(A, gA0, gA0 + 1);
         int aReg1 = packHalves(A, gA1, gA1 + 1);
         int bReg0 = packHalves(B, gB0, gB0 + K);
         int bReg1 = packHalves(B, gB1, gB1 + K);
-        int bReg2 = packHalves(B, gB2, gB2 + K);
-        int bReg3 = packHalves(B, gB3, gB3 + K);
         aTile[aIdx0] = aReg0;
         aTile[aIdx1] = aReg1;
         bTile[bIdx0] = bReg0;
         bTile[bIdx1] = bReg1;
-        bTile[bIdx2] = bReg2;
-        bTile[bIdx3] = bReg3;
         ctx.localBarrier();
 
         int numKSteps = K / 16;
@@ -1542,38 +1532,28 @@ public class TransformerRaggedBatchKernels {
                 aReg1 = packHalves(A, gA1 + kOff, gA1 + kOff + 1);
                 bReg0 = packHalves(B, gB0 + kOff, gB0 + kOff + K);
                 bReg1 = packHalves(B, gB1 + kOff, gB1 + kOff + K);
-                bReg2 = packHalves(B, gB2 + kOff, gB2 + kOff + K);
-                bReg3 = packHalves(B, gB3 + kOff, gB3 + kOff + K);
             }
             HalfFloat[] a0 = ctx.mmaLoadA(aTile, 16, warpM * 512);
-            int bBase = warpN * 4;
+            int bBase = warpN * 2;
             HalfFloat[] b0 = ctx.mmaLoadB(bTile, 16, (bBase + 0) * 256);
             HalfFloat[] b1 = ctx.mmaLoadB(bTile, 16, (bBase + 1) * 256);
-            HalfFloat[] b2 = ctx.mmaLoadB(bTile, 16, (bBase + 2) * 256);
-            HalfFloat[] b3 = ctx.mmaLoadB(bTile, 16, (bBase + 3) * 256);
             ctx.localBarrier();
             if (kStep + 1 < numKSteps) {
                 aTile[aIdx0] = aReg0;
                 aTile[aIdx1] = aReg1;
                 bTile[bIdx0] = bReg0;
                 bTile[bIdx1] = bReg1;
-                bTile[bIdx2] = bReg2;
-                bTile[bIdx3] = bReg3;
             }
             c0 = ctx.mma(a0, b0, c0, MMAShape.M16N8K16);
             c1 = ctx.mma(a0, b1, c1, MMAShape.M16N8K16);
-            c2 = ctx.mma(a0, b2, c2, MMAShape.M16N8K16);
-            c3 = ctx.mma(a0, b3, c3, MMAShape.M16N8K16);
             ctx.localBarrier();
         }
 
         // Rows past the step are padding; the 32-row tile is stored whole, as gemmMMA does.
         int rBase = warpM * 16;
-        int cBase = colOffset + blockCol + warpN * 32;
+        int cBase = colOffset + blockCol + warpN * 16;
         ctx.mmaStore(c0, C, rBase, cBase + 0, ldc);
         ctx.mmaStore(c1, C, rBase, cBase + 8, ldc);
-        ctx.mmaStore(c2, C, rBase, cBase + 16, ldc);
-        ctx.mmaStore(c3, C, rBase, cBase + 24, ldc);
     }
 
     /**
