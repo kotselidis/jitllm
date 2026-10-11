@@ -61,6 +61,16 @@ public final class OpenAIServer implements AutoCloseable {
             return false;
         }
 
+        /** Whether {@code ignore_eos} can be honoured; the session path has no such option. */
+        default boolean supportsIgnoreEos() {
+            return false;
+        }
+
+        /** The {@code /metrics} body, or {@code null} when this path keeps no serving metrics. */
+        default String metricsText() {
+            return null;
+        }
+
         @Override
         void close();
     }
@@ -133,6 +143,16 @@ public final class OpenAIServer implements AutoCloseable {
             @Override
             public boolean greedyOnly() {
                 return true;
+            }
+
+            @Override
+            public boolean supportsIgnoreEos() {
+                return true;
+            }
+
+            @Override
+            public String metricsText() {
+                return delegate.metricsText();
             }
 
             @Override
@@ -351,7 +371,8 @@ public final class OpenAIServer implements AutoCloseable {
                             options.batchSlots(),
                             options.maxQueuedRequests(),
                             contextLength,
-                            options.prefixCacheEntries());
+                            options.prefixCacheEntries(),
+                            served);
             server = new OpenAIServer(service, served, config.gpu(), contextLength);
             try {
                 if (StartupDiagnostics.verbose()) {
@@ -437,7 +458,10 @@ public final class OpenAIServer implements AutoCloseable {
         http.createContext("/v1/chat/completions", ex -> handleCompletion(ex, true));
         http.createContext("/v1/completions", ex -> handleCompletion(ex, false));
         http.createContext("/v1/systemone", this::handleSystemOne);
-        httpWorkers = Executors.newFixedThreadPool(8);
+        http.createContext("/metrics", this::handleMetrics);
+        // A request holds its thread until it finishes, so a fixed pool capped the requests in
+        // flight at the pool size however many batch slots were free. One virtual thread each.
+        httpWorkers = Executors.newVirtualThreadPerTaskExecutor();
         http.setExecutor(httpWorkers);
         http.start();
         String bound = http.getAddress().getAddress().getHostAddress();
@@ -544,6 +568,7 @@ public final class OpenAIServer implements AutoCloseable {
               <ul>
                 <li><code>GET  /health</code> — liveness check</li>
                 <li><code>GET  /v1/models</code> — list the served model</li>
+                <li><code>GET  /metrics</code> — Prometheus serving metrics (continuous batching only)</li>
                 <li><code>POST /v1/chat/completions</code> — chat completions (supports <code>"stream": true</code> SSE)</li>
                 <li><code>POST /v1/completions</code> — text completions (supports <code>"stream": true</code> SSE)</li>
               </ul>
@@ -567,6 +592,25 @@ public final class OpenAIServer implements AutoCloseable {
 
     private void handleHealth(HttpExchange ex) throws IOException {
         sendJson(ex, 200, Map.of("status", "ok"));
+    }
+
+    /** {@code GET /metrics}: Prometheus text, on the continuous-batching path only. */
+    private void handleMetrics(HttpExchange ex) throws IOException {
+        String text = service.metricsText();
+        if (text == null) {
+            sendError(
+                    ex,
+                    501,
+                    "/metrics is available with --continuous-batching only; the per-request path"
+                            + " keeps no serving metrics");
+            return;
+        }
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+        ex.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(bytes);
+        }
     }
 
     private void handleModels(HttpExchange ex) throws IOException {
@@ -630,12 +674,18 @@ public final class OpenAIServer implements AutoCloseable {
         float topP = (float) Json.num(body, "top_p", 0.95);
         long seed = (long) Json.num(body, "seed", 1234);
         boolean stream = Json.bool(body, "stream", false);
+        boolean ignoreEos = Json.bool(body, "ignore_eos", false);
+        boolean includeUsage =
+                body.get("stream_options") instanceof Map<?, ?> streamOptions
+                        && Json.bool((Map<String, Object>) streamOptions, "include_usage", false);
 
         String requestedModel = Json.str(body, "model", null);
         int promptChars = promptCharacters(messages);
         String path = chat ? "POST /v1/chat/completions" : "POST /v1/completions";
 
-        var req = new InferenceService.Request(messages, maxTokens, temperature, topP, seed);
+        var req =
+                new InferenceService.Request(
+                        messages, maxTokens, temperature, topP, seed, ignoreEos);
         String id = (chat ? "chatcmpl-" : "cmpl-") + seq.incrementAndGet();
         long created = System.currentTimeMillis() / 1000;
         String summary = requestSummary(id, path, requestedModel, promptChars, maxTokens, stream);
@@ -644,6 +694,9 @@ public final class OpenAIServer implements AutoCloseable {
                 validationError(requestedModel, servedModel, maxTokens, promptChars, contextLength);
         if (rejection == null && service.greedyOnly() && temperature != 0.0f) {
             rejection = "Continuous batching currently requires temperature=0 (greedy sampling)";
+        }
+        if (rejection == null && ignoreEos && !service.supportsIgnoreEos()) {
+            rejection = "ignore_eos is supported with --continuous-batching only";
         }
         if (rejection != null) {
             System.err.println(summary + " -> 400 " + rejection);
@@ -655,7 +708,7 @@ public final class OpenAIServer implements AutoCloseable {
         long startNanos = System.nanoTime();
         try {
             if (stream) {
-                streamResponse(ex, req, id, created, chat);
+                streamResponse(ex, req, id, created, chat, includeUsage);
             } else {
                 fullResponse(ex, req, id, created, chat);
             }
@@ -710,19 +763,19 @@ public final class OpenAIServer implements AutoCloseable {
         resp.put("created", created);
         resp.put("model", servedModel);
         resp.put("choices", List.of(choice));
-        resp.put(
-                "usage",
-                Map.of(
-                        "prompt_tokens", r.promptTokens(),
-                        "completion_tokens", r.completionTokens(),
-                        "total_tokens", r.promptTokens() + r.completionTokens()));
+        resp.put("usage", usage(r));
         sendJson(ex, 200, resp);
     }
 
     // ── Streaming (Server-Sent Events) ────────────────────────────────────────
 
     private void streamResponse(
-            HttpExchange ex, InferenceService.Request req, String id, long created, boolean chat)
+            HttpExchange ex,
+            InferenceService.Request req,
+            String id,
+            long created,
+            boolean chat,
+            boolean includeUsage)
             throws IOException {
         ex.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
         ex.getResponseHeaders().set("Cache-Control", "no-cache");
@@ -756,6 +809,12 @@ public final class OpenAIServer implements AutoCloseable {
                             });
             String finish = r.stopped() ? "stop" : "length";
             writeSse(os, chunk(id, object, created, chat ? Map.of() : textField(""), finish));
+            if (includeUsage) {
+                // OpenAI's stream_options.include_usage: one more chunk, no choices, real counts.
+                // A load generator reads the token totals from it instead of re-tokenizing the
+                // text with a tokenizer that may not match the model's.
+                writeSse(os, usageChunk(id, object, created, r));
+            }
             os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
             os.flush();
         } catch (Exception e) {
@@ -763,6 +822,25 @@ public final class OpenAIServer implements AutoCloseable {
         } finally {
             os.close();
         }
+    }
+
+    private String usageChunk(String id, String object, long created, InferenceService.Result r) {
+        Map<String, Object> obj = new LinkedHashMap<>();
+        obj.put("id", id);
+        obj.put("object", object);
+        obj.put("created", created);
+        obj.put("model", servedModel);
+        obj.put("choices", List.of());
+        obj.put("usage", usage(r));
+        return Json.write(obj);
+    }
+
+    static Map<String, Object> usage(InferenceService.Result r) {
+        Map<String, Object> usage = new LinkedHashMap<>();
+        usage.put("prompt_tokens", r.promptTokens());
+        usage.put("completion_tokens", r.completionTokens());
+        usage.put("total_tokens", r.promptTokens() + r.completionTokens());
+        return usage;
     }
 
     private Map<String, Object> roleDelta() {
