@@ -771,7 +771,8 @@ def create_parser(command=None) -> argparse.ArgumentParser:
     advanced_group.add_argument("--max-batched-tokens", type=int, default=None, metavar="N",
                                 help="[experimental] (serve) Tokens one --continuous-batching step "
                                      "carries, at least SLOTS; prompts are fed in chunks next to "
-                                     "decode tokens. FP16 Llama only. Default: one token per request")
+                                     "decode tokens; 512 is a good start. FP16 Llama only. Default: one "
+                                     "token per request")
 
     # Removed: parsed only to refuse it with the migration.
     parser.add_argument("--fp16-kv-cache", action="store_true", help=argparse.SUPPRESS)
