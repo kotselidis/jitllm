@@ -210,4 +210,68 @@ public class ChunkedPrefillTest {
     private static int steps(FakeBatchExecutor executor) {
         return executor.activeCountsPerStep.size();
     }
+
+    /**
+     * A backend that throws mid-step must fail that step's requests, cause attached, rather than
+     * kill the engine and leave every caller waiting.
+     */
+    @Test
+    public void aBackendFailureFailsTheStepsRequestsAndTheEngineCarriesOn() throws Exception {
+        try (KvCacheManager manager = manager(2)) {
+            RuntimeException boom = new IllegalStateException("kernel failed to compile");
+            RaggedFakeExecutor working = new RaggedFakeExecutor(2, 64, 64);
+            boolean[] broken = {true};
+            org.beehive.jitllm.runtime.batch.BatchExecutor executor =
+                    new org.beehive.jitllm.runtime.batch.BatchExecutor() {
+                        @Override
+                        public int maxBatchSize() {
+                            return 2;
+                        }
+
+                        @Override
+                        public int maxTokensPerStep() {
+                            return 64;
+                        }
+
+                        @Override
+                        public int maxTokensPerSequence() {
+                            return 64;
+                        }
+
+                        @Override
+                        public org.beehive.jitllm.runtime.batch.StepOutput execute(
+                                org.beehive.jitllm.runtime.batch.TokenBatch batch) {
+                            if (broken[0]) {
+                                throw boom;
+                            }
+                            return working.execute(batch);
+                        }
+
+                        @Override
+                        public int[] decodeStep(org.beehive.jitllm.runtime.batch.BatchSlots b) {
+                            throw new AssertionError();
+                        }
+
+                        @Override
+                        public boolean isStopToken(int token) {
+                            return false;
+                        }
+                    };
+            try (LLMEngine engine =
+                    new LLMEngine(TestModels.sharedKvCapable(), manager, executor, 2, 8)) {
+                RequestHandle failed = engine.addRequest(prompt(10, 11), 4, null);
+
+                assertEquals("nothing advanced", 0, engine.step());
+                assertEquals(RequestState.FAILED, failed.state());
+                assertTrue("the cause is kept", failed.failure() == boom);
+                failed.await(); // signalled, not left waiting
+                assertEquals("its slot and lease went back", 0, manager.liveLeases());
+
+                broken[0] = false;
+                RequestHandle next = engine.addRequest(prompt(10, 12), 4, null);
+                drain(engine, List.of(next));
+                assertEquals(RequestState.COMPLETED, next.state());
+            }
+        }
+    }
 }

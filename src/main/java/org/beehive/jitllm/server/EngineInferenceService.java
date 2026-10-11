@@ -276,7 +276,15 @@ public final class EngineInferenceService implements AutoCloseable {
     /** The single caller of {@code step()}. */
     private void drive() {
         while (running) {
-            int advanced = engine.step();
+            int advanced;
+            try {
+                advanced = engine.step();
+            } catch (RuntimeException | Error failure) {
+                // The engine already failed the requests it could; a dead driver would leave
+                // every later request waiting, so report it and keep stepping.
+                System.err.println("[engine] step failed: " + failure);
+                advanced = 0;
+            }
             if (advanced == 0) {
                 // Nothing to do. Park briefly rather than spinning a core against an empty queue;
                 // a submission will have work ready by the next pass.
