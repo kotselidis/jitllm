@@ -4,11 +4,14 @@ import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import org.beehive.jitllm.backend.tornado.kernels.Int8GemmKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerRaggedBatchKernels;
 import org.beehive.jitllm.backend.tornado.kv.TornadoKvStore;
 import org.beehive.jitllm.backend.tornado.layers.type.fp16.decode.LlamaFP16LayersBatchDecodeMMA;
+import org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LlamaQ8_0LayersRagged;
 import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillActivation;
+import org.beehive.jitllm.backend.tornado.workspace.TornadoWorkspaces;
 import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.state.State;
 import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
@@ -20,6 +23,7 @@ import org.beehive.jitllm.runtime.batch.BatchSlots;
 import org.beehive.jitllm.runtime.batch.StepOutput;
 import org.beehive.jitllm.runtime.batch.TokenBatch;
 import org.beehive.jitllm.runtime.kv.KvStorage;
+import org.beehive.jitllm.runtime.tensor.DataType;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.KernelContext;
@@ -30,6 +34,7 @@ import uk.ac.manchester.tornado.api.WorkerGrid1D;
 import uk.ac.manchester.tornado.api.WorkerGrid2D;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.types.HalfFloat;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
@@ -93,7 +98,18 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
     private final long dimBytes;
     private final TornadoKvStore store;
 
-    private final LlamaFP16LayersBatchDecodeMMA layers;
+    private final RaggedLayers layers;
+
+    /** Q8_0 weights: int8 tensor-core projections, embeddings decoded on the host. */
+    private final boolean q8;
+
+    // Q8_0: the token embedding table, and the activation rows it is decoded into.
+    private final ByteArray embeddingQ8;
+    private final HalfFloatArray embeddingHalf;
+    private final FloatArray activationRows;
+
+    // Q8_0: sampling rows the int8 vocabulary GEMM computes, in [1] as the int8 kernels read it.
+    private final IntArray logitsRowsInt8;
     private final WorkerGrid activationGrid;
 
     /**
@@ -123,7 +139,12 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         }
         if (!(state instanceof LlamaState llamaState)
                 || !(config instanceof LlamaConfiguration llamaConfig)) {
-            throw new IllegalArgumentException("Ragged batching supports FP16 Llama only so far");
+            throw new IllegalArgumentException("Ragged batching supports Llama only so far");
+        }
+        DataType projections = ((LlamaTornadoWeights) model.weights()).wqLayered[0].dataType();
+        if (projections != DataType.F16 && projections != DataType.Q8_0) {
+            throw new IllegalArgumentException(
+                    "Ragged batching supports FP16 and Q8_0 Llama weights, got " + projections);
         }
         if (!(storage instanceof TornadoKvStore kvStore) || kvStore.keyPoolFP16() == null) {
             throw new IllegalArgumentException(
@@ -143,6 +164,7 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         }
         this.maxSequences = maxSequences;
         this.maxRows = maxRows;
+        this.q8 = projections == DataType.Q8_0;
         this.store = kvStore;
         this.dim = config.dim();
         this.stopTokens = model.chatFormat().getStopTokens();
@@ -158,6 +180,7 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         this.sampleRows.init(-1);
         this.sampledTokens = new IntArray(paddedSequences);
         this.logitsRows = new IntArray(2); // [1] = 0: the vocabulary GEMM has no mid kernel
+        this.logitsRowsInt8 = new IntArray(2);
         this.vocabSize = vocab;
         FloatArray gathered = new FloatArray(maxSequences * dim);
         FloatArray finalScale = new FloatArray(maxSequences);
@@ -165,26 +188,42 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         normedFinalFP16.init(new HalfFloat(0.0f));
         FloatArray logits = new FloatArray(paddedSequences * vocab);
 
-        BatchPrefillActivation activation =
-                new BatchPrefillActivation(state, config, maxRows, false);
+        BatchPrefillActivation activation = new BatchPrefillActivation(state, config, maxRows, q8);
         this.layers =
-                new LlamaFP16LayersBatchDecodeMMA(
-                        llamaState,
-                        weights,
-                        llamaConfig,
-                        maxRows,
-                        blocksPerSlot * kvStore.blockSizeTokens(),
-                        kvStore.keyPoolFP16(),
-                        kvStore.valuePoolFP16(),
-                        rowPositions,
-                        kvStore.blockTable(),
-                        kvStore.blockSizeTokens(),
-                        blocksPerSlot,
-                        rowSlots);
+                q8
+                        ? new LlamaQ8_0LayersRagged(
+                                llamaState,
+                                weights,
+                                llamaConfig,
+                                maxRows,
+                                blocksPerSlot * kvStore.blockSizeTokens(),
+                                kvStore.keyPoolFP16(),
+                                kvStore.valuePoolFP16(),
+                                rowPositions,
+                                kvStore.blockTable(),
+                                kvStore.blockSizeTokens(),
+                                blocksPerSlot,
+                                rowSlots)
+                        : new LlamaFP16LayersBatchDecodeMMA(
+                                llamaState,
+                                weights,
+                                llamaConfig,
+                                maxRows,
+                                blocksPerSlot * kvStore.blockSizeTokens(),
+                                kvStore.keyPoolFP16(),
+                                kvStore.valuePoolFP16(),
+                                rowPositions,
+                                kvStore.blockTable(),
+                                kvStore.blockSizeTokens(),
+                                blocksPerSlot,
+                                rowSlots);
         List<ImmutableTaskGraph> layerGraphs = layers.getLayerImmutableTaskGraphs();
 
         KernelContext logitsContext = new KernelContext();
-        HalfFloatArray wclsHalf = weights.wclsByteArray.asHalfFloatArray();
+        HalfFloatArray wclsHalf = q8 ? null : weights.wclsByteArray.asHalfFloatArray();
+        ByteArray logitsQ8 = q8 ? TornadoWorkspaces.bytes(paddedSequences * dim) : null;
+        FloatArray logitsQ8Scales =
+                q8 ? TornadoWorkspaces.floats(paddedSequences * dim / 32) : null;
         FloatArray rmsFinal = weights.rms_final_weight_as_floatArray.asFloatArray();
         // Gather the sampling rows, then the final norm, the vocabulary GEMM and greedy argmax
         // over B rows; only B token ids cross to the host.
@@ -192,14 +231,17 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
                 new TaskGraph("raggedLogits")
                         .consumeFromDevice(
                                 layers.getLastLayerTaskGraphID(), state.workspace.wrapXBatch)
-                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, sampleRows, logitsRows)
+                        .transferToDevice(
+                                DataTransferMode.EVERY_EXECUTION,
+                                sampleRows,
+                                logitsRows,
+                                logitsRowsInt8)
                         .transferToDevice(
                                 DataTransferMode.FIRST_EXECUTION,
                                 logitsContext,
                                 gathered,
                                 finalScale,
                                 normedFinalFP16,
-                                wclsHalf,
                                 rmsFinal,
                                 sampledTokens)
                         .task(
@@ -227,37 +269,75 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
                                 gathered,
                                 rmsFinal,
                                 finalScale,
-                                dim)
-                        .task(
-                                "vocab",
-                                TransformerRaggedBatchKernels::gemmMMAGuarded,
-                                logitsContext,
-                                logitsRows,
-                                normedFinalFP16,
-                                wclsHalf,
-                                logits,
-                                paddedSequences,
-                                vocab,
-                                dim)
-                        .task(
-                                "vocab_skinny",
-                                TransformerRaggedBatchKernels::gemmMMASkinny,
-                                logitsContext,
-                                normedFinalFP16,
-                                wclsHalf,
-                                logits,
-                                logitsRows,
-                                dim,
-                                vocab,
-                                0)
-                        .task(
-                                "argmax",
-                                TransformerBatchPrefillKernels::batchedArgmaxLogits,
-                                logitsContext,
-                                logits,
-                                sampledTokens,
-                                vocab)
-                        .transferToHost(DataTransferMode.EVERY_EXECUTION, sampledTokens);
+                                dim);
+        if (q8) {
+            // Q8_0: the vocabulary projection on the int8 GEMM, its weight through the repack.
+            state.workspace.packedRepack.upload(logitsGraph, weights.wclsByteArray);
+            logitsGraph
+                    .transferToDevice(DataTransferMode.FIRST_EXECUTION, logitsQ8, logitsQ8Scales)
+                    .task(
+                            "vocab_q8",
+                            Int8GemmKernels::quantizeActivationsQ8WarpFP16,
+                            logitsContext,
+                            normedFinalFP16,
+                            logitsQ8,
+                            logitsQ8Scales,
+                            paddedSequences * dim)
+                    .task(
+                            "vocab",
+                            weights.wclsByteArray.isPackedQ8()
+                                    ? Int8GemmKernels::gemmInt8Q8_0Packed
+                                    : Int8GemmKernels::gemmInt8Q8_0,
+                            logitsContext,
+                            logitsQ8,
+                            logitsQ8Scales,
+                            weights.wclsByteArray.asByteArray(),
+                            logits,
+                            logits,
+                            paddedSequences,
+                            vocab,
+                            dim,
+                            Int8GemmKernels.EPILOGUE_STORE,
+                            logits,
+                            1,
+                            logitsRowsInt8,
+                            vocab,
+                            0);
+        } else {
+            logitsGraph.transferToDevice(DataTransferMode.FIRST_EXECUTION, wclsHalf);
+            logitsGraph
+                    .task(
+                            "vocab",
+                            TransformerRaggedBatchKernels::gemmMMAGuarded,
+                            logitsContext,
+                            logitsRows,
+                            normedFinalFP16,
+                            wclsHalf,
+                            logits,
+                            paddedSequences,
+                            vocab,
+                            dim)
+                    .task(
+                            "vocab_skinny",
+                            TransformerRaggedBatchKernels::gemmMMASkinny,
+                            logitsContext,
+                            normedFinalFP16,
+                            wclsHalf,
+                            logits,
+                            logitsRows,
+                            dim,
+                            vocab,
+                            0);
+        }
+        logitsGraph
+                .task(
+                        "argmax",
+                        TransformerBatchPrefillKernels::batchedArgmaxLogits,
+                        logitsContext,
+                        logits,
+                        sampledTokens,
+                        vocab)
+                .transferToHost(DataTransferMode.EVERY_EXECUTION, sampledTokens);
 
         GridScheduler schedule = new GridScheduler();
         activation.updateGridScheduler(schedule);
@@ -269,11 +349,24 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         schedule.addWorkerGrid(
                 "raggedLogits.rms_reduce", worker(maxSequences * RMS_LOCAL, RMS_LOCAL));
         schedule.addWorkerGrid("raggedLogits.rms_apply", worker(maxSequences * dim, 256));
+        if (q8) {
+            schedule.addWorkerGrid("raggedLogits.vocab_q8", worker(maxSequences * dim, 256));
+            WorkerGrid2D vocabInt8 =
+                    new WorkerGrid2D(
+                            paddedSequences
+                                    / Int8GemmKernels.I8_BM
+                                    * Int8GemmKernels.Q8_GEMM_THREADS,
+                            vocab / Int8GemmKernels.I8_BN);
+            vocabInt8.setLocalWork(Int8GemmKernels.Q8_GEMM_THREADS, 1, 1);
+            schedule.addWorkerGrid("raggedLogits.vocab", vocabInt8);
+        }
         this.vocabGrid = mmaGrid(paddedSequences, vocab);
         this.vocabSkinnyGrid =
                 worker(vocab / TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP * 128, 128);
-        schedule.addWorkerGrid("raggedLogits.vocab", vocabGrid);
-        schedule.addWorkerGrid("raggedLogits.vocab_skinny", vocabSkinnyGrid);
+        if (!q8) {
+            schedule.addWorkerGrid("raggedLogits.vocab", vocabGrid);
+            schedule.addWorkerGrid("raggedLogits.vocab_skinny", vocabSkinnyGrid);
+        }
         schedule.addWorkerGrid("raggedLogits.argmax", worker(maxSequences * 256, 256));
         this.gridScheduler = schedule;
 
@@ -283,10 +376,17 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         all.add(logitsGraph.snapshot());
         this.layerCount = layerGraphs.size();
         this.logitsGraphIndex = 1 + layerCount;
+        var packedRepack = state.workspace.packedRepack.appendGraphs(all, schedule);
         this.plan = new TornadoExecutionPlan(all.toArray(new ImmutableTaskGraph[0]));
+        org.beehive.jitllm.backend.tornado.plan.PackedRepack.run(plan, packedRepack);
 
-        this.embeddingTable = weights.getTokenEmbeddingTable().asHalfFloatArray().getSegment();
-        this.embeddingBatch = state.workspace.embeddingXBatch.getSegment();
+        var table = weights.getTokenEmbeddingTable();
+        boolean tableQ8 = table.dataType() == DataType.Q8_0;
+        this.embeddingQ8 = q8 && tableQ8 ? table.asByteArray() : null;
+        this.embeddingHalf = q8 && !tableQ8 ? table.asHalfFloatArray() : null;
+        this.activationRows = q8 ? state.workspace.wrapXBatch : null;
+        this.embeddingTable = q8 ? null : table.asHalfFloatArray().getSegment();
+        this.embeddingBatch = q8 ? null : state.workspace.embeddingXBatch.getSegment();
         this.dimBytes = (long) dim * Short.BYTES;
     }
 
@@ -304,7 +404,7 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
                 "ragged-batch (chunked prefill)",
                 1,
                 "FP16",
-                "FP16 tensor-core MMA",
+                q8 ? "Q8_0 int8 tensor-core GEMM" : "FP16 tensor-core MMA",
                 "JIT kernels",
                 false,
                 false);
@@ -349,12 +449,16 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
                 throw new IllegalArgumentException(
                         "token " + r + " names KV slot " + slot + " of " + maxSequences);
             }
-            MemorySegment.copy(
-                    embeddingTable,
-                    batch.tokens()[r] * dimBytes,
-                    embeddingBatch,
-                    (long) r * dimBytes,
-                    dimBytes);
+            if (q8) {
+                decodeEmbedding(batch.tokens()[r], r);
+            } else {
+                MemorySegment.copy(
+                        embeddingTable,
+                        batch.tokens()[r] * dimBytes,
+                        embeddingBatch,
+                        (long) r * dimBytes,
+                        dimBytes);
+            }
             rowPositions.set(r, batch.positions()[r]);
             rowSlots.set(r, slot);
         }
@@ -398,23 +502,26 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
             tiles.set(2 * t + 1, 0);
         }
         layers.setActiveRows(activeRows, rows, tileCount);
+        logitsRowsInt8.set(1, sequences);
         // A few sampling sequences take the skinny vocabulary GEMM; the guarded 128-row one then
         // launches a single tile that returns at once. Disabled, the count reads as large.
         boolean smallVocab = skinnyVocab && sequences <= TransformerRaggedBatchKernels.SKINNY_ROWS;
         logitsRows.set(0, skinnyVocab ? sequences : Integer.MAX_VALUE);
         int paddedSequences = (maxSequences + 127) & ~127;
-        vocabGrid.setGlobalWork(
-                smallVocab ? 256 : paddedSequences / 128 * 256L,
-                smallVocab ? 1 : vocabSize / 128,
-                1);
-        vocabSkinnyGrid.setGlobalWork(
-                smallVocab
-                        ? (long) vocabSize
-                                / TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP
-                                * 128
-                        : 128,
-                1,
-                1);
+        if (!q8)
+            vocabGrid.setGlobalWork(
+                    smallVocab ? 256 : paddedSequences / 128 * 256L,
+                    smallVocab ? 1 : vocabSize / 128,
+                    1);
+        if (!q8)
+            vocabSkinnyGrid.setGlobalWork(
+                    smallVocab
+                            ? (long) vocabSize
+                                    / TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP
+                                    * 128
+                            : 128,
+                    1,
+                    1);
         activationGrid.setGlobalWork((long) activeRows * dim, 1, 1);
 
         plan.withGraph(0).withGridScheduler(gridScheduler).execute();
@@ -428,6 +535,23 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
             sampled[s] = sampledTokens.get(s);
         }
         return new StepOutput(sampled);
+    }
+
+    /** One token's embedding into activation row {@code row}, decoded to FP32 on the host. */
+    private void decodeEmbedding(int token, int row) {
+        int base = row * dim;
+        if (embeddingQ8 != null) {
+            int blocksPerRow = dim / 32;
+            for (int j = 0; j < dim; j++) {
+                int block = (token * blocksPerRow + j / 32) * 34;
+                float scale = embeddingQ8.getHalfFloat(block).getFloat32();
+                activationRows.set(base + j, embeddingQ8.get(block + 2 + j % 32) * scale);
+            }
+        } else {
+            for (int j = 0; j < dim; j++) {
+                activationRows.set(base + j, embeddingHalf.get(token * dim + j).getFloat32());
+            }
+        }
     }
 
     @Override

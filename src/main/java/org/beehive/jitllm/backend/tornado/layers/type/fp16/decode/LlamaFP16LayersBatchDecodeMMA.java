@@ -46,7 +46,8 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  * a padding row. Only the two KV-addressing kernels change, to their {@link
  * TransformerRaggedBatchKernels} twins; every other task already works row by row.
  */
-public class LlamaFP16LayersBatchDecodeMMA {
+public class LlamaFP16LayersBatchDecodeMMA
+        implements org.beehive.jitllm.backend.tornado.batch.RaggedLayers {
 
     static final int RMS_LOCAL_SIZE = 256;
 

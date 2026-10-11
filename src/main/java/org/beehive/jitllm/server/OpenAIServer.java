@@ -361,9 +361,14 @@ public final class OpenAIServer implements AutoCloseable {
             int contextLength =
                     resolveContextLength(
                             config.contextLength(), model.configuration().contextLength());
-            if (model.weights().dataType() != org.beehive.jitllm.runtime.tensor.DataType.F16) {
+            var weightType = model.weights().dataType();
+            boolean quantizedRagged =
+                    options.chunkedPrefill()
+                            && weightType == org.beehive.jitllm.runtime.tensor.DataType.Q8_0;
+            if (weightType != org.beehive.jitllm.runtime.tensor.DataType.F16 && !quantizedRagged) {
                 throw new IllegalArgumentException(
-                        "Continuous batching requires FP16 Llama/Qwen3 weights");
+                        "Continuous batching requires FP16 Llama/Qwen3 weights, or Q8_0 Llama with"
+                                + " --max-batched-tokens");
             }
             EngineInferenceService service =
                     new EngineInferenceService(
