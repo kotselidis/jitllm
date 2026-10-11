@@ -7,6 +7,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -41,6 +42,9 @@ public class LlamaTokenizer implements Tokenizer {
     private final Pattern compiledPattern;
     private final Vocabulary vocabulary;
     // model-specific fields
+    // a pair's priority is its rank in the merges list, lowest first, not the token it makes:
+    // 152403 of Llama 3's 280147 merges make a token that an earlier merge already makes
+    private final Map<Pair<Integer, Integer>, Integer> mergeRanks;
     private final Map<Pair<Integer, Integer>, Integer> merges;
     private final Map<String, Integer> specialTokens;
 
@@ -73,10 +77,14 @@ public class LlamaTokenizer implements Tokenizer {
 
         // init tokenizer object fields
         this.vocabulary = vocabulary;
-        this.compiledPattern = Pattern.compile(LLAMA_3_PATTERN);
+        // \s is Unicode White_Space and (?i) folds Unicode case, as in the Rust regex engines the
+        // pattern was written for: U+00A0 and U+3000 are spaces, 'ſ is a contraction
+        this.compiledPattern = Pattern.compile(LLAMA_3_PATTERN, Pattern.UNICODE_CHARACTER_CLASS);
         this.specialTokens = new HashMap<>(specialTokens);
+        this.mergeRanks = new HashMap<>();
         this.merges = new HashMap<>();
         for (Pair<Integer, Integer> pair : merges) {
+            this.mergeRanks.putIfAbsent(pair, this.mergeRanks.size());
             int firstIndex = pair.first();
             int secondIndex = pair.second();
             int mergeIndex =
@@ -246,6 +254,13 @@ public class LlamaTokenizer implements Tokenizer {
     }
 
     private List<Integer> encodeChunk(String chunk) {
+        // a chunk that is itself a token is that token, merges or not (ignore_merges in Hugging
+        // Face's tokenizer.json, as llama.cpp does for Llama 3): some tokens cannot be reached by
+        // the merges at all, " století" among them, which BPE would split into " sto", "let", "í"
+        OptionalInt whole = this.vocabulary.getIndex(chunk);
+        if (whole.isPresent()) {
+            return List.of(whole.getAsInt());
+        }
         // return the token ids
         // let's begin. first, convert all bytes to integers in range 0.255
         List<Integer> ids = new ArrayList<>();
@@ -255,14 +270,14 @@ public class LlamaTokenizer implements Tokenizer {
         }
 
         while (ids.size() >= 2) {
-            // find the pair with the lowest merge index
+            // find the pair with the lowest merge rank
             Map<Pair<Integer, Integer>, Integer> stats = getStats(ids);
             Pair<Integer, Integer> pair =
                     stats.keySet().stream()
                             .min(
                                     Comparator.comparingInt(
                                             key ->
-                                                    this.merges.getOrDefault(
+                                                    this.mergeRanks.getOrDefault(
                                                             key, Integer.MAX_VALUE)))
                             .orElseThrow();
             // subtle: if there are no more merges available, the key will
@@ -272,7 +287,7 @@ public class LlamaTokenizer implements Tokenizer {
             if (!this.merges.containsKey(pair)) {
                 break; // nothing else can be merged anymore
             }
-            // otherwise let's merge the best pair (lowest merge index)
+            // otherwise let's merge the best pair (lowest merge rank)
             int idx = this.merges.get(pair);
             ids = merge(ids, pair, idx);
         }
