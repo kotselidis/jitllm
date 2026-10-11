@@ -23,7 +23,31 @@ public record KvStorageRequest(
         int blockSizeTokens,
         int numberOfLayers,
         int kvDim,
-        boolean fp16KeyValue) {
+        boolean fp16KeyValue,
+        boolean wideAddressing) {
+
+    /**
+     * A pool addressed with 32-bit offsets, which every kernel can read: at most {@code
+     * Integer.MAX_VALUE} values.
+     */
+    public KvStorageRequest(
+            int totalBlocks,
+            int blocksPerSlot,
+            int maxSlots,
+            int blockSizeTokens,
+            int numberOfLayers,
+            int kvDim,
+            boolean fp16KeyValue) {
+        this(
+                totalBlocks,
+                blocksPerSlot,
+                maxSlots,
+                blockSizeTokens,
+                numberOfLayers,
+                kvDim,
+                fp16KeyValue,
+                false);
+    }
 
     public KvStorageRequest {
         if (totalBlocks <= 0

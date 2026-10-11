@@ -63,17 +63,36 @@ public final class TornadoKvStore implements KvStorage {
             int numLayers,
             int kvDim,
             boolean fp16) {
+        this(totalBlocks, blocksPerSlot, maxSlots, blockSizeTokens, numLayers, kvDim, fp16, false);
+    }
+
+    /**
+     * @param wideAddressing allow a pool past {@code Integer.MAX_VALUE} values. Only for kernels
+     *     that compute pool offsets in 64 bits — the ragged-batch ones; every other KV kernel
+     *     indexes with {@code int} and would wrap silently, so without it such a pool is refused
+     */
+    public TornadoKvStore(
+            int totalBlocks,
+            int blocksPerSlot,
+            int maxSlots,
+            int blockSizeTokens,
+            int numLayers,
+            int kvDim,
+            boolean fp16,
+            boolean wideAddressing) {
         // One block beyond the leasable range is the scratch block: inactive slots still run the
         // KV kernels every step, and their writes have to land somewhere no live sequence reads
         // (#129's arrangement). It is allocated here and never leased.
         this.scratchBlock = totalBlocks;
         long elements = (long) (totalBlocks + 1) * numLayers * blockSizeTokens * kvDim;
-        if (elements > Integer.MAX_VALUE) {
+        if (elements > Integer.MAX_VALUE && !(wideAddressing && fp16)) {
             throw new IllegalArgumentException(
                     "KV pool of "
                             + elements
-                            + " elements exceeds what a single TornadoVM array can address; reduce"
-                            + " maxConcurrentSessions or the context length");
+                            + " elements exceeds what 32-bit kernel offsets can address; reduce"
+                            + " maxConcurrentSessions or the context length, or serve with"
+                            + " --max-batched-tokens, whose kernels address the FP16 pool in 64"
+                            + " bits");
         }
         this.blockSizeTokens = blockSizeTokens;
         this.blocksPerSlot = blocksPerSlot;
@@ -81,7 +100,7 @@ public final class TornadoKvStore implements KvStorage {
         this.kvDim = kvDim;
         this.bytesPerBlock = 2L * kvDim * blockSizeTokens * numLayers * (fp16 ? 2L : 4L);
 
-        int size = (int) elements;
+        long size = elements;
         if (fp16) {
             this.keyPool = null;
             this.valuePool = null;
@@ -90,8 +109,8 @@ public final class TornadoKvStore implements KvStorage {
             this.keyPoolFP16.init(new HalfFloat(0.f));
             this.valuePoolFP16.init(new HalfFloat(0.f));
         } else {
-            this.keyPool = new FloatArray(size);
-            this.valuePool = new FloatArray(size);
+            this.keyPool = new FloatArray((int) size);
+            this.valuePool = new FloatArray((int) size);
             this.keyPool.init(0.f);
             this.valuePool.init(0.f);
             this.keyPoolFP16 = null;

@@ -19,6 +19,7 @@ public final class TornadoKvStorageFactory implements KvStorageFactory {
                 request.blockSizeTokens(),
                 request.numberOfLayers(),
                 request.kvDim(),
-                request.fp16KeyValue());
+                request.fp16KeyValue(),
+                request.wideAddressing());
     }
 }
