@@ -75,6 +75,19 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
     private final IntArray rowSlots;
     private final IntArray sampleRows;
     private final IntArray sampledTokens;
+
+    /**
+     * Sequences sampling this step, read on the device: at most {@link
+     * TransformerRaggedBatchKernels#SKINNY_ROWS} run the vocabulary projection on the skinny GEMM.
+     */
+    private final IntArray logitsRows;
+
+    private final boolean skinnyVocab =
+            !"false".equals(System.getProperty("jitllm.ragged.skinnyGemm"));
+
+    private final int vocabSize;
+    private WorkerGrid vocabGrid;
+    private WorkerGrid vocabSkinnyGrid;
     private final MemorySegment embeddingTable;
     private final MemorySegment embeddingBatch;
     private final long dimBytes;
@@ -144,6 +157,8 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         this.sampleRows = new IntArray(maxSequences);
         this.sampleRows.init(-1);
         this.sampledTokens = new IntArray(paddedSequences);
+        this.logitsRows = new IntArray(1);
+        this.vocabSize = vocab;
         FloatArray gathered = new FloatArray(maxSequences * dim);
         FloatArray finalScale = new FloatArray(maxSequences);
         HalfFloatArray normedFinalFP16 = new HalfFloatArray(paddedSequences * dim);
@@ -177,7 +192,7 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
                 new TaskGraph("raggedLogits")
                         .consumeFromDevice(
                                 layers.getLastLayerTaskGraphID(), state.workspace.wrapXBatch)
-                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, sampleRows)
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, sampleRows, logitsRows)
                         .transferToDevice(
                                 DataTransferMode.FIRST_EXECUTION,
                                 logitsContext,
@@ -215,14 +230,26 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
                                 dim)
                         .task(
                                 "vocab",
-                                TransformerBatchPrefillKernels::gemmMMA,
+                                TransformerRaggedBatchKernels::gemmMMAGuarded,
                                 logitsContext,
+                                logitsRows,
                                 normedFinalFP16,
                                 wclsHalf,
                                 logits,
                                 paddedSequences,
                                 vocab,
                                 dim)
+                        .task(
+                                "vocab_skinny",
+                                TransformerRaggedBatchKernels::gemmMMASkinny,
+                                logitsContext,
+                                normedFinalFP16,
+                                wclsHalf,
+                                logits,
+                                logitsRows,
+                                dim,
+                                vocab,
+                                0)
                         .task(
                                 "argmax",
                                 TransformerBatchPrefillKernels::batchedArgmaxLogits,
@@ -242,7 +269,11 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         schedule.addWorkerGrid(
                 "raggedLogits.rms_reduce", worker(maxSequences * RMS_LOCAL, RMS_LOCAL));
         schedule.addWorkerGrid("raggedLogits.rms_apply", worker(maxSequences * dim, 256));
-        schedule.addWorkerGrid("raggedLogits.vocab", mmaGrid(paddedSequences, vocab));
+        this.vocabGrid = mmaGrid(paddedSequences, vocab);
+        this.vocabSkinnyGrid =
+                worker(vocab / TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP * 128, 128);
+        schedule.addWorkerGrid("raggedLogits.vocab", vocabGrid);
+        schedule.addWorkerGrid("raggedLogits.vocab_skinny", vocabSkinnyGrid);
         schedule.addWorkerGrid("raggedLogits.argmax", worker(maxSequences * 256, 256));
         this.gridScheduler = schedule;
 
@@ -336,6 +367,23 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         }
         int activeRows = trimRows ? Math.min(maxRows, (rows + 15) & ~15) : maxRows;
         layers.setActiveRows(activeRows, rows);
+        // A few sampling sequences take the skinny vocabulary GEMM; the guarded 128-row one then
+        // launches a single tile that returns at once. Disabled, the count reads as large.
+        boolean smallVocab = skinnyVocab && sequences <= TransformerRaggedBatchKernels.SKINNY_ROWS;
+        logitsRows.set(0, skinnyVocab ? sequences : Integer.MAX_VALUE);
+        int paddedSequences = (maxSequences + 127) & ~127;
+        vocabGrid.setGlobalWork(
+                smallVocab ? 256 : paddedSequences / 128 * 256L,
+                smallVocab ? 1 : vocabSize / 128,
+                1);
+        vocabSkinnyGrid.setGlobalWork(
+                smallVocab
+                        ? (long) vocabSize
+                                / TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP
+                                * 128
+                        : 128,
+                1,
+                1);
         activationGrid.setGlobalWork((long) activeRows * dim, 1, 1);
 
         plan.withGraph(0).withGridScheduler(gridScheduler).execute();
