@@ -91,6 +91,16 @@ public class LlamaFP16LayersBatchDecodeMMA {
 
     // Split-K partial results: per (row, head, split), headSize values plus max and sum.
     private final FloatArray attnPartials;
+
+    /**
+     * Steps of at most {@link TransformerRaggedBatchKernels#SKINNY_ROWS} tokens run their
+     * projections on the skinny tensor-core GEMM instead of the 128-row one. Same output bits.
+     */
+    private final boolean skinnyGemm =
+            !"false".equals(System.getProperty("jitllm.ragged.skinnyGemm"));
+
+    // The step's real token count, read on the device to pick the GEMM; ragged mode only.
+    private final IntArray stepRows;
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
 
@@ -106,6 +116,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private WorkerGrid mmaGateUpWorker;
     private WorkerGrid ewDimWorker;
     private WorkerGrid ewHidWorker;
+    private WorkerGrid skinnyDimWorker;
+    private WorkerGrid skinnyKvWorker;
+    private WorkerGrid skinnyHidWorker;
 
     public LlamaFP16LayersBatchDecodeMMA(
             LlamaState state,
@@ -203,6 +216,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
         if (rowSlots != null && (!paged || keyCacheBatchFP16 == null)) {
             throw new IllegalArgumentException("ragged rows need a paged FP16 key/value pool");
         }
+        this.stepRows = rowSlots != null ? new IntArray(1) : null;
         this.attnPartials =
                 rowSlots != null && splitKv
                         ? new FloatArray(
@@ -232,7 +246,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 g.transferToDevice(DataTransferMode.EVERY_EXECUTION, blockTable);
             }
             if (rowSlots != null) {
-                g.transferToDevice(DataTransferMode.EVERY_EXECUTION, rowSlots);
+                g.transferToDevice(DataTransferMode.EVERY_EXECUTION, rowSlots, stepRows);
             }
             if (attnPartials != null) {
                 g.transferToDevice(DataTransferMode.FIRST_EXECUTION, attnPartials);
@@ -259,7 +273,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 g.consumeFromDevice(pred, context, blockTable);
             }
             if (rowSlots != null) {
-                g.consumeFromDevice(pred, context, rowSlots);
+                g.consumeFromDevice(pred, context, rowSlots, stepRows);
             }
             if (attnPartials != null) {
                 g.consumeFromDevice(pred, context, attnPartials);
@@ -319,19 +333,66 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 state.workspace.attnScaleBatch,
                 dim);
 
-        g.task(
-                "qkvProj",
-                TransformerBatchPrefillKernels::gemmMMAQKV,
-                context,
-                state.workspace.wrapXbFP16Batch,
-                weights.wqLayered[layerIndex].asHalfFloatArray(),
-                weights.wkLayered[layerIndex].asHalfFloatArray(),
-                weights.wvLayered[layerIndex].asHalfFloatArray(),
-                state.workspace.qkvResultBatch,
-                paddedBatch,
-                dim,
-                kvDim,
-                dim);
+        if (skinny()) {
+            g.task(
+                    "qkvProj",
+                    TransformerRaggedBatchKernels::gemmMMAQKVGuarded,
+                    context,
+                    stepRows,
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wqLayered[layerIndex].asHalfFloatArray(),
+                    weights.wkLayered[layerIndex].asHalfFloatArray(),
+                    weights.wvLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    paddedBatch,
+                    dim,
+                    kvDim,
+                    dim);
+        } else {
+            g.task(
+                    "qkvProj",
+                    TransformerBatchPrefillKernels::gemmMMAQKV,
+                    context,
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wqLayered[layerIndex].asHalfFloatArray(),
+                    weights.wkLayered[layerIndex].asHalfFloatArray(),
+                    weights.wvLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    paddedBatch,
+                    dim,
+                    kvDim,
+                    dim);
+        }
+        if (skinny()) {
+            int qkvStride = dim + 2 * kvDim;
+            skinnyTask(
+                    g,
+                    "qProj_skinny",
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wqLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    dim,
+                    qkvStride,
+                    0);
+            skinnyTask(
+                    g,
+                    "kProj_skinny",
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wkLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    dim,
+                    qkvStride,
+                    dim);
+            skinnyTask(
+                    g,
+                    "vProj_skinny",
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wvLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    dim,
+                    qkvStride,
+                    dim + kvDim);
+        }
 
         // DECODE: per-slot position + per-slot KV region (paged via block table, or contiguous).
         if (paged) {
@@ -515,16 +576,41 @@ public class LlamaFP16LayersBatchDecodeMMA {
                     dim);
         }
 
-        g.task(
-                "woProj",
-                TransformerBatchPrefillKernels::gemmMMA,
-                context,
-                state.workspace.attnOutFP16,
-                weights.woLayered[layerIndex].asHalfFloatArray(),
-                state.workspace.woOut,
-                paddedBatch,
-                dim,
-                dim);
+        if (skinny()) {
+            g.task(
+                    "woProj",
+                    TransformerRaggedBatchKernels::gemmMMAGuarded,
+                    context,
+                    stepRows,
+                    state.workspace.attnOutFP16,
+                    weights.woLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.woOut,
+                    paddedBatch,
+                    dim,
+                    dim);
+        } else {
+            g.task(
+                    "woProj",
+                    TransformerBatchPrefillKernels::gemmMMA,
+                    context,
+                    state.workspace.attnOutFP16,
+                    weights.woLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.woOut,
+                    paddedBatch,
+                    dim,
+                    dim);
+        }
+        if (skinny()) {
+            skinnyTask(
+                    g,
+                    "woProj_skinny",
+                    state.workspace.attnOutFP16,
+                    weights.woLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.woOut,
+                    dim,
+                    dim,
+                    0);
+        }
 
         g.task(
                 "batch_ffn_rms",
@@ -547,41 +633,101 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 state.workspace.ffnScaleBatch,
                 dim);
 
-        g.task(
-                "gateUpProj",
-                TransformerBatchPrefillKernels::gemmMMAGateUp,
-                context,
-                state.workspace.normedXFFNFP16,
-                weights.w1Layered[layerIndex].asHalfFloatArray(),
-                weights.w3Layered[layerIndex].asHalfFloatArray(),
-                state.workspace.gateUpResultBatch,
-                paddedBatch,
-                hidDim,
-                dim);
+        if (skinny()) {
+            g.task(
+                    "gateUpProj",
+                    TransformerRaggedBatchKernels::gemmMMAGateUpGuarded,
+                    context,
+                    stepRows,
+                    state.workspace.normedXFFNFP16,
+                    weights.w1Layered[layerIndex].asHalfFloatArray(),
+                    weights.w3Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.gateUpResultBatch,
+                    paddedBatch,
+                    hidDim,
+                    dim);
+        } else {
+            g.task(
+                    "gateUpProj",
+                    TransformerBatchPrefillKernels::gemmMMAGateUp,
+                    context,
+                    state.workspace.normedXFFNFP16,
+                    weights.w1Layered[layerIndex].asHalfFloatArray(),
+                    weights.w3Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.gateUpResultBatch,
+                    paddedBatch,
+                    hidDim,
+                    dim);
+        }
+        if (skinny()) {
+            skinnyTask(
+                    g,
+                    "gateProj_skinny",
+                    state.workspace.normedXFFNFP16,
+                    weights.w1Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.gateUpResultBatch,
+                    dim,
+                    2 * hidDim,
+                    0);
+            skinnyTask(
+                    g,
+                    "upProj_skinny",
+                    state.workspace.normedXFFNFP16,
+                    weights.w3Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.gateUpResultBatch,
+                    dim,
+                    2 * hidDim,
+                    hidDim);
+        }
 
         g.task(
-                        "swiglu",
-                        TransformerBatchPrefillKernels::batchedFFNSwiGLUFP16Packed,
-                        context,
-                        state.workspace.wrapHbFP16Batch,
-                        state.workspace.gateUpResultBatch,
-                        hidDim)
-                .task(
-                        "w2Proj",
-                        TransformerBatchPrefillKernels::gemmMMA,
-                        context,
-                        state.workspace.wrapHbFP16Batch,
-                        weights.w2Layered[layerIndex].asHalfFloatArray(),
-                        state.workspace.w2Out,
-                        batchSize,
-                        dim,
-                        hidDim)
-                .task(
-                        "w2Resid",
-                        TransformerBatchPrefillKernels::batchedResidualAddFP32,
-                        context,
-                        state.workspace.wrapXBatch,
-                        state.workspace.w2Out);
+                "swiglu",
+                TransformerBatchPrefillKernels::batchedFFNSwiGLUFP16Packed,
+                context,
+                state.workspace.wrapHbFP16Batch,
+                state.workspace.gateUpResultBatch,
+                hidDim);
+        if (skinny()) {
+            g.task(
+                    "w2Proj",
+                    TransformerRaggedBatchKernels::gemmMMAGuarded,
+                    context,
+                    stepRows,
+                    state.workspace.wrapHbFP16Batch,
+                    weights.w2Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.w2Out,
+                    batchSize,
+                    dim,
+                    hidDim);
+        } else {
+            g.task(
+                    "w2Proj",
+                    TransformerBatchPrefillKernels::gemmMMA,
+                    context,
+                    state.workspace.wrapHbFP16Batch,
+                    weights.w2Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.w2Out,
+                    batchSize,
+                    dim,
+                    hidDim);
+        }
+        if (skinny()) {
+            skinnyTask(
+                    g,
+                    "w2Proj_skinny",
+                    state.workspace.wrapHbFP16Batch,
+                    weights.w2Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.w2Out,
+                    hidDim,
+                    dim,
+                    0);
+        }
+        g.task(
+                "w2Resid",
+                TransformerBatchPrefillKernels::batchedResidualAddFP32,
+                context,
+                state.workspace.wrapXBatch,
+                state.workspace.w2Out);
 
         g.persistOnDevice(state.workspace.wrapXBatch, keyPool(), valuePool());
         return g;
@@ -589,11 +735,53 @@ public class LlamaFP16LayersBatchDecodeMMA {
 
     // @formatter:on
 
+    /** Whether this graph carries the skinny GEMM tasks next to the 128-row ones. */
+    private boolean skinny() {
+        return rowSlots != null && skinnyGemm;
+    }
+
+    /**
+     * Adds a skinny GEMM writing {@code out[t, colOffset + n]}. On a skinny step the guarded
+     * 128-row GEMM of the same product returns at once and this one computes it; on a large step
+     * this one returns at once.
+     */
+    private void skinnyTask(
+            TaskGraph g,
+            String name,
+            HalfFloatArray x,
+            HalfFloatArray w,
+            FloatArray out,
+            int k,
+            int ldc,
+            int colOffset) {
+        g.task(
+                name,
+                TransformerRaggedBatchKernels::gemmMMASkinny,
+                context,
+                x,
+                w,
+                out,
+                stepRows,
+                k,
+                ldc,
+                colOffset);
+    }
+
     static WorkerGrid mmaGrid(int paddedM, int N) {
         int mBlocks = paddedM / 128;
         int nBlocks = N / 128;
         WorkerGrid2D grid = new WorkerGrid2D(mBlocks * 256, nBlocks);
         grid.setLocalWork(256, 1, 1);
+        return grid;
+    }
+
+    static WorkerGrid skinnyGrid(int n) {
+        return elementwiseGrid(n / TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP * 128, 128);
+    }
+
+    static WorkerGrid elementwiseGrid(int n, int local) {
+        WorkerGrid1D grid = new WorkerGrid1D(n);
+        grid.setLocalWork(local, 1, 1);
         return grid;
     }
 
@@ -635,6 +823,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
 
         ewDimWorker = elementwiseGrid(batchSize * dim);
         ewHidWorker = elementwiseGrid(batchSize * hidDim);
+        skinnyDimWorker = skinnyGrid(dim);
+        skinnyKvWorker = skinnyGrid(kvDim);
+        skinnyHidWorker = skinnyGrid(hidDim);
 
         for (int i = 0; i < config.numberOfLayers(); i++) {
             String p = "batchDecodeLayer_" + i + ".";
@@ -653,6 +844,15 @@ public class LlamaFP16LayersBatchDecodeMMA {
             scheduler.addWorkerGrid(p + "swiglu", ewHidWorker);
             scheduler.addWorkerGrid(p + "w2Proj", mmaDimWorker);
             scheduler.addWorkerGrid(p + "w2Resid", ewDimWorker);
+            if (skinny()) {
+                scheduler.addWorkerGrid(p + "qProj_skinny", skinnyDimWorker);
+                scheduler.addWorkerGrid(p + "kProj_skinny", skinnyKvWorker);
+                scheduler.addWorkerGrid(p + "vProj_skinny", skinnyKvWorker);
+                scheduler.addWorkerGrid(p + "woProj_skinny", skinnyDimWorker);
+                scheduler.addWorkerGrid(p + "gateProj_skinny", skinnyHidWorker);
+                scheduler.addWorkerGrid(p + "upProj_skinny", skinnyHidWorker);
+                scheduler.addWorkerGrid(p + "w2Proj_skinny", skinnyDimWorker);
+            }
         }
     }
 
@@ -665,6 +865,17 @@ public class LlamaFP16LayersBatchDecodeMMA {
      * @param rows a multiple of 16, at most {@code batchSize}
      */
     public void setActiveRows(int rows) {
+        setActiveRows(rows, rows);
+    }
+
+    /**
+     * {@link #setActiveRows(int)}, also choosing the GEMM: a step of at most {@link
+     * TransformerRaggedBatchKernels#SKINNY_ROWS} real tokens runs its projections on the skinny
+     * kernel, the guarded 128-row kernel launching a single tile that returns at once.
+     *
+     * @param realRows the step's tokens, before rounding up to {@code rows}
+     */
+    public void setActiveRows(int rows, int realRows) {
         if (rows <= 0 || rows > batchSize || rows % 16 != 0) {
             throw new IllegalArgumentException(
                     "active rows must be a positive multiple of 16 up to "
@@ -691,6 +902,19 @@ public class LlamaFP16LayersBatchDecodeMMA {
         mmaQkvWorker.setGlobalWork(mmaRows / 128 * 256L, (dim + 2L * config.kvDim()) / 128, 1);
         mmaDimWorker.setGlobalWork(mmaRows / 128 * 256L, dim / 128, 1);
         mmaGateUpWorker.setGlobalWork(mmaRows / 128 * 256L, 2L * hidDim / 128, 1);
+        if (skinny()) {
+            stepRows.set(0, realRows);
+            boolean small = realRows <= TransformerRaggedBatchKernels.SKINNY_ROWS;
+            int cols = TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP;
+            skinnyDimWorker.setGlobalWork(small ? dim / cols * 128L : 128, 1, 1);
+            skinnyKvWorker.setGlobalWork(small ? config.kvDim() / cols * 128L : 128, 1, 1);
+            skinnyHidWorker.setGlobalWork(small ? hidDim / cols * 128L : 128, 1, 1);
+            if (small) {
+                mmaQkvWorker.setGlobalWork(256, 1, 1);
+                mmaDimWorker.setGlobalWork(256, 1, 1);
+                mmaGateUpWorker.setGlobalWork(256, 1, 1);
+            }
+        }
         ewDimWorker.setGlobalWork((long) rows * dim, 1, 1);
         ewHidWorker.setGlobalWork((long) rows * hidDim, 1, 1);
     }

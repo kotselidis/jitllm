@@ -1,6 +1,7 @@
 package org.beehive.jitllm.backend.tornado.kernels;
 
 import uk.ac.manchester.tornado.api.KernelContext;
+import uk.ac.manchester.tornado.api.enums.MMAShape;
 import uk.ac.manchester.tornado.api.math.TornadoMath;
 import uk.ac.manchester.tornado.api.types.HalfFloat;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
@@ -573,6 +574,677 @@ public class TransformerRaggedBatchKernels {
         }
         float out = denominator > 0.0f ? numerator / denominator : 0.0f;
         attnOutFP16.set(row * nHeads * headSize + h * headSize + d, new HalfFloat(out));
+    }
+
+    /** Rows {@link #gemmMMASkinny} handles: one m16n8k16 B tile of tokens. */
+    public static final int SKINNY_ROWS = 8;
+
+    /** Output columns one {@link #gemmMMASkinny} workgroup computes: four warps of sixteen. */
+    public static final int SKINNY_COLS_PER_GROUP = 64;
+
+    /** K positions of the token tile staged in shared memory at a time. */
+    private static final int SKINNY_K_CHUNK = 2048;
+
+    /**
+     * Tensor-core GEMM for a step of at most {@link #SKINNY_ROWS} tokens: {@code C[t, colOffset +
+     * n] = sum_k X[t, k] * W[n, k]} for {@code t < rows}.
+     *
+     * <p>Decode at light load is a matrix-vector product, bound by reading the weights. The 128-row
+     * tiles of {@code gemmMMA} cost the same for one token as for 128, so this computes the
+     * transpose instead: the weights are the m16n8k16 A operand, read straight from global memory
+     * by each warp with no shared-memory staging and no barriers, and the step's tokens are the
+     * 8-wide B operand, staged once per K chunk. Each warp owns sixteen output columns; the weights
+     * are read once.
+     *
+     * <p>Every output value is the same products summed by the same m16n8k16 instructions in the
+     * same ascending K order as in {@code gemmMMA}, so the result is the same bits whichever kernel
+     * a step uses — what lets the engine pick one by the step's size without breaking batch
+     * invariance.
+     *
+     * <p>Does nothing when {@code stepRows[0] > SKINNY_ROWS}: the 128-row kernel has the step.
+     * Requires {@code K % 64 == 0}. Worker: {@code WorkerGrid1D(N / 64 * 128)}, local 128.
+     *
+     * @param ldc row stride of {@code C}
+     * @param colOffset first column of {@code C} this product writes, for packed outputs
+     */
+    public static void gemmMMASkinny(
+            KernelContext ctx,
+            HalfFloatArray X,
+            HalfFloatArray W,
+            FloatArray C,
+            IntArray stepRows,
+            int K,
+            int ldc,
+            int colOffset) {
+        int rows = stepRows.get(0);
+        if (rows > SKINNY_ROWS) {
+            return;
+        }
+        int tid = ctx.localIdx;
+        int lane = tid % 32;
+        int warp = tid / 32;
+        int n0 = ctx.groupIdx * SKINNY_COLS_PER_GROUP + warp * 16;
+
+        // Token tile in gemmMMA's B-tile layout, one 256-byte subtile per k16 step: int idx =
+        // step * 64 + kRow * 4 + tokenPair packs tokens (2p, 2p + 1) at k.
+        int[] xTile = ctx.allocateIntLocalArray(SKINNY_K_CHUNK * 4);
+        float[] acc = ctx.mmaFragment(0.0f);
+
+        // One flat loop over the K steps, four at a time, restaging the token tile at each chunk
+        // boundary. A fragment carried through nested loops is lowered to an array assignment NVRTC
+        // rejects, hence one loop. The four weight-fragment loads are issued before the four MMAs
+        // so their latencies overlap; the MMAs still run in ascending K order into one
+        // accumulator, which keeps every value the same bits.
+        int stepsPerChunk = SKINNY_K_CHUNK / 16;
+        for (int step = 0; step < K / 16; step += 4) {
+            int local = step % stepsPerChunk;
+            if (local == 0) {
+                // Uniform across the workgroup: the condition depends on the step alone.
+                ctx.localBarrier();
+                int kc = step * 16;
+                int chunk = Math.min(SKINNY_K_CHUNK, K - kc);
+                for (int idx = tid; idx < chunk * 4; idx += 128) {
+                    int k = kc + (idx >>> 6) * 16 + ((idx & 63) >>> 2);
+                    int t = (idx & 3) << 1;
+                    int lo = X.get(t * K + k).getHalfFloatValue() & 0xFFFF;
+                    int hi = X.get((t + 1) * K + k).getHalfFloatValue() & 0xFFFF;
+                    xTile[idx] = lo | (hi << 16);
+                }
+                ctx.localBarrier();
+            }
+            int k0 = step * 16;
+            HalfFloat[] a0 = ctx.mmaLoadA(W, n0, k0, K);
+            HalfFloat[] a1 = ctx.mmaLoadA(W, n0, k0 + 16, K);
+            HalfFloat[] a2 = ctx.mmaLoadA(W, n0, k0 + 32, K);
+            HalfFloat[] a3 = ctx.mmaLoadA(W, n0, k0 + 48, K);
+            HalfFloat[] b0 = ctx.mmaLoadB(xTile, 16, local * 256);
+            HalfFloat[] b1 = ctx.mmaLoadB(xTile, 16, (local + 1) * 256);
+            HalfFloat[] b2 = ctx.mmaLoadB(xTile, 16, (local + 2) * 256);
+            HalfFloat[] b3 = ctx.mmaLoadB(xTile, 16, (local + 3) * 256);
+            acc = ctx.mma(a0, b0, acc, MMAShape.M16N8K16);
+            acc = ctx.mma(a1, b1, acc, MMAShape.M16N8K16);
+            acc = ctx.mma(a2, b2, acc, MMAShape.M16N8K16);
+            acc = ctx.mma(a3, b3, acc, MMAShape.M16N8K16);
+        }
+
+        // acc holds the transposed tile: element i is column n0 + lane / 4 + 8 * (i / 2), token
+        // (lane % 4) * 2 + i % 2.
+        int n = colOffset + n0 + lane / 4;
+        int t = (lane % 4) * 2;
+        if (t < rows) {
+            C.set(t * ldc + n, acc[0]);
+            C.set(t * ldc + n + 8, acc[2]);
+        }
+        if (t + 1 < rows) {
+            C.set((t + 1) * ldc + n, acc[1]);
+            C.set((t + 1) * ldc + n + 8, acc[3]);
+        }
+    }
+
+    // ── 128-row tensor-core GEMMs that step aside for the skinny kernel ─────────────────────
+    // Tile constants and the packing helper, as in TransformerBatchPrefillKernels.
+
+    private static final int WARP_SIZE = 32;
+    private static final int BM = 128, BN = 128, BK = 16;
+    private static final int WARPS_M = 4, WARPS_N = 2;
+    private static final int WARPS_PER_BLOCK = WARPS_M * WARPS_N;
+    private static final int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+    private static final int WM = BM / WARPS_M;
+    private static final int WN = BN / WARPS_N;
+    private static final int B_SUBTILE_BYTES = 256;
+
+    private static int packHalves(HalfFloatArray src, int idxLo, int idxHi) {
+        int lo = src.get(idxLo).getHalfFloatValue() & 0xFFFF;
+        int hi = src.get(idxHi).getHalfFloatValue() & 0xFFFF;
+        return lo | (hi << 16);
+    }
+
+    /**
+     * {@link TransformerBatchPrefillKernels#gemmMMA} that does nothing on a step of at most {@link
+     * #SKINNY_ROWS} tokens, which {@link #gemmMMASkinny} computes instead. A 128-row block walks K
+     * serially, so even a single tile costs nearly a full launch; skipping is what makes the skinny
+     * path pay. The arithmetic is the original's, unchanged.
+     */
+    public static void gemmMMAGuarded(
+            KernelContext ctx,
+            IntArray stepRows,
+            HalfFloatArray A,
+            HalfFloatArray B,
+            FloatArray C,
+            int M,
+            int N,
+            int K) {
+        if (stepRows.get(0) <= SKINNY_ROWS) {
+            return; // a skinny step: gemmMMASkinny computes this product
+        }
+        int tid = ctx.localIdx;
+        int warpId = tid / WARP_SIZE;
+        int warpM = warpId / WARPS_N;
+        int warpN = warpId % WARPS_N;
+        int blockRow = BM * ctx.groupIdx;
+        int blockCol = BN * ctx.groupIdy;
+
+        int[] aTile = ctx.allocateIntLocalArray(BM * BK / 2);
+        int[] bTile = ctx.allocateIntLocalArray(BK * BN / 2);
+
+        float[] c00 = ctx.mmaFragment(0.0f);
+        float[] c01 = ctx.mmaFragment(0.0f);
+        float[] c02 = ctx.mmaFragment(0.0f);
+        float[] c03 = ctx.mmaFragment(0.0f);
+        float[] c04 = ctx.mmaFragment(0.0f);
+        float[] c05 = ctx.mmaFragment(0.0f);
+        float[] c06 = ctx.mmaFragment(0.0f);
+        float[] c07 = ctx.mmaFragment(0.0f);
+        float[] c10 = ctx.mmaFragment(0.0f);
+        float[] c11 = ctx.mmaFragment(0.0f);
+        float[] c12 = ctx.mmaFragment(0.0f);
+        float[] c13 = ctx.mmaFragment(0.0f);
+        float[] c14 = ctx.mmaFragment(0.0f);
+        float[] c15 = ctx.mmaFragment(0.0f);
+        float[] c16 = ctx.mmaFragment(0.0f);
+        float[] c17 = ctx.mmaFragment(0.0f);
+
+        // ── Per-thread staging index math (constant across K-steps) ──────────
+        // A tile: BM*BK/2 = 1024 ints; layout idx = m_row*(BK/2) + k_pair.
+        //   m_row = idx >>> 3, k = (idx & 7)*2; global A element (blockRow+m_row, kBase+k).
+        int aIdx0 = tid;
+        int gA0 = (blockRow + (aIdx0 >>> 3)) * K + ((aIdx0 & 7) << 1);
+        int aIdx1 = tid + 256;
+        int gA1 = (blockRow + (aIdx1 >>> 3)) * K + ((aIdx1 & 7) << 1);
+        int aIdx2 = tid + 512;
+        int gA2 = (blockRow + (aIdx2 >>> 3)) * K + ((aIdx2 & 7) << 1);
+        int aIdx3 = tid + 768;
+        int gA3 = (blockRow + (aIdx3 >>> 3)) * K + ((aIdx3 & 7) << 1);
+        // B tile: BK*BN/2 = 1024 ints; subTileId = idx >>> 6, k_row = (idx & 63) >>> 2,
+        //   col = subTileId*8 + (idx & 3)*2; B[col, k] at col*K + k (pair at +K).
+        int bIdx0 = tid;
+        int gB0 = (blockCol + ((bIdx0 >>> 6) << 3) + ((bIdx0 & 3) << 1)) * K + ((bIdx0 & 63) >>> 2);
+        int bIdx1 = tid + 256;
+        int gB1 = (blockCol + ((bIdx1 >>> 6) << 3) + ((bIdx1 & 3) << 1)) * K + ((bIdx1 & 63) >>> 2);
+        int bIdx2 = tid + 512;
+        int gB2 = (blockCol + ((bIdx2 >>> 6) << 3) + ((bIdx2 & 3) << 1)) * K + ((bIdx2 & 63) >>> 2);
+        int bIdx3 = tid + 768;
+        int gB3 = (blockCol + ((bIdx3 >>> 6) << 3) + ((bIdx3 & 3) << 1)) * K + ((bIdx3 & 63) >>> 2);
+
+        // ── Prologue: stage K-step 0 ─────────────────────────────────────────
+        int aReg0 = packHalves(A, gA0, gA0 + 1);
+        int aReg1 = packHalves(A, gA1, gA1 + 1);
+        int aReg2 = packHalves(A, gA2, gA2 + 1);
+        int aReg3 = packHalves(A, gA3, gA3 + 1);
+        int bReg0 = packHalves(B, gB0, gB0 + K);
+        int bReg1 = packHalves(B, gB1, gB1 + K);
+        int bReg2 = packHalves(B, gB2, gB2 + K);
+        int bReg3 = packHalves(B, gB3, gB3 + K);
+        aTile[aIdx0] = aReg0;
+        aTile[aIdx1] = aReg1;
+        aTile[aIdx2] = aReg2;
+        aTile[aIdx3] = aReg3;
+        bTile[bIdx0] = bReg0;
+        bTile[bIdx1] = bReg1;
+        bTile[bIdx2] = bReg2;
+        bTile[bIdx3] = bReg3;
+        ctx.localBarrier();
+
+        int numKSteps = K / BK;
+        for (int kStep = 0; kStep < numKSteps; kStep++) {
+            // Issue next step's global loads FIRST: independent of the MMAs below,
+            // so their latency overlaps ldmatrix + tensor-core compute.
+            if (kStep + 1 < numKSteps) {
+                int kOff = (kStep + 1) * BK;
+                aReg0 = packHalves(A, gA0 + kOff, gA0 + kOff + 1);
+                aReg1 = packHalves(A, gA1 + kOff, gA1 + kOff + 1);
+                aReg2 = packHalves(A, gA2 + kOff, gA2 + kOff + 1);
+                aReg3 = packHalves(A, gA3 + kOff, gA3 + kOff + 1);
+                bReg0 = packHalves(B, gB0 + kOff, gB0 + kOff + K);
+                bReg1 = packHalves(B, gB1 + kOff, gB1 + kOff + K);
+                bReg2 = packHalves(B, gB2 + kOff, gB2 + kOff + K);
+                bReg3 = packHalves(B, gB3 + kOff, gB3 + kOff + K);
+            }
+
+            int aOff0 = warpM * 1024;
+            int aOff1 = warpM * 1024 + 512;
+            HalfFloat[] a0 = ctx.mmaLoadA(aTile, BK, aOff0);
+            HalfFloat[] a1 = ctx.mmaLoadA(aTile, BK, aOff1);
+            int bBase = warpN * 8;
+            HalfFloat[] b0 = ctx.mmaLoadB(bTile, BK, (bBase + 0) * B_SUBTILE_BYTES);
+            HalfFloat[] b1 = ctx.mmaLoadB(bTile, BK, (bBase + 1) * B_SUBTILE_BYTES);
+            HalfFloat[] b2 = ctx.mmaLoadB(bTile, BK, (bBase + 2) * B_SUBTILE_BYTES);
+            HalfFloat[] b3 = ctx.mmaLoadB(bTile, BK, (bBase + 3) * B_SUBTILE_BYTES);
+            HalfFloat[] b4 = ctx.mmaLoadB(bTile, BK, (bBase + 4) * B_SUBTILE_BYTES);
+            HalfFloat[] b5 = ctx.mmaLoadB(bTile, BK, (bBase + 5) * B_SUBTILE_BYTES);
+            HalfFloat[] b6 = ctx.mmaLoadB(bTile, BK, (bBase + 6) * B_SUBTILE_BYTES);
+            HalfFloat[] b7 = ctx.mmaLoadB(bTile, BK, (bBase + 7) * B_SUBTILE_BYTES);
+            ctx.localBarrier(); // all shared reads for this K-step complete
+
+            // Overwrite shared tiles for the next step; overlaps the MMAs below.
+            if (kStep + 1 < numKSteps) {
+                aTile[aIdx0] = aReg0;
+                aTile[aIdx1] = aReg1;
+                aTile[aIdx2] = aReg2;
+                aTile[aIdx3] = aReg3;
+                bTile[bIdx0] = bReg0;
+                bTile[bIdx1] = bReg1;
+                bTile[bIdx2] = bReg2;
+                bTile[bIdx3] = bReg3;
+            }
+
+            c00 = ctx.mma(a0, b0, c00, MMAShape.M16N8K16);
+            c01 = ctx.mma(a0, b1, c01, MMAShape.M16N8K16);
+            c02 = ctx.mma(a0, b2, c02, MMAShape.M16N8K16);
+            c03 = ctx.mma(a0, b3, c03, MMAShape.M16N8K16);
+            c04 = ctx.mma(a0, b4, c04, MMAShape.M16N8K16);
+            c05 = ctx.mma(a0, b5, c05, MMAShape.M16N8K16);
+            c06 = ctx.mma(a0, b6, c06, MMAShape.M16N8K16);
+            c07 = ctx.mma(a0, b7, c07, MMAShape.M16N8K16);
+            c10 = ctx.mma(a1, b0, c10, MMAShape.M16N8K16);
+            c11 = ctx.mma(a1, b1, c11, MMAShape.M16N8K16);
+            c12 = ctx.mma(a1, b2, c12, MMAShape.M16N8K16);
+            c13 = ctx.mma(a1, b3, c13, MMAShape.M16N8K16);
+            c14 = ctx.mma(a1, b4, c14, MMAShape.M16N8K16);
+            c15 = ctx.mma(a1, b5, c15, MMAShape.M16N8K16);
+            c16 = ctx.mma(a1, b6, c16, MMAShape.M16N8K16);
+            c17 = ctx.mma(a1, b7, c17, MMAShape.M16N8K16);
+            ctx.localBarrier(); // shared writes visible before next step's ldmatrix
+        }
+
+        int rBase = blockRow + warpM * WM;
+        int cBase = blockCol + warpN * WN;
+        ctx.mmaStore(c00, C, rBase + 0, cBase + 0, N);
+        ctx.mmaStore(c01, C, rBase + 0, cBase + 8, N);
+        ctx.mmaStore(c02, C, rBase + 0, cBase + 16, N);
+        ctx.mmaStore(c03, C, rBase + 0, cBase + 24, N);
+        ctx.mmaStore(c04, C, rBase + 0, cBase + 32, N);
+        ctx.mmaStore(c05, C, rBase + 0, cBase + 40, N);
+        ctx.mmaStore(c06, C, rBase + 0, cBase + 48, N);
+        ctx.mmaStore(c07, C, rBase + 0, cBase + 56, N);
+        ctx.mmaStore(c10, C, rBase + 16, cBase + 0, N);
+        ctx.mmaStore(c11, C, rBase + 16, cBase + 8, N);
+        ctx.mmaStore(c12, C, rBase + 16, cBase + 16, N);
+        ctx.mmaStore(c13, C, rBase + 16, cBase + 24, N);
+        ctx.mmaStore(c14, C, rBase + 16, cBase + 32, N);
+        ctx.mmaStore(c15, C, rBase + 16, cBase + 40, N);
+        ctx.mmaStore(c16, C, rBase + 16, cBase + 48, N);
+        ctx.mmaStore(c17, C, rBase + 16, cBase + 56, N);
+    }
+
+    /**
+     * {@link TransformerBatchPrefillKernels#gemmMMAQKV} that does nothing on a step of at most
+     * {@link #SKINNY_ROWS} tokens, which {@link #gemmMMASkinny} computes instead. A 128-row block
+     * walks K serially, so even a single tile costs nearly a full launch; skipping is what makes
+     * the skinny path pay. The arithmetic is the original's, unchanged.
+     */
+    public static void gemmMMAQKVGuarded(
+            KernelContext ctx,
+            IntArray stepRows,
+            HalfFloatArray A,
+            HalfFloatArray wq,
+            HalfFloatArray wk,
+            HalfFloatArray wv,
+            FloatArray qkvOut,
+            int M,
+            int dim,
+            int kvDim,
+            int K) {
+        if (stepRows.get(0) <= SKINNY_ROWS) {
+            return; // a skinny step: gemmMMASkinny computes this product
+        }
+        int tid = ctx.localIdx;
+        int warpId = tid / WARP_SIZE;
+        int warpM = warpId / WARPS_N;
+        int warpN = warpId % WARPS_N;
+        int blockRow = BM * ctx.groupIdx;
+        int blockCol = BN * ctx.groupIdy; // column in the packed output
+        int qkvStride = dim + 2 * kvDim;
+
+        // Column base inside the segment's own weight matrix (block-uniform).
+        int wColBase = blockCol;
+        if (blockCol >= dim) wColBase -= dim;
+        if (blockCol >= dim + kvDim) wColBase -= kvDim;
+
+        int[] aTile = ctx.allocateIntLocalArray(BM * BK / 2);
+        int[] bTile = ctx.allocateIntLocalArray(BK * BN / 2);
+
+        float[] c00 = ctx.mmaFragment(0.0f);
+        float[] c01 = ctx.mmaFragment(0.0f);
+        float[] c02 = ctx.mmaFragment(0.0f);
+        float[] c03 = ctx.mmaFragment(0.0f);
+        float[] c04 = ctx.mmaFragment(0.0f);
+        float[] c05 = ctx.mmaFragment(0.0f);
+        float[] c06 = ctx.mmaFragment(0.0f);
+        float[] c07 = ctx.mmaFragment(0.0f);
+        float[] c10 = ctx.mmaFragment(0.0f);
+        float[] c11 = ctx.mmaFragment(0.0f);
+        float[] c12 = ctx.mmaFragment(0.0f);
+        float[] c13 = ctx.mmaFragment(0.0f);
+        float[] c14 = ctx.mmaFragment(0.0f);
+        float[] c15 = ctx.mmaFragment(0.0f);
+        float[] c16 = ctx.mmaFragment(0.0f);
+        float[] c17 = ctx.mmaFragment(0.0f);
+
+        int aIdx0 = tid;
+        int gA0 = (blockRow + (aIdx0 >>> 3)) * K + ((aIdx0 & 7) << 1);
+        int aIdx1 = tid + 256;
+        int gA1 = (blockRow + (aIdx1 >>> 3)) * K + ((aIdx1 & 7) << 1);
+        int aIdx2 = tid + 512;
+        int gA2 = (blockRow + (aIdx2 >>> 3)) * K + ((aIdx2 & 7) << 1);
+        int aIdx3 = tid + 768;
+        int gA3 = (blockRow + (aIdx3 >>> 3)) * K + ((aIdx3 & 7) << 1);
+        int bIdx0 = tid;
+        int gB0 = (wColBase + ((bIdx0 >>> 6) << 3) + ((bIdx0 & 3) << 1)) * K + ((bIdx0 & 63) >>> 2);
+        int bIdx1 = tid + 256;
+        int gB1 = (wColBase + ((bIdx1 >>> 6) << 3) + ((bIdx1 & 3) << 1)) * K + ((bIdx1 & 63) >>> 2);
+        int bIdx2 = tid + 512;
+        int gB2 = (wColBase + ((bIdx2 >>> 6) << 3) + ((bIdx2 & 3) << 1)) * K + ((bIdx2 & 63) >>> 2);
+        int bIdx3 = tid + 768;
+        int gB3 = (wColBase + ((bIdx3 >>> 6) << 3) + ((bIdx3 & 3) << 1)) * K + ((bIdx3 & 63) >>> 2);
+
+        // ── Prologue: stage K-step 0 ──
+        int aReg0 = packHalves(A, gA0, gA0 + 1);
+        int aReg1 = packHalves(A, gA1, gA1 + 1);
+        int aReg2 = packHalves(A, gA2, gA2 + 1);
+        int aReg3 = packHalves(A, gA3, gA3 + 1);
+        int bReg0;
+        int bReg1;
+        int bReg2;
+        int bReg3;
+        if (blockCol < dim) {
+            bReg0 = packHalves(wq, gB0, gB0 + K);
+            bReg1 = packHalves(wq, gB1, gB1 + K);
+            bReg2 = packHalves(wq, gB2, gB2 + K);
+            bReg3 = packHalves(wq, gB3, gB3 + K);
+        } else if (blockCol < dim + kvDim) {
+            bReg0 = packHalves(wk, gB0, gB0 + K);
+            bReg1 = packHalves(wk, gB1, gB1 + K);
+            bReg2 = packHalves(wk, gB2, gB2 + K);
+            bReg3 = packHalves(wk, gB3, gB3 + K);
+        } else {
+            bReg0 = packHalves(wv, gB0, gB0 + K);
+            bReg1 = packHalves(wv, gB1, gB1 + K);
+            bReg2 = packHalves(wv, gB2, gB2 + K);
+            bReg3 = packHalves(wv, gB3, gB3 + K);
+        }
+        aTile[aIdx0] = aReg0;
+        aTile[aIdx1] = aReg1;
+        aTile[aIdx2] = aReg2;
+        aTile[aIdx3] = aReg3;
+        bTile[bIdx0] = bReg0;
+        bTile[bIdx1] = bReg1;
+        bTile[bIdx2] = bReg2;
+        bTile[bIdx3] = bReg3;
+        ctx.localBarrier();
+
+        int numKSteps = K / BK;
+        for (int kStep = 0; kStep < numKSteps; kStep++) {
+            if (kStep + 1 < numKSteps) {
+                int kOff = (kStep + 1) * BK;
+                aReg0 = packHalves(A, gA0 + kOff, gA0 + kOff + 1);
+                aReg1 = packHalves(A, gA1 + kOff, gA1 + kOff + 1);
+                aReg2 = packHalves(A, gA2 + kOff, gA2 + kOff + 1);
+                aReg3 = packHalves(A, gA3 + kOff, gA3 + kOff + 1);
+                if (blockCol < dim) {
+                    bReg0 = packHalves(wq, gB0 + kOff, gB0 + kOff + K);
+                    bReg1 = packHalves(wq, gB1 + kOff, gB1 + kOff + K);
+                    bReg2 = packHalves(wq, gB2 + kOff, gB2 + kOff + K);
+                    bReg3 = packHalves(wq, gB3 + kOff, gB3 + kOff + K);
+                } else if (blockCol < dim + kvDim) {
+                    bReg0 = packHalves(wk, gB0 + kOff, gB0 + kOff + K);
+                    bReg1 = packHalves(wk, gB1 + kOff, gB1 + kOff + K);
+                    bReg2 = packHalves(wk, gB2 + kOff, gB2 + kOff + K);
+                    bReg3 = packHalves(wk, gB3 + kOff, gB3 + kOff + K);
+                } else {
+                    bReg0 = packHalves(wv, gB0 + kOff, gB0 + kOff + K);
+                    bReg1 = packHalves(wv, gB1 + kOff, gB1 + kOff + K);
+                    bReg2 = packHalves(wv, gB2 + kOff, gB2 + kOff + K);
+                    bReg3 = packHalves(wv, gB3 + kOff, gB3 + kOff + K);
+                }
+            }
+
+            int aOff0 = warpM * 1024;
+            int aOff1 = warpM * 1024 + 512;
+            HalfFloat[] a0 = ctx.mmaLoadA(aTile, BK, aOff0);
+            HalfFloat[] a1 = ctx.mmaLoadA(aTile, BK, aOff1);
+            int bBase = warpN * 8;
+            HalfFloat[] b0 = ctx.mmaLoadB(bTile, BK, (bBase + 0) * B_SUBTILE_BYTES);
+            HalfFloat[] b1 = ctx.mmaLoadB(bTile, BK, (bBase + 1) * B_SUBTILE_BYTES);
+            HalfFloat[] b2 = ctx.mmaLoadB(bTile, BK, (bBase + 2) * B_SUBTILE_BYTES);
+            HalfFloat[] b3 = ctx.mmaLoadB(bTile, BK, (bBase + 3) * B_SUBTILE_BYTES);
+            HalfFloat[] b4 = ctx.mmaLoadB(bTile, BK, (bBase + 4) * B_SUBTILE_BYTES);
+            HalfFloat[] b5 = ctx.mmaLoadB(bTile, BK, (bBase + 5) * B_SUBTILE_BYTES);
+            HalfFloat[] b6 = ctx.mmaLoadB(bTile, BK, (bBase + 6) * B_SUBTILE_BYTES);
+            HalfFloat[] b7 = ctx.mmaLoadB(bTile, BK, (bBase + 7) * B_SUBTILE_BYTES);
+            ctx.localBarrier();
+
+            if (kStep + 1 < numKSteps) {
+                aTile[aIdx0] = aReg0;
+                aTile[aIdx1] = aReg1;
+                aTile[aIdx2] = aReg2;
+                aTile[aIdx3] = aReg3;
+                bTile[bIdx0] = bReg0;
+                bTile[bIdx1] = bReg1;
+                bTile[bIdx2] = bReg2;
+                bTile[bIdx3] = bReg3;
+            }
+
+            c00 = ctx.mma(a0, b0, c00, MMAShape.M16N8K16);
+            c01 = ctx.mma(a0, b1, c01, MMAShape.M16N8K16);
+            c02 = ctx.mma(a0, b2, c02, MMAShape.M16N8K16);
+            c03 = ctx.mma(a0, b3, c03, MMAShape.M16N8K16);
+            c04 = ctx.mma(a0, b4, c04, MMAShape.M16N8K16);
+            c05 = ctx.mma(a0, b5, c05, MMAShape.M16N8K16);
+            c06 = ctx.mma(a0, b6, c06, MMAShape.M16N8K16);
+            c07 = ctx.mma(a0, b7, c07, MMAShape.M16N8K16);
+            c10 = ctx.mma(a1, b0, c10, MMAShape.M16N8K16);
+            c11 = ctx.mma(a1, b1, c11, MMAShape.M16N8K16);
+            c12 = ctx.mma(a1, b2, c12, MMAShape.M16N8K16);
+            c13 = ctx.mma(a1, b3, c13, MMAShape.M16N8K16);
+            c14 = ctx.mma(a1, b4, c14, MMAShape.M16N8K16);
+            c15 = ctx.mma(a1, b5, c15, MMAShape.M16N8K16);
+            c16 = ctx.mma(a1, b6, c16, MMAShape.M16N8K16);
+            c17 = ctx.mma(a1, b7, c17, MMAShape.M16N8K16);
+            ctx.localBarrier();
+        }
+
+        // Stores are uniform: packed column == blockCol-relative column,
+        // stride is the packed row width.
+        int rBase = blockRow + warpM * WM;
+        int cBase = blockCol + warpN * WN;
+        ctx.mmaStore(c00, qkvOut, rBase + 0, cBase + 0, qkvStride);
+        ctx.mmaStore(c01, qkvOut, rBase + 0, cBase + 8, qkvStride);
+        ctx.mmaStore(c02, qkvOut, rBase + 0, cBase + 16, qkvStride);
+        ctx.mmaStore(c03, qkvOut, rBase + 0, cBase + 24, qkvStride);
+        ctx.mmaStore(c04, qkvOut, rBase + 0, cBase + 32, qkvStride);
+        ctx.mmaStore(c05, qkvOut, rBase + 0, cBase + 40, qkvStride);
+        ctx.mmaStore(c06, qkvOut, rBase + 0, cBase + 48, qkvStride);
+        ctx.mmaStore(c07, qkvOut, rBase + 0, cBase + 56, qkvStride);
+        ctx.mmaStore(c10, qkvOut, rBase + 16, cBase + 0, qkvStride);
+        ctx.mmaStore(c11, qkvOut, rBase + 16, cBase + 8, qkvStride);
+        ctx.mmaStore(c12, qkvOut, rBase + 16, cBase + 16, qkvStride);
+        ctx.mmaStore(c13, qkvOut, rBase + 16, cBase + 24, qkvStride);
+        ctx.mmaStore(c14, qkvOut, rBase + 16, cBase + 32, qkvStride);
+        ctx.mmaStore(c15, qkvOut, rBase + 16, cBase + 40, qkvStride);
+        ctx.mmaStore(c16, qkvOut, rBase + 16, cBase + 48, qkvStride);
+        ctx.mmaStore(c17, qkvOut, rBase + 16, cBase + 56, qkvStride);
+    }
+
+    /**
+     * {@link TransformerBatchPrefillKernels#gemmMMAGateUp} that does nothing on a step of at most
+     * {@link #SKINNY_ROWS} tokens, which {@link #gemmMMASkinny} computes instead. A 128-row block
+     * walks K serially, so even a single tile costs nearly a full launch; skipping is what makes
+     * the skinny path pay. The arithmetic is the original's, unchanged.
+     */
+    public static void gemmMMAGateUpGuarded(
+            KernelContext ctx,
+            IntArray stepRows,
+            HalfFloatArray A,
+            HalfFloatArray w1,
+            HalfFloatArray w3,
+            FloatArray gateUpOut,
+            int M,
+            int hidDim,
+            int K) {
+        if (stepRows.get(0) <= SKINNY_ROWS) {
+            return; // a skinny step: gemmMMASkinny computes this product
+        }
+        int tid = ctx.localIdx;
+        int warpId = tid / WARP_SIZE;
+        int warpM = warpId / WARPS_N;
+        int warpN = warpId % WARPS_N;
+        int blockRow = BM * ctx.groupIdx;
+        int blockCol = BN * ctx.groupIdy; // column in the packed output
+        int outStride = 2 * hidDim;
+
+        int wColBase = (blockCol < hidDim) ? blockCol : (blockCol - hidDim);
+
+        int[] aTile = ctx.allocateIntLocalArray(BM * BK / 2);
+        int[] bTile = ctx.allocateIntLocalArray(BK * BN / 2);
+
+        float[] c00 = ctx.mmaFragment(0.0f);
+        float[] c01 = ctx.mmaFragment(0.0f);
+        float[] c02 = ctx.mmaFragment(0.0f);
+        float[] c03 = ctx.mmaFragment(0.0f);
+        float[] c04 = ctx.mmaFragment(0.0f);
+        float[] c05 = ctx.mmaFragment(0.0f);
+        float[] c06 = ctx.mmaFragment(0.0f);
+        float[] c07 = ctx.mmaFragment(0.0f);
+        float[] c10 = ctx.mmaFragment(0.0f);
+        float[] c11 = ctx.mmaFragment(0.0f);
+        float[] c12 = ctx.mmaFragment(0.0f);
+        float[] c13 = ctx.mmaFragment(0.0f);
+        float[] c14 = ctx.mmaFragment(0.0f);
+        float[] c15 = ctx.mmaFragment(0.0f);
+        float[] c16 = ctx.mmaFragment(0.0f);
+        float[] c17 = ctx.mmaFragment(0.0f);
+
+        int aIdx0 = tid;
+        int gA0 = (blockRow + (aIdx0 >>> 3)) * K + ((aIdx0 & 7) << 1);
+        int aIdx1 = tid + 256;
+        int gA1 = (blockRow + (aIdx1 >>> 3)) * K + ((aIdx1 & 7) << 1);
+        int aIdx2 = tid + 512;
+        int gA2 = (blockRow + (aIdx2 >>> 3)) * K + ((aIdx2 & 7) << 1);
+        int aIdx3 = tid + 768;
+        int gA3 = (blockRow + (aIdx3 >>> 3)) * K + ((aIdx3 & 7) << 1);
+        int bIdx0 = tid;
+        int gB0 = (wColBase + ((bIdx0 >>> 6) << 3) + ((bIdx0 & 3) << 1)) * K + ((bIdx0 & 63) >>> 2);
+        int bIdx1 = tid + 256;
+        int gB1 = (wColBase + ((bIdx1 >>> 6) << 3) + ((bIdx1 & 3) << 1)) * K + ((bIdx1 & 63) >>> 2);
+        int bIdx2 = tid + 512;
+        int gB2 = (wColBase + ((bIdx2 >>> 6) << 3) + ((bIdx2 & 3) << 1)) * K + ((bIdx2 & 63) >>> 2);
+        int bIdx3 = tid + 768;
+        int gB3 = (wColBase + ((bIdx3 >>> 6) << 3) + ((bIdx3 & 3) << 1)) * K + ((bIdx3 & 63) >>> 2);
+
+        int aReg0 = packHalves(A, gA0, gA0 + 1);
+        int aReg1 = packHalves(A, gA1, gA1 + 1);
+        int aReg2 = packHalves(A, gA2, gA2 + 1);
+        int aReg3 = packHalves(A, gA3, gA3 + 1);
+        int bReg0;
+        int bReg1;
+        int bReg2;
+        int bReg3;
+        if (blockCol < hidDim) {
+            bReg0 = packHalves(w1, gB0, gB0 + K);
+            bReg1 = packHalves(w1, gB1, gB1 + K);
+            bReg2 = packHalves(w1, gB2, gB2 + K);
+            bReg3 = packHalves(w1, gB3, gB3 + K);
+        } else {
+            bReg0 = packHalves(w3, gB0, gB0 + K);
+            bReg1 = packHalves(w3, gB1, gB1 + K);
+            bReg2 = packHalves(w3, gB2, gB2 + K);
+            bReg3 = packHalves(w3, gB3, gB3 + K);
+        }
+        aTile[aIdx0] = aReg0;
+        aTile[aIdx1] = aReg1;
+        aTile[aIdx2] = aReg2;
+        aTile[aIdx3] = aReg3;
+        bTile[bIdx0] = bReg0;
+        bTile[bIdx1] = bReg1;
+        bTile[bIdx2] = bReg2;
+        bTile[bIdx3] = bReg3;
+        ctx.localBarrier();
+
+        int numKSteps = K / BK;
+        for (int kStep = 0; kStep < numKSteps; kStep++) {
+            if (kStep + 1 < numKSteps) {
+                int kOff = (kStep + 1) * BK;
+                aReg0 = packHalves(A, gA0 + kOff, gA0 + kOff + 1);
+                aReg1 = packHalves(A, gA1 + kOff, gA1 + kOff + 1);
+                aReg2 = packHalves(A, gA2 + kOff, gA2 + kOff + 1);
+                aReg3 = packHalves(A, gA3 + kOff, gA3 + kOff + 1);
+                if (blockCol < hidDim) {
+                    bReg0 = packHalves(w1, gB0 + kOff, gB0 + kOff + K);
+                    bReg1 = packHalves(w1, gB1 + kOff, gB1 + kOff + K);
+                    bReg2 = packHalves(w1, gB2 + kOff, gB2 + kOff + K);
+                    bReg3 = packHalves(w1, gB3 + kOff, gB3 + kOff + K);
+                } else {
+                    bReg0 = packHalves(w3, gB0 + kOff, gB0 + kOff + K);
+                    bReg1 = packHalves(w3, gB1 + kOff, gB1 + kOff + K);
+                    bReg2 = packHalves(w3, gB2 + kOff, gB2 + kOff + K);
+                    bReg3 = packHalves(w3, gB3 + kOff, gB3 + kOff + K);
+                }
+            }
+
+            int aOff0 = warpM * 1024;
+            int aOff1 = warpM * 1024 + 512;
+            HalfFloat[] a0 = ctx.mmaLoadA(aTile, BK, aOff0);
+            HalfFloat[] a1 = ctx.mmaLoadA(aTile, BK, aOff1);
+            int bBase = warpN * 8;
+            HalfFloat[] b0 = ctx.mmaLoadB(bTile, BK, (bBase + 0) * B_SUBTILE_BYTES);
+            HalfFloat[] b1 = ctx.mmaLoadB(bTile, BK, (bBase + 1) * B_SUBTILE_BYTES);
+            HalfFloat[] b2 = ctx.mmaLoadB(bTile, BK, (bBase + 2) * B_SUBTILE_BYTES);
+            HalfFloat[] b3 = ctx.mmaLoadB(bTile, BK, (bBase + 3) * B_SUBTILE_BYTES);
+            HalfFloat[] b4 = ctx.mmaLoadB(bTile, BK, (bBase + 4) * B_SUBTILE_BYTES);
+            HalfFloat[] b5 = ctx.mmaLoadB(bTile, BK, (bBase + 5) * B_SUBTILE_BYTES);
+            HalfFloat[] b6 = ctx.mmaLoadB(bTile, BK, (bBase + 6) * B_SUBTILE_BYTES);
+            HalfFloat[] b7 = ctx.mmaLoadB(bTile, BK, (bBase + 7) * B_SUBTILE_BYTES);
+            ctx.localBarrier();
+
+            if (kStep + 1 < numKSteps) {
+                aTile[aIdx0] = aReg0;
+                aTile[aIdx1] = aReg1;
+                aTile[aIdx2] = aReg2;
+                aTile[aIdx3] = aReg3;
+                bTile[bIdx0] = bReg0;
+                bTile[bIdx1] = bReg1;
+                bTile[bIdx2] = bReg2;
+                bTile[bIdx3] = bReg3;
+            }
+
+            c00 = ctx.mma(a0, b0, c00, MMAShape.M16N8K16);
+            c01 = ctx.mma(a0, b1, c01, MMAShape.M16N8K16);
+            c02 = ctx.mma(a0, b2, c02, MMAShape.M16N8K16);
+            c03 = ctx.mma(a0, b3, c03, MMAShape.M16N8K16);
+            c04 = ctx.mma(a0, b4, c04, MMAShape.M16N8K16);
+            c05 = ctx.mma(a0, b5, c05, MMAShape.M16N8K16);
+            c06 = ctx.mma(a0, b6, c06, MMAShape.M16N8K16);
+            c07 = ctx.mma(a0, b7, c07, MMAShape.M16N8K16);
+            c10 = ctx.mma(a1, b0, c10, MMAShape.M16N8K16);
+            c11 = ctx.mma(a1, b1, c11, MMAShape.M16N8K16);
+            c12 = ctx.mma(a1, b2, c12, MMAShape.M16N8K16);
+            c13 = ctx.mma(a1, b3, c13, MMAShape.M16N8K16);
+            c14 = ctx.mma(a1, b4, c14, MMAShape.M16N8K16);
+            c15 = ctx.mma(a1, b5, c15, MMAShape.M16N8K16);
+            c16 = ctx.mma(a1, b6, c16, MMAShape.M16N8K16);
+            c17 = ctx.mma(a1, b7, c17, MMAShape.M16N8K16);
+            ctx.localBarrier();
+        }
+
+        int rBase = blockRow + warpM * WM;
+        int cBase = blockCol + warpN * WN;
+        ctx.mmaStore(c00, gateUpOut, rBase + 0, cBase + 0, outStride);
+        ctx.mmaStore(c01, gateUpOut, rBase + 0, cBase + 8, outStride);
+        ctx.mmaStore(c02, gateUpOut, rBase + 0, cBase + 16, outStride);
+        ctx.mmaStore(c03, gateUpOut, rBase + 0, cBase + 24, outStride);
+        ctx.mmaStore(c04, gateUpOut, rBase + 0, cBase + 32, outStride);
+        ctx.mmaStore(c05, gateUpOut, rBase + 0, cBase + 40, outStride);
+        ctx.mmaStore(c06, gateUpOut, rBase + 0, cBase + 48, outStride);
+        ctx.mmaStore(c07, gateUpOut, rBase + 0, cBase + 56, outStride);
+        ctx.mmaStore(c10, gateUpOut, rBase + 16, cBase + 0, outStride);
+        ctx.mmaStore(c11, gateUpOut, rBase + 16, cBase + 8, outStride);
+        ctx.mmaStore(c12, gateUpOut, rBase + 16, cBase + 16, outStride);
+        ctx.mmaStore(c13, gateUpOut, rBase + 16, cBase + 24, outStride);
+        ctx.mmaStore(c14, gateUpOut, rBase + 16, cBase + 32, outStride);
+        ctx.mmaStore(c15, gateUpOut, rBase + 16, cBase + 40, outStride);
+        ctx.mmaStore(c16, gateUpOut, rBase + 16, cBase + 48, outStride);
+        ctx.mmaStore(c17, gateUpOut, rBase + 16, cBase + 56, outStride);
     }
 
     /**

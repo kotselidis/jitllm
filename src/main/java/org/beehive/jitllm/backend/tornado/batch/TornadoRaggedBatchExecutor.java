@@ -335,7 +335,7 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
             sampleRows.set(s, s < sequences ? batch.lastTokenOf(s) : -1);
         }
         int activeRows = trimRows ? Math.min(maxRows, (rows + 15) & ~15) : maxRows;
-        layers.setActiveRows(activeRows);
+        layers.setActiveRows(activeRows, rows);
         activationGrid.setGlobalWork((long) activeRows * dim, 1, 1);
 
         plan.withGraph(0).withGridScheduler(gridScheduler).execute();
