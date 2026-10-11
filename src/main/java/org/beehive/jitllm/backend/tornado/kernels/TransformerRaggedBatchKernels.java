@@ -19,6 +19,9 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  * a prompt chunk bit-for-bit the token the decode path computes at the same position — the batch
  * invariance the engine relies on. Reviewing means diffing each against its twin.
  *
+ * <p>Key/value pool offsets are 64-bit, so the pool may hold more than {@code Integer.MAX_VALUE}
+ * values (TornadoVM's {@code long} array accessors).
+ *
  * <p>Causality within a chunk needs nothing here: the RoPE task writes every row's key and value
  * before the attention task runs, and each row attends over positions up to its own.
  *
@@ -89,8 +92,8 @@ public class TransformerRaggedBatchKernels {
 
                 int physBlock = blockTable.get(slot * maxBlocksPerSlot + pos / blockSize);
                 int slotInBlock = pos % blockSize;
-                int cacheOff =
-                        physBlock * (numLayers * blockSize * kvDim)
+                long cacheOff =
+                        (long) physBlock * (numLayers * blockSize * kvDim)
                                 + layerIndex * (blockSize * kvDim)
                                 + slotInBlock * kvDim;
                 keyPool.set(cacheOff + i, new HalfFloat(rotK0));
@@ -169,8 +172,8 @@ public class TransformerRaggedBatchKernels {
                 int d = idx % headSize;
                 int t = tileC + tInTile;
                 int physBlock = blockTable.get(slot * maxBlocksPerSlot + t / blockSize);
-                int kvOff =
-                        physBlock * blockStride
+                long kvOff =
+                        (long) physBlock * blockStride
                                 + layerOff
                                 + (t % blockSize) * kvDim
                                 + kvHeadIdx * headSize
@@ -327,8 +330,8 @@ public class TransformerRaggedBatchKernels {
                 int d = idx % headSize;
                 int t = tileC + tInTile;
                 int physBlock = blockTable.get(slot * maxBlocksPerSlot + t / blockSize);
-                int kvOff =
-                        physBlock * blockStride
+                long kvOff =
+                        (long) physBlock * blockStride
                                 + layerOff
                                 + (t % blockSize) * kvDim
                                 + kvHeadIdx * headSize
@@ -478,8 +481,8 @@ public class TransformerRaggedBatchKernels {
                 int dd = idx % headSize;
                 int t = tileC + tInTile;
                 int physBlock = blockTable.get(slot * maxBlocksPerSlot + t / blockSize);
-                int kvOff =
-                        physBlock * blockStride
+                long kvOff =
+                        (long) physBlock * blockStride
                                 + layerOff
                                 + (t % blockSize) * kvDim
                                 + kvHeadIdx * headSize

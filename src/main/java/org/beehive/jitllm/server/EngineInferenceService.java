@@ -93,7 +93,9 @@ public final class EngineInferenceService implements AutoCloseable {
                                         blockTokens,
                                         model.configuration().numberOfLayers(),
                                         model.kvCacheDim(),
-                                        fp16KeyValue()));
+                                        fp16KeyValue(),
+                                        // The ragged kernels address the pool in 64 bits.
+                                        maxBatchedTokens > 0));
         this.manager.attach(store);
         if (prefixCacheEntries > 0) {
             this.manager.enablePrefixCache(prefixCacheEntries);
