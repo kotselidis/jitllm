@@ -106,7 +106,9 @@ public class Qwen3Tokenizer implements Tokenizer {
         specialTokens.remove("</think>");
 
         this.vocabulary = vocabulary;
-        this.compiledPattern = Pattern.compile(splitPattern);
+        // \s is Unicode White_Space, as in the engines the pattern was written for: U+00A0 and
+        // U+3000 are spaces
+        this.compiledPattern = Pattern.compile(splitPattern, Pattern.UNICODE_CHARACTER_CLASS);
         this.specialTokens = new HashMap<>(specialTokens);
         this.merges = new HashMap<>();
         this.tokenTypes = tokenTypes;

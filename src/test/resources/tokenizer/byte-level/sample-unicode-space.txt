@@ -1,0 +1,10 @@
+Bonjour : comment allez-vous ? Très bien ! « Oui », dit-il.
+Prix : 1 234,56 € — soit 12 % de plus.
+　　日本語の文章。　段落の頭には全角スペースを入れる。
+中文　　两个全角空格　后面是文字。
+a　　b   c  
+d 　 　x
+x  = y  + z  * 3  / 4
+line separator paragraph nextline  ogham  x
+    indented  code(); 　// comment　
+   leading nbsp and trailing   

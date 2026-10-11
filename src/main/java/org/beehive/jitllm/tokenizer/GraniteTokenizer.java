@@ -69,7 +69,9 @@ public class GraniteTokenizer implements Tokenizer {
                     case "dbrx" -> DBRX_PATTERN;
                     default -> REFACT_PATTERN;
                 };
-        this.compiledPattern = Pattern.compile(pattern);
+        // \s is Unicode White_Space, as in the engines the pattern was written for: U+00A0 and
+        // U+3000 are spaces
+        this.compiledPattern = Pattern.compile(pattern, Pattern.UNICODE_CHARACTER_CLASS);
 
         // Read token IDs from metadata
         this.bosTokenId = getIntFromMetadata(metadata, "tokenizer.ggml.bos_token_id", 0);

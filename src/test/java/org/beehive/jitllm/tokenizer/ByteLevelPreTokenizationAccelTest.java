@@ -27,7 +27,14 @@ import org.junit.Test;
  *
  * <p>{@code sample.txt} is dense in what the split decides: indentation, spaces before punctuation
  * and operators, runs of spaces and a tab, digits, contractions, blank lines and non-Latin text.
- * The expected ids are recorded by {@code record_llama_cpp_ids.sh}.
+ * {@code sample-unicode-space.txt} is the same for whitespace that is not ASCII: French no-break
+ * spaces before punctuation, ideographic spaces in Chinese and Japanese, em, thin, ogham, NEL and
+ * line separators. The split patterns take {@code \s} as Unicode White_Space, as the engines they
+ * were written for do; Java's {@code \s} is ASCII unless the pattern is compiled with {@link
+ * java.util.regex.Pattern#UNICODE_CHARACTER_CLASS}, and without it {@code a}, two U+3000 and {@code
+ * b} split as {@code a}, both U+3000, {@code b} instead of {@code a}, one U+3000, U+3000 then
+ * {@code b}. The expected ids are recorded by {@code record_llama_cpp_ids.sh}; Hugging Face's
+ * tokenizers, given the same vocabulary, merges and pre-tokenizer, make the same ones.
  */
 public class ByteLevelPreTokenizationAccelTest {
 
@@ -67,13 +74,20 @@ public class ByteLevelPreTokenizationAccelTest {
         }
         // The vocabulary and merges only: no weights
         Model model = ModelLoader.loadModel(modelPath, 512, false, false);
-        String text = Files.readString(ROOT.resolve("sample.txt"));
+        assertSampleTokenizesAsLlamaCpp(model, "sample.txt", name + ".llama-cpp-ids.txt");
+        assertSampleTokenizesAsLlamaCpp(
+                model, "sample-unicode-space.txt", name + ".unicode-space.llama-cpp-ids.txt");
+    }
 
-        List<Integer> expected = ids(ROOT.resolve(name + ".llama-cpp-ids.txt"));
+    private static void assertSampleTokenizesAsLlamaCpp(Model model, String sample, String idsFile)
+            throws IOException {
+        String text = Files.readString(ROOT.resolve(sample));
+
+        List<Integer> expected = ids(ROOT.resolve(idsFile));
         List<Integer> actual = model.tokenizer().encodeAsList(text);
 
-        assertEquals(name + ": the ids llama.cpp produces", expected, actual);
-        assertEquals(name + ": decodes to the text", text, model.tokenizer().decode(actual));
+        assertEquals(idsFile + ": the ids llama.cpp produces", expected, actual);
+        assertEquals(idsFile + ": decodes to the text", text, model.tokenizer().decode(actual));
     }
 
     private static List<Integer> ids(Path file) throws IOException {
