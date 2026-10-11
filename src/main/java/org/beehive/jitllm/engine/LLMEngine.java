@@ -7,7 +7,8 @@ import java.util.Map;
 import java.util.function.IntConsumer;
 import org.beehive.jitllm.model.Model;
 import org.beehive.jitllm.runtime.batch.BatchExecutor;
-import org.beehive.jitllm.runtime.batch.BatchSlots;
+import org.beehive.jitllm.runtime.batch.StepOutput;
+import org.beehive.jitllm.runtime.batch.TokenBatch;
 import org.beehive.jitllm.runtime.kv.KvCacheManager;
 import org.beehive.jitllm.runtime.metrics.MetricKey;
 import org.beehive.jitllm.runtime.metrics.MetricsSink;
@@ -32,6 +33,12 @@ public final class LLMEngine implements AutoCloseable {
     private final Scheduler scheduler;
     private final BatchExecutor executor;
     private final KvCacheManager manager;
+
+    /** Tokens one step carries, across every running request. */
+    private final int tokenBudget;
+
+    /** Tokens one request may feed in a step; 1 for an executor that only decodes. */
+    private final int maxChunk;
 
     private final Map<ScheduledRequest, RequestHandle> handles = new IdentityHashMap<>();
     private final Map<ScheduledRequest, Integer> generated = new IdentityHashMap<>();
@@ -105,9 +112,22 @@ public final class LLMEngine implements AutoCloseable {
                             + ". B sizes the persistent buffers and the captured plan, so"
                             + " the two cannot disagree");
         }
+        if (executor.maxTokensPerStep() < maxBatchSize || executor.maxTokensPerSequence() < 1) {
+            throw new IllegalArgumentException(
+                    "the executor carries "
+                            + executor.maxTokensPerStep()
+                            + " tokens per step and "
+                            + executor.maxTokensPerSequence()
+                            + " per request, but B="
+                            + maxBatchSize
+                            + ". A step must fit one token for every running request, or a"
+                            + " generating request could be left without its token");
+        }
         this.model = model;
         this.manager = manager;
         this.executor = executor;
+        this.tokenBudget = executor.maxTokensPerStep();
+        this.maxChunk = executor.maxTokensPerSequence();
         this.metrics = metrics == null ? MetricsSink.disabled() : metrics;
         this.scheduler = new Scheduler(manager, maxBatchSize, maxQueuedRequests);
     }
@@ -256,44 +276,46 @@ public final class LLMEngine implements AutoCloseable {
                         }
                     }
                 }
-                ScheduledRequest[] slots = scheduler.activeSlots();
-                if (isEmpty(slots)) {
+                List<StepPlanner.Work> plan =
+                        StepPlanner.plan(running(scheduler.activeSlots()), tokenBudget, maxChunk);
+                if (plan.isEmpty()) {
                     return 0;
                 }
+                TokenBatch batch = compose(plan);
 
                 if (metrics.isEnabled()) {
                     metrics.record(MetricKey.ENGINE_STEPS, 1);
                     metrics.record(MetricKey.BATCH_OCCUPANCY, scheduler.runningCount());
+                    metrics.record(MetricKey.BATCHED_TOKENS, batch.tokenCount());
                     var capacity = manager.capacity();
                     metrics.record(MetricKey.KV_BLOCKS_IN_USE, capacity.usedBlocks());
                     metrics.record(MetricKey.KV_BLOCKS_TOTAL, capacity.totalBlocks());
                 }
-                int[] tokens = executor.decodeStep(compose(slots));
-                for (int slot = 0; slot < slots.length; slot++) {
-                    ScheduledRequest request = slots[slot];
-                    if (request == null) {
-                        continue; // inactive slot: ran, contributed nothing
-                    }
-                    int token = tokens[slot];
+                StepOutput output = executor.execute(batch);
+                for (int s = 0; s < plan.size(); s++) {
+                    ScheduledRequest request = plan.get(s).request();
+                    int fed = plan.get(s).tokens();
                     RequestHandle handle = handles.get(request);
-                    boolean generating = request.isGenerating();
-                    request.consume();
+                    int promptLength = request.promptTokens().length;
+                    boolean wasIngesting = request.consumed() < promptLength;
+                    request.consume(fed);
                     advanced++;
 
-                    if (request.consumed() == request.promptTokens().length) {
+                    if (wasIngesting && request.consumed() >= promptLength) {
                         // The prompt is fully ingested, so its KV exists and can be shared. Whole
                         // blocks only — a partial block is not something the table can point at.
                         int blockTokens = manager.capacity().blockSizeTokens();
-                        int covered = request.promptTokens().length / blockTokens * blockTokens;
+                        int covered = promptLength / blockTokens * blockTokens;
                         manager.rememberPrefix(request.lease(), request.promptTokens(), covered);
                     }
 
-                    if (!generating) {
-                        // Still feeding the prompt. The sample predicts a token we already have,
-                        // so it is discarded rather than delivered as output.
+                    if (!batch.samples()[s]) {
+                        // A prompt chunk that stopped short of the end: what it would sample is
+                        // the next prompt token, which we already have.
                         continue;
                     }
 
+                    int token = output.sampled()[s];
                     if (metrics.isEnabled() && handle.tokenCount() == 0) {
                         Long submitted = submittedAtNanos.get(request);
                         if (submitted != null) {
@@ -383,41 +405,55 @@ public final class LLMEngine implements AutoCloseable {
         return manager;
     }
 
-    /**
-     * Turns the scheduler's slots into the neutral batch the executor takes.
-     *
-     * <p>Inactive slots stay in the arrays, marked inactive rather than removed: the kernels run
-     * the whole batch every step, and a slot that vanished would shift every slot after it.
-     */
-    private BatchSlots compose(ScheduledRequest[] slots) {
-        boolean[] active = new boolean[slots.length];
-        int[] tokens = new int[slots.length];
-        int[] positions = new int[slots.length];
-        int[] kvSlots = new int[slots.length];
-        for (int slot = 0; slot < slots.length; slot++) {
-            ScheduledRequest request = slots[slot];
-            if (request == null) {
-                continue;
+    /** The running requests, in slot order. */
+    private static List<ScheduledRequest> running(ScheduledRequest[] slots) {
+        List<ScheduledRequest> running = new ArrayList<>(slots.length);
+        for (ScheduledRequest request : slots) {
+            if (request != null) {
+                running.add(request);
             }
-            active[slot] = true;
+        }
+        return running;
+    }
+
+    /**
+     * Lays the plan out as the flat token batch the executor takes: each request's tokens back to
+     * back, at the positions it has reached.
+     */
+    private TokenBatch compose(List<StepPlanner.Work> plan) {
+        int total = 0;
+        for (StepPlanner.Work work : plan) {
+            total += work.tokens();
+        }
+        int[] tokens = new int[total];
+        int[] positions = new int[total];
+        int[] sequenceOf = new int[total];
+        int[] kvSlots = new int[plan.size()];
+        int[] queryStart = new int[plan.size() + 1];
+        boolean[] samples = new boolean[plan.size()];
+        int t = 0;
+        for (int s = 0; s < plan.size(); s++) {
+            ScheduledRequest request = plan.get(s).request();
+            int fed = plan.get(s).tokens();
+            queryStart[s] = t;
+            kvSlots[s] = request.lease().slot();
+            samples[s] = request.samplesAfter(fed);
             RequestHandle handle = handles.get(request);
             int lastSampled =
                     handle.tokenCount() > 0 ? handle.tokens().get(handle.tokenCount() - 1) : 0;
-            tokens[slot] = request.nextInput(lastSampled);
-            // The absolute sequence position, which is how many tokens this sequence has been fed —
-            // prompt and generated alike. The KV block table is indexed by it.
-            positions[slot] = request.consumed();
-            kvSlots[slot] = request.lease().slot();
-        }
-        return new BatchSlots(active, tokens, positions, kvSlots);
-    }
-
-    private static boolean isEmpty(ScheduledRequest[] slots) {
-        for (ScheduledRequest request : slots) {
-            if (request != null) {
-                return false;
+            for (int i = 0; i < fed; i++, t++) {
+                // The absolute sequence position, which is how many tokens this sequence has been
+                // fed — prompt and generated alike. The KV block table is indexed by it.
+                int position = request.consumed() + i;
+                tokens[t] =
+                        position < request.promptTokens().length
+                                ? request.promptTokens()[position]
+                                : lastSampled;
+                positions[t] = position;
+                sequenceOf[t] = s;
             }
         }
-        return true;
+        queryStart[plan.size()] = t;
+        return new TokenBatch(tokens, positions, sequenceOf, kvSlots, queryStart, samples);
     }
 }

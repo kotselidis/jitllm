@@ -96,8 +96,14 @@ public final class ScheduledRequest {
         return consumed;
     }
 
-    void consume() {
-        consumed++;
+    /** Records that {@code tokens} more have been fed: a prompt chunk, or one decode token. */
+    void consume(int tokens) {
+        consumed += tokens;
+    }
+
+    /** Prompt tokens not yet fed; 0 once the request is generating. */
+    public int remainingPromptTokens() {
+        return Math.max(0, promptTokens.length - consumed);
     }
 
     /**
@@ -118,20 +124,16 @@ public final class ScheduledRequest {
     }
 
     /**
-     * Whether the token sampled after feeding position {@code consumed} is real output.
+     * Whether a step feeding {@code tokens} more tokens ends at or past the last prompt token, so
+     * the token it samples is real output.
      *
-     * <p>Prefill here is decode: the prompt is fed one token per step through the same graphs, and
-     * the sample that follows each prompt token predicts the next prompt token — which is already
-     * known and therefore discarded. Only the sample after the <b>last</b> prompt token is the
-     * first thing the model actually generated.
+     * <p>A sample that follows a prompt token before the last predicts the next prompt token —
+     * which is already known — so a chunk that stops short of the end of the prompt samples
+     * nothing. Only the sample after the <b>last</b> prompt token is the first thing the model
+     * actually generated.
      */
-    public boolean isGenerating() {
-        return consumed >= promptTokens.length - 1;
-    }
-
-    /** The token to feed this step: the next prompt token, or the last one sampled. */
-    public int nextInput(int lastSampled) {
-        return consumed < promptTokens.length ? promptTokens[consumed] : lastSampled;
+    public boolean samplesAfter(int tokens) {
+        return consumed + tokens >= promptTokens.length;
     }
 
     public RequestState state() {

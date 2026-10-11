@@ -56,6 +56,7 @@ final class ServingMetrics implements MetricsSink {
     private long requestsRejected;
     private long engineSteps;
     private long batchOccupancy;
+    private long batchedTokens;
     private long prefixBlocksReused;
 
     ServingMetrics(String servedModel) {
@@ -70,6 +71,7 @@ final class ServingMetrics implements MetricsSink {
             case REQUESTS_REJECTED -> requestsRejected += value;
             case ENGINE_STEPS -> engineSteps += value;
             case BATCH_OCCUPANCY -> batchOccupancy += value;
+            case BATCHED_TOKENS -> batchedTokens += value;
             case PREFIX_BLOCKS_REUSED -> prefixBlocksReused += value;
             default -> {
                 // Time to first token is measured by requestFinished, where the client sees it; KV
@@ -144,6 +146,11 @@ final class ServingMetrics implements MetricsSink {
                 "batch_occupancy_sum",
                 "Running requests summed over engine steps; divide by engine_steps_total.",
                 batchOccupancy);
+        counter(
+                out,
+                "batched_tokens_sum",
+                "Tokens computed summed over engine steps; divide by engine_steps_total.",
+                batchedTokens);
         counter(
                 out,
                 "prefix_cache_blocks_reused_total",
