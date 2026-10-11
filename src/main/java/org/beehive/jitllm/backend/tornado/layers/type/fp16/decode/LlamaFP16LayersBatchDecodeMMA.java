@@ -79,6 +79,13 @@ public class LlamaFP16LayersBatchDecodeMMA {
 
     private final int kvSplits = Integer.getInteger("jitllm.ragged.kvSplits", 16);
 
+    /**
+     * Split-K with the query heads of one KV head in one workgroup, so each key/value tile is read
+     * once per KV head rather than once per query head. Same output bits as per-head.
+     */
+    private final boolean gqaAttention =
+            !"false".equals(System.getProperty("jitllm.ragged.gqaAttention"));
+
     /** Fewest positions a split reads: a shorter context uses fewer splits, down to one. */
     private final int kvSplitMin = Integer.getInteger("jitllm.ragged.kvSplitMin", 256);
 
@@ -387,7 +394,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
             if (attnPartials != null) {
                 g.task(
                         "batch_attention",
-                        TransformerRaggedBatchKernels::raggedSplitKvAttentionPartial,
+                        groupedAttention()
+                                ? TransformerRaggedBatchKernels::raggedSplitKvAttentionPartialGqa
+                                : TransformerRaggedBatchKernels::raggedSplitKvAttentionPartial,
                         context,
                         seqPositions,
                         rowSlots,
@@ -613,7 +622,11 @@ public class LlamaFP16LayersBatchDecodeMMA {
         int attnLocal = attnLocalSize();
         attnWorker =
                 WorkerGridFactory.genericWorker(
-                        batchSize * nHeads * attnGroupsPerHead() * attnLocal, attnLocal);
+                        batchSize
+                                * (nHeads / attnHeadsPerGroup())
+                                * attnGroupsPerHead()
+                                * attnLocal,
+                        attnLocal);
         attnCombineWorker = WorkerGridFactory.genericWorker(batchSize * nHeads * headSz, headSz);
 
         mmaQkvWorker = mmaGrid(paddedBatch, dim + 2 * kvDim);
@@ -667,7 +680,12 @@ public class LlamaFP16LayersBatchDecodeMMA {
         ffnRmsApplyWorker.setGlobalWork((long) rows * dim, 1, 1);
         ropeWorker.setGlobalWork((long) rows * (dim / 2), 1, 1);
         attnWorker.setGlobalWork(
-                (long) rows * config.numberOfHeads() * attnGroupsPerHead() * attnLocalSize(), 1, 1);
+                (long) rows
+                        * (config.numberOfHeads() / attnHeadsPerGroup())
+                        * attnGroupsPerHead()
+                        * attnLocalSize(),
+                1,
+                1);
         attnCombineWorker.setGlobalWork(
                 (long) rows * config.numberOfHeads() * config.headSize(), 1, 1);
         mmaQkvWorker.setGlobalWork(mmaRows / 128 * 256L, (dim + 2L * config.kvDim()) / 128, 1);
@@ -677,14 +695,33 @@ public class LlamaFP16LayersBatchDecodeMMA {
         ewHidWorker.setGlobalWork((long) rows * hidDim, 1, 1);
     }
 
-    /** Threads per attention workgroup: one per head dimension, up to 128. */
-    private int attnLocalSize() {
-        return Math.min(config.headSize(), 128);
+    /**
+     * Whether the grouped split-K kernel runs: its workgroup holds every query head of a KV head,
+     * so {@code kvMul * headSize} must fit one workgroup and its shared tiles.
+     */
+    private boolean groupedAttention() {
+        return attnPartials != null
+                && gqaAttention
+                && config.kvMul() <= 8
+                && config.headSize() <= 128
+                && config.kvMul() * config.headSize() <= 1024;
     }
 
-    /** Attention workgroups per (row, head): one per split under split-K, else one. */
+    /** Threads per attention workgroup: a KV head's query heads grouped, else one head. */
+    private int attnLocalSize() {
+        return groupedAttention()
+                ? config.kvMul() * config.headSize()
+                : Math.min(config.headSize(), 128);
+    }
+
+    /** Attention workgroups per (row, head group): one per split under split-K, else one. */
     private int attnGroupsPerHead() {
         return attnPartials != null ? kvSplits : 1;
+    }
+
+    /** Query heads per attention workgroup. */
+    private int attnHeadsPerGroup() {
+        return groupedAttention() ? config.kvMul() : 1;
     }
 
     public List<ImmutableTaskGraph> getLayerImmutableTaskGraphs() {

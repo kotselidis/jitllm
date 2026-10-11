@@ -385,6 +385,152 @@ public class TransformerRaggedBatchKernels {
     }
 
     /**
+     * {@link #raggedSplitKvAttentionPartial} with the query heads that share a KV head computed
+     * together: one workgroup per (row, KV head, split), {@code kvMul * headSize} threads, thread
+     * {@code tid} owning query head {@code tid / headSize} of the group and dimension {@code tid %
+     * headSize}.
+     *
+     * <p>Each key/value tile is loaded once for all {@code kvMul} query heads instead of once per
+     * head. Every head's dot products, online softmax and accumulation run in the same order as in
+     * the per-head kernel, so the partial results — and the output — are the same bits; only the
+     * memory traffic shrinks, by {@code kvMul}.
+     *
+     * @param splitCfg {@code maxSplits | (minSplit << 16)}
+     */
+    public static void raggedSplitKvAttentionPartialGqa(
+            KernelContext context,
+            IntArray rowPositions,
+            IntArray rowSlots,
+            IntArray blockTable,
+            FloatArray qkvBatch,
+            HalfFloatArray keyPool,
+            HalfFloatArray valuePool,
+            FloatArray partials,
+            int nHeads,
+            int headSize,
+            int kvDim,
+            int kvMul,
+            int layerIndex,
+            int numLayers,
+            int blockCfg,
+            int splitCfg) {
+        int maxSplits = splitCfg & 0xFFFF;
+        int minSplit = splitCfg >>> 16;
+        int nKvHeads = nHeads / kvMul;
+        int tid = context.localIdx;
+        int g = context.groupIdx;
+        int localSz = context.localGroupSizeX;
+        int row = g / (nKvHeads * maxSplits);
+        int rem = g % (nKvHeads * maxSplits);
+        int kvHeadIdx = rem / maxSplits;
+        int s = rem % maxSplits;
+        int j = tid / headSize; // query head within the group
+        int d = tid % headSize; // the dimension this thread owns
+        int h = kvHeadIdx * kvMul + j;
+
+        int slot = rowSlots.get(row);
+        // Padding row: the whole workgroup returns together, so the barriers below stay uniform.
+        if (slot < 0) {
+            return;
+        }
+        int seqLen = rowPositions.get(row) + 1;
+        int chunk = Math.max(minSplit, (seqLen + maxSplits - 1) / maxSplits);
+        int startPos = s * chunk;
+        int endPos = Math.min(startPos + chunk, seqLen); // exclusive
+        int outBase = ((row * nHeads + h) * maxSplits + s) * (headSize + 2);
+        if (startPos >= seqLen) {
+            // Past the row's end: an empty split, which the combine skips.
+            if (d == 0) {
+                partials.set(outBase + headSize, Float.NEGATIVE_INFINITY);
+                partials.set(outBase + headSize + 1, 0.0f);
+            }
+            return;
+        }
+
+        int blockSize = blockCfg & 0xFFFF;
+        int maxBlocksPerSlot = blockCfg >>> 16;
+        int dim = nHeads * headSize;
+        int layerOff = layerIndex * (blockSize * kvDim);
+        int BLOCK_C = 16;
+        int qkvStride = dim + 2 * kvDim;
+        int blockStride = numLayers * blockSize * kvDim;
+
+        // Up to 1024 threads: kvMul * headSize query values, one tile, kvMul score rows.
+        float[] qShared = context.allocateFloatLocalArray(1024);
+        float[] kTile = context.allocateFloatLocalArray(16 * 128);
+        float[] vTile = context.allocateFloatLocalArray(16 * 128);
+        float[] sTile = context.allocateFloatLocalArray(16 * 8);
+
+        qShared[tid] = qkvBatch.get(row * qkvStride + h * headSize + d);
+        context.localBarrier();
+
+        float maxScore = Float.NEGATIVE_INFINITY;
+        float sumExp = 0.0f;
+        float acc = 0.0f;
+
+        for (int tileC = startPos; tileC < endPos; tileC += BLOCK_C) {
+            int tileEnd = Math.min(tileC + BLOCK_C, endPos) - 1;
+            int tileLen = tileEnd - tileC + 1;
+
+            for (int idx = tid; idx < tileLen * headSize; idx += localSz) {
+                int tInTile = idx / headSize;
+                int dd = idx % headSize;
+                int t = tileC + tInTile;
+                int physBlock = blockTable.get(slot * maxBlocksPerSlot + t / blockSize);
+                int kvOff =
+                        physBlock * blockStride
+                                + layerOff
+                                + (t % blockSize) * kvDim
+                                + kvHeadIdx * headSize
+                                + dd;
+                kTile[tInTile * headSize + dd] = keyPool.get(kvOff).getFloat32();
+                vTile[tInTile * headSize + dd] = valuePool.get(kvOff).getFloat32();
+            }
+            context.localBarrier();
+
+            // One thread per (query head, key position) pair.
+            for (int pair = tid; pair < kvMul * tileLen; pair += localSz) {
+                int jj = pair / tileLen;
+                int tInTile = pair % tileLen;
+                float score = 0.0f;
+                for (int dd = 0; dd < headSize; dd++) {
+                    score += qShared[jj * headSize + dd] * kTile[tInTile * headSize + dd];
+                }
+                sTile[jj * BLOCK_C + tInTile] = score / TornadoMath.sqrt(headSize);
+            }
+            context.localBarrier();
+
+            float tileMax = Float.NEGATIVE_INFINITY;
+            for (int t = 0; t < tileLen; t++) {
+                if (sTile[j * BLOCK_C + t] > tileMax) {
+                    tileMax = sTile[j * BLOCK_C + t];
+                }
+            }
+
+            float newMax = Math.max(maxScore, tileMax);
+            if (maxScore != Float.NEGATIVE_INFINITY && newMax != maxScore) {
+                float corr = TornadoMath.exp(maxScore - newMax);
+                sumExp *= corr;
+                acc *= corr;
+            }
+            maxScore = newMax;
+
+            for (int t = 0; t < tileLen; t++) {
+                float p = TornadoMath.exp(sTile[j * BLOCK_C + t] - maxScore);
+                sumExp += p;
+                acc += p * vTile[t * headSize + d];
+            }
+            context.localBarrier();
+        }
+
+        partials.set(outBase + d, acc);
+        if (d == 0) {
+            partials.set(outBase + headSize, maxScore);
+            partials.set(outBase + headSize + 1, sumExp);
+        }
+    }
+
+    /**
      * Split-K paged attention, second pass: one workgroup per (row, head), one thread per head
      * dimension. Rescales each split's partial result to the overall max and normalises by the
      * rescaled sum of the splits, visiting them in order.
