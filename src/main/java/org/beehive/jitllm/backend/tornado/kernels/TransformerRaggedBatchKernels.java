@@ -534,6 +534,761 @@ public class TransformerRaggedBatchKernels {
         }
     }
 
+    /** Rows of one MMA tile in {@link #raggedFlashAttentionMMA}: query rows times their heads. */
+    public static final int FLASH_TILE_ROWS = 16;
+
+    /**
+     * Split-K paged attention on tensor cores, first pass: one warp per (query tile, KV head,
+     * split). A query tile is up to {@code 16 / kvMul} consecutive rows of one sequence; with the
+     * {@code kvMul} query heads that share the KV head they make the 16 rows of an m16n8k16 tile.
+     * Every row — a decode token or a prompt token — goes through this kernel.
+     *
+     * <p>Per 16-key tile: K and V are staged in shared memory in the B-operand layout, {@code S = Q
+     * K^T} takes eight MMAs, each row's scores are masked at its own causal end and folded into its
+     * online softmax, and {@code P V} takes eight more MMAs whose result is added to the row's
+     * running output. The output and the split's max and sum go to {@code partials}, as for the
+     * scalar kernels, and {@link #raggedSplitKvAttentionCombine} merges the splits.
+     *
+     * <p><b>Batch invariance.</b> A row's scores, softmax and output come from its own query, its
+     * own mask and the key tiles aligned from its split's start — never from the other rows of the
+     * tile, which an MMA keeps apart. So a token computes the same bits alone or in any company,
+     * and in a prompt chunk or one at a time.
+     *
+     * <p>Fragments are fresh in every key tile and folded into private arrays: an accumulator
+     * fragment cannot be written through, and one carried across loop iterations does not compile.
+     *
+     * <p>Requires {@code headSize == 64} and {@code 16 % kvMul == 0}.
+     *
+     * @param queryTiles per tile, the first row and the row count; a count of 0 is padding
+     * @param splitCfg {@code maxSplits | (minSplit << 16)}
+     */
+    public static void raggedFlashAttentionMMA(
+            KernelContext context,
+            IntArray rowPositions,
+            IntArray rowSlots,
+            IntArray queryTiles,
+            IntArray blockTable,
+            FloatArray qkvBatch,
+            HalfFloatArray keyPool,
+            HalfFloatArray valuePool,
+            FloatArray partials,
+            int nHeads,
+            int headSize,
+            int kvDim,
+            int kvMul,
+            int layerIndex,
+            int numLayers,
+            int blockCfg,
+            int splitCfg) {
+        int maxSplits = splitCfg & 0xFFFF;
+        int minSplit = splitCfg >>> 16;
+        int nKvHeads = nHeads / kvMul;
+        int lane = context.localIdx;
+        int g = context.groupIdx;
+        int tile = g / (nKvHeads * maxSplits);
+        int rem = g % (nKvHeads * maxSplits);
+        int kvHeadIdx = rem / maxSplits;
+        int s = rem % maxSplits;
+
+        int firstRow = queryTiles.get(2 * tile);
+        int tileRows = queryTiles.get(2 * tile + 1);
+        // Padding tile: the whole warp returns together.
+        if (tileRows == 0) {
+            return;
+        }
+        int slot = rowSlots.get(firstRow);
+        int lastLen = rowPositions.get(firstRow + tileRows - 1) + 1;
+        int chunk = Math.max(minSplit, (lastLen + maxSplits - 1) / maxSplits);
+        int startPos = s * chunk;
+        int maxEnd = Math.min(startPos + chunk, lastLen);
+
+        int blockSize = blockCfg & 0xFFFF;
+        int maxBlocksPerSlot = blockCfg >>> 16;
+        int dim = nHeads * headSize;
+        int layerOff = layerIndex * (blockSize * kvDim);
+        int qkvStride = dim + 2 * kvDim;
+        int blockStride = numLayers * blockSize * kvDim;
+        float scale = 1.0f / TornadoMath.sqrt(headSize);
+
+        // Shared tiles, as int-packed half pairs in gemmMMA's operand layouts.
+        int[] qTile = context.allocateIntLocalArray(512); // A: 4 k-steps x 16 rows x 8 pairs
+        int[] kTile = context.allocateIntLocalArray(512); // B: 2 key blocks x 4 k-steps x 64
+        int[] vTile = context.allocateIntLocalArray(512); // B: 8 dim blocks x 16 keys x 4 pairs
+        int[] pTile = context.allocateIntLocalArray(128); // A: 16 rows x 8 key pairs
+        float[] sTile = context.allocateFloatLocalArray(256);
+        float[] rowMax = context.allocateFloatLocalArray(16);
+        float[] rowSum = context.allocateFloatLocalArray(16);
+        float[] rowCorr = context.allocateFloatLocalArray(16);
+        int[] rowEnd = context.allocateIntLocalArray(16);
+
+        // Tile row r is query row r / kvMul of the tile, head r % kvMul of the KV head's group.
+        for (int r = lane; r < 16; r += 32) {
+            int qr = r / kvMul;
+            rowMax[r] = Float.NEGATIVE_INFINITY;
+            rowSum[r] = 0.0f;
+            rowEnd[r] =
+                    qr < tileRows
+                            ? Math.min(startPos + chunk, rowPositions.get(firstRow + qr) + 1)
+                            : 0;
+        }
+        for (int idx = lane; idx < 512; idx += 32) {
+            int kStep = idx >>> 7;
+            int r = (idx >>> 3) & 15;
+            int pair = idx & 7;
+            int qr = r / kvMul;
+            int packed = 0;
+            if (qr < tileRows) {
+                int h = kvHeadIdx * kvMul + r % kvMul;
+                int base = (firstRow + qr) * qkvStride + h * headSize + kStep * 16 + pair * 2;
+                int lo = new HalfFloat(qkvBatch.get(base)).getHalfFloatValue() & 0xFFFF;
+                int hi = new HalfFloat(qkvBatch.get(base + 1)).getHalfFloatValue() & 0xFFFF;
+                packed = lo | (hi << 16);
+            }
+            qTile[idx] = packed;
+        }
+        float[] oAcc = new float[32];
+        for (int e = 0; e < 32; e++) {
+            oAcc[e] = 0.0f;
+        }
+        context.localBarrier();
+
+        for (int tileC = startPos; tileC < maxEnd; tileC += 16) {
+            // K as B for S = Q K^T: element (k = dim, n = key), packing keys (2p, 2p + 1).
+            for (int idx = lane; idx < 512; idx += 32) {
+                int keyBlock = idx >>> 8;
+                int kStep = (idx >>> 6) & 3;
+                int kRow = (idx >>> 2) & 15;
+                int p = idx & 3;
+                int t = tileC + keyBlock * 8 + p * 2;
+                int d = kStep * 16 + kRow;
+                int lo = 0;
+                int hi = 0;
+                if (t < maxEnd) {
+                    long off =
+                            (long) blockTable.get(slot * maxBlocksPerSlot + t / blockSize)
+                                            * blockStride
+                                    + layerOff
+                                    + (t % blockSize) * kvDim
+                                    + kvHeadIdx * headSize
+                                    + d;
+                    lo = keyPool.get(off).getHalfFloatValue() & 0xFFFF;
+                }
+                if (t + 1 < maxEnd) {
+                    long off =
+                            (long) blockTable.get(slot * maxBlocksPerSlot + (t + 1) / blockSize)
+                                            * blockStride
+                                    + layerOff
+                                    + ((t + 1) % blockSize) * kvDim
+                                    + kvHeadIdx * headSize
+                                    + d;
+                    hi = keyPool.get(off).getHalfFloatValue() & 0xFFFF;
+                }
+                kTile[idx] = lo | (hi << 16);
+            }
+            // V as B for P V: element (k = key, n = dim), packing dims (2p, 2p + 1).
+            for (int idx = lane; idx < 512; idx += 32) {
+                int dimBlock = idx >>> 6;
+                int key = (idx >>> 2) & 15;
+                int p = idx & 3;
+                int t = tileC + key;
+                int packed = 0;
+                if (t < maxEnd) {
+                    long off =
+                            (long) blockTable.get(slot * maxBlocksPerSlot + t / blockSize)
+                                            * blockStride
+                                    + layerOff
+                                    + (t % blockSize) * kvDim
+                                    + kvHeadIdx * headSize
+                                    + dimBlock * 8
+                                    + p * 2;
+                    int lo = valuePool.get(off).getHalfFloatValue() & 0xFFFF;
+                    int hi = valuePool.get(off + 1).getHalfFloatValue() & 0xFFFF;
+                    packed = lo | (hi << 16);
+                }
+                vTile[idx] = packed;
+            }
+            context.localBarrier();
+
+            float[] s0 = context.mmaFragment(0.0f);
+            float[] s1 = context.mmaFragment(0.0f);
+            HalfFloat[] qa0 = context.mmaLoadA(qTile, 16, 0);
+            s0 = context.mma(qa0, context.mmaLoadB(kTile, 16, 0), s0, MMAShape.M16N8K16);
+            s1 = context.mma(qa0, context.mmaLoadB(kTile, 16, 1024), s1, MMAShape.M16N8K16);
+            HalfFloat[] qa1 = context.mmaLoadA(qTile, 16, 512);
+            s0 = context.mma(qa1, context.mmaLoadB(kTile, 16, 256), s0, MMAShape.M16N8K16);
+            s1 = context.mma(qa1, context.mmaLoadB(kTile, 16, 1280), s1, MMAShape.M16N8K16);
+            HalfFloat[] qa2 = context.mmaLoadA(qTile, 16, 1024);
+            s0 = context.mma(qa2, context.mmaLoadB(kTile, 16, 512), s0, MMAShape.M16N8K16);
+            s1 = context.mma(qa2, context.mmaLoadB(kTile, 16, 1536), s1, MMAShape.M16N8K16);
+            HalfFloat[] qa3 = context.mmaLoadA(qTile, 16, 1536);
+            s0 = context.mma(qa3, context.mmaLoadB(kTile, 16, 768), s0, MMAShape.M16N8K16);
+            s1 = context.mma(qa3, context.mmaLoadB(kTile, 16, 1792), s1, MMAShape.M16N8K16);
+
+            // Scores to shared memory, scaled and masked at each row's causal end.
+            int r0 = lane / 4;
+            int c0 = (lane % 4) * 2;
+            sTile[r0 * 16 + (c0 + 0)] =
+                    tileC + (c0 + 0) < rowEnd[r0] ? s0[0] * scale : Float.NEGATIVE_INFINITY;
+            sTile[r0 * 16 + (c0 + 1)] =
+                    tileC + (c0 + 1) < rowEnd[r0] ? s0[1] * scale : Float.NEGATIVE_INFINITY;
+            sTile[(r0 + 8) * 16 + (c0 + 0)] =
+                    tileC + (c0 + 0) < rowEnd[(r0 + 8)] ? s0[2] * scale : Float.NEGATIVE_INFINITY;
+            sTile[(r0 + 8) * 16 + (c0 + 1)] =
+                    tileC + (c0 + 1) < rowEnd[(r0 + 8)] ? s0[3] * scale : Float.NEGATIVE_INFINITY;
+            sTile[r0 * 16 + (c0 + 8)] =
+                    tileC + (c0 + 8) < rowEnd[r0] ? s1[0] * scale : Float.NEGATIVE_INFINITY;
+            sTile[r0 * 16 + (c0 + 9)] =
+                    tileC + (c0 + 9) < rowEnd[r0] ? s1[1] * scale : Float.NEGATIVE_INFINITY;
+            sTile[(r0 + 8) * 16 + (c0 + 8)] =
+                    tileC + (c0 + 8) < rowEnd[(r0 + 8)] ? s1[2] * scale : Float.NEGATIVE_INFINITY;
+            sTile[(r0 + 8) * 16 + (c0 + 9)] =
+                    tileC + (c0 + 9) < rowEnd[(r0 + 8)] ? s1[3] * scale : Float.NEGATIVE_INFINITY;
+            context.localBarrier();
+
+            // Online softmax, one lane per row; P to shared memory in the A layout.
+            if (lane < 16) {
+                int r = lane;
+                float tileMax = Float.NEGATIVE_INFINITY;
+                for (int c = 0; c < 16; c++) {
+                    tileMax = Math.max(tileMax, sTile[r * 16 + c]);
+                }
+                float m = rowMax[r];
+                float newMax = Math.max(m, tileMax);
+                // A tile wholly past the row's end leaves it exactly as it was.
+                float corr =
+                        tileMax == Float.NEGATIVE_INFINITY
+                                ? 1.0f
+                                : (m == Float.NEGATIVE_INFINITY
+                                        ? 0.0f
+                                        : TornadoMath.exp(m - newMax));
+                float sum = rowSum[r] * corr;
+                for (int c = 0; c < 16; c += 2) {
+                    float p0 =
+                            sTile[r * 16 + c] == Float.NEGATIVE_INFINITY
+                                    ? 0.0f
+                                    : TornadoMath.exp(sTile[r * 16 + c] - newMax);
+                    float p1 =
+                            sTile[r * 16 + c + 1] == Float.NEGATIVE_INFINITY
+                                    ? 0.0f
+                                    : TornadoMath.exp(sTile[r * 16 + c + 1] - newMax);
+                    sum += p0 + p1;
+                    int lo = new HalfFloat(p0).getHalfFloatValue() & 0xFFFF;
+                    int hi = new HalfFloat(p1).getHalfFloatValue() & 0xFFFF;
+                    pTile[r * 8 + c / 2] = lo | (hi << 16);
+                }
+                rowSum[r] = sum;
+                rowMax[r] = tileMax == Float.NEGATIVE_INFINITY ? m : newMax;
+                rowCorr[r] = corr;
+            }
+            context.localBarrier();
+
+            // P V into fresh fragments, folded into the running output with the rows' corrections.
+            HalfFloat[] pa = context.mmaLoadA(pTile, 16, 0);
+            float corrLo = rowCorr[r0];
+            float corrHi = rowCorr[r0 + 8];
+            float[] o0 = context.mmaFragment(0.0f);
+            o0 = context.mma(pa, context.mmaLoadB(vTile, 16, 0), o0, MMAShape.M16N8K16);
+            oAcc[0] = oAcc[0] * corrLo + o0[0];
+            oAcc[1] = oAcc[1] * corrLo + o0[1];
+            oAcc[2] = oAcc[2] * corrHi + o0[2];
+            oAcc[3] = oAcc[3] * corrHi + o0[3];
+            float[] o1 = context.mmaFragment(0.0f);
+            o1 = context.mma(pa, context.mmaLoadB(vTile, 16, 256), o1, MMAShape.M16N8K16);
+            oAcc[4] = oAcc[4] * corrLo + o1[0];
+            oAcc[5] = oAcc[5] * corrLo + o1[1];
+            oAcc[6] = oAcc[6] * corrHi + o1[2];
+            oAcc[7] = oAcc[7] * corrHi + o1[3];
+            float[] o2 = context.mmaFragment(0.0f);
+            o2 = context.mma(pa, context.mmaLoadB(vTile, 16, 512), o2, MMAShape.M16N8K16);
+            oAcc[8] = oAcc[8] * corrLo + o2[0];
+            oAcc[9] = oAcc[9] * corrLo + o2[1];
+            oAcc[10] = oAcc[10] * corrHi + o2[2];
+            oAcc[11] = oAcc[11] * corrHi + o2[3];
+            float[] o3 = context.mmaFragment(0.0f);
+            o3 = context.mma(pa, context.mmaLoadB(vTile, 16, 768), o3, MMAShape.M16N8K16);
+            oAcc[12] = oAcc[12] * corrLo + o3[0];
+            oAcc[13] = oAcc[13] * corrLo + o3[1];
+            oAcc[14] = oAcc[14] * corrHi + o3[2];
+            oAcc[15] = oAcc[15] * corrHi + o3[3];
+            float[] o4 = context.mmaFragment(0.0f);
+            o4 = context.mma(pa, context.mmaLoadB(vTile, 16, 1024), o4, MMAShape.M16N8K16);
+            oAcc[16] = oAcc[16] * corrLo + o4[0];
+            oAcc[17] = oAcc[17] * corrLo + o4[1];
+            oAcc[18] = oAcc[18] * corrHi + o4[2];
+            oAcc[19] = oAcc[19] * corrHi + o4[3];
+            float[] o5 = context.mmaFragment(0.0f);
+            o5 = context.mma(pa, context.mmaLoadB(vTile, 16, 1280), o5, MMAShape.M16N8K16);
+            oAcc[20] = oAcc[20] * corrLo + o5[0];
+            oAcc[21] = oAcc[21] * corrLo + o5[1];
+            oAcc[22] = oAcc[22] * corrHi + o5[2];
+            oAcc[23] = oAcc[23] * corrHi + o5[3];
+            float[] o6 = context.mmaFragment(0.0f);
+            o6 = context.mma(pa, context.mmaLoadB(vTile, 16, 1536), o6, MMAShape.M16N8K16);
+            oAcc[24] = oAcc[24] * corrLo + o6[0];
+            oAcc[25] = oAcc[25] * corrLo + o6[1];
+            oAcc[26] = oAcc[26] * corrHi + o6[2];
+            oAcc[27] = oAcc[27] * corrHi + o6[3];
+            float[] o7 = context.mmaFragment(0.0f);
+            o7 = context.mma(pa, context.mmaLoadB(vTile, 16, 1792), o7, MMAShape.M16N8K16);
+            oAcc[28] = oAcc[28] * corrLo + o7[0];
+            oAcc[29] = oAcc[29] * corrLo + o7[1];
+            oAcc[30] = oAcc[30] * corrHi + o7[2];
+            oAcc[31] = oAcc[31] * corrHi + o7[3];
+            context.localBarrier();
+        }
+
+        // Unnormalised output, max and sum per (row, head, split), the scalar kernels' layout.
+        int r0 = lane / 4;
+        int c0 = (lane % 4) * 2;
+        writeFlashOutput(
+                partials,
+                oAcc[0],
+                r0,
+                0 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[1],
+                r0,
+                0 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[2],
+                (r0 + 8),
+                0 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[3],
+                (r0 + 8),
+                0 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[4],
+                r0,
+                8 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[5],
+                r0,
+                8 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[6],
+                (r0 + 8),
+                8 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[7],
+                (r0 + 8),
+                8 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[8],
+                r0,
+                16 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[9],
+                r0,
+                16 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[10],
+                (r0 + 8),
+                16 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[11],
+                (r0 + 8),
+                16 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[12],
+                r0,
+                24 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[13],
+                r0,
+                24 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[14],
+                (r0 + 8),
+                24 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[15],
+                (r0 + 8),
+                24 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[16],
+                r0,
+                32 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[17],
+                r0,
+                32 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[18],
+                (r0 + 8),
+                32 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[19],
+                (r0 + 8),
+                32 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[20],
+                r0,
+                40 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[21],
+                r0,
+                40 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[22],
+                (r0 + 8),
+                40 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[23],
+                (r0 + 8),
+                40 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[24],
+                r0,
+                48 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[25],
+                r0,
+                48 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[26],
+                (r0 + 8),
+                48 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[27],
+                (r0 + 8),
+                48 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[28],
+                r0,
+                56 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[29],
+                r0,
+                56 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[30],
+                (r0 + 8),
+                56 + c0 + 0,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        writeFlashOutput(
+                partials,
+                oAcc[31],
+                (r0 + 8),
+                56 + c0 + 1,
+                firstRow,
+                tileRows,
+                kvHeadIdx,
+                kvMul,
+                nHeads,
+                headSize,
+                maxSplits,
+                s);
+        if (lane < 16) {
+            int qr = lane / kvMul;
+            if (qr < tileRows) {
+                int h = kvHeadIdx * kvMul + lane % kvMul;
+                int outBase = (((firstRow + qr) * nHeads + h) * maxSplits + s) * (headSize + 2);
+                partials.set(outBase + headSize, rowMax[lane]);
+                partials.set(outBase + headSize + 1, rowSum[lane]);
+            }
+        }
+    }
+
+    /** One output value of {@link #raggedFlashAttentionMMA}, dropped for a padding row. */
+    private static void writeFlashOutput(
+            FloatArray partials,
+            float value,
+            int r,
+            int dimIndex,
+            int firstRow,
+            int tileRows,
+            int kvHeadIdx,
+            int kvMul,
+            int nHeads,
+            int headSize,
+            int maxSplits,
+            int s) {
+        int qr = r / kvMul;
+        if (qr < tileRows) {
+            int h = kvHeadIdx * kvMul + r % kvMul;
+            int outBase = (((firstRow + qr) * nHeads + h) * maxSplits + s) * (headSize + 2);
+            partials.set(outBase + dimIndex, value);
+        }
+    }
+
     /**
      * Split-K paged attention, second pass: one workgroup per (row, head), one thread per head
      * dimension. Rescales each split's partial result to the overall max and normalises by the

@@ -366,7 +366,24 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
             sampleRows.set(s, s < sequences ? batch.lastTokenOf(s) : -1);
         }
         int activeRows = trimRows ? Math.min(maxRows, (rows + 15) & ~15) : maxRows;
-        layers.setActiveRows(activeRows, rows);
+        // Query tiles for attention: each sequence's rows in runs of up to queryTileRows(), so a
+        // prompt chunk's rows share key/value reads; a decode row is a tile of one.
+        IntArray tiles = layers.queryTiles();
+        int tileCount = 0;
+        int queryTile = layers.queryTileRows();
+        for (int s = 0; s < sequences; s++) {
+            int end = batch.queryStart()[s + 1];
+            for (int r = batch.queryStart()[s]; r < end; r += queryTile) {
+                tiles.set(2 * tileCount, r);
+                tiles.set(2 * tileCount + 1, Math.min(queryTile, end - r));
+                tileCount++;
+            }
+        }
+        for (int t = tileCount; t < maxRows; t++) {
+            tiles.set(2 * t, 0);
+            tiles.set(2 * t + 1, 0);
+        }
+        layers.setActiveRows(activeRows, rows, tileCount);
         // A few sampling sequences take the skinny vocabulary GEMM; the guarded 128-row one then
         // launches a single tile that returns at once. Disabled, the count reads as large.
         boolean smallVocab = skinnyVocab && sequences <= TransformerRaggedBatchKernels.SKINNY_ROWS;

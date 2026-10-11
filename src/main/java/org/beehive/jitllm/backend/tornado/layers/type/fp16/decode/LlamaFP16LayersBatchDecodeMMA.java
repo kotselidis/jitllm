@@ -77,7 +77,11 @@ public class LlamaFP16LayersBatchDecodeMMA {
      */
     private final boolean splitKv = !"false".equals(System.getProperty("jitllm.ragged.splitKv"));
 
-    private final int kvSplits = Integer.getInteger("jitllm.ragged.kvSplits", 16);
+    /**
+     * Splits per row, at least enough that a split is always {@code kvSplitMin} positions — which
+     * the tiled attention kernel needs, so every row of a query tile splits alike.
+     */
+    private final int kvSplits;
 
     /**
      * Split-K with the query heads of one KV head in one workgroup, so each key/value tile is read
@@ -85,6 +89,18 @@ public class LlamaFP16LayersBatchDecodeMMA {
      */
     private final boolean gqaAttention =
             !"false".equals(System.getProperty("jitllm.ragged.gqaAttention"));
+
+    /**
+     * Attention on tensor cores for every row ({@link
+     * TransformerRaggedBatchKernels#raggedFlashAttentionMMA}): query tiles of up to {@code 16 /
+     * kvMul} rows of one sequence share each key/value tile. Batch invariant, but not the scalar
+     * kernels' bits.
+     */
+    private final boolean flashAttention =
+            !"false".equals(System.getProperty("jitllm.ragged.flashAttention"));
+
+    // Per query tile, its first row and row count; written by the executor each step.
+    private final IntArray queryTiles;
 
     /** Fewest positions a split reads: a shorter context uses fewer splits, down to one. */
     private final int kvSplitMin = Integer.getInteger("jitllm.ragged.kvSplitMin", 256);
@@ -216,6 +232,11 @@ public class LlamaFP16LayersBatchDecodeMMA {
         if (rowSlots != null && (!paged || keyCacheBatchFP16 == null)) {
             throw new IllegalArgumentException("ragged rows need a paged FP16 key/value pool");
         }
+        this.kvSplits =
+                Math.max(
+                        Integer.getInteger("jitllm.ragged.kvSplits", 16),
+                        (decodeCtx + kvSplitMin - 1) / kvSplitMin);
+        this.queryTiles = rowSlots != null ? new IntArray(2 * batchSize) : null;
         this.stepRows = rowSlots != null ? new IntArray(1) : null;
         this.attnPartials =
                 rowSlots != null && splitKv
@@ -246,7 +267,8 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 g.transferToDevice(DataTransferMode.EVERY_EXECUTION, blockTable);
             }
             if (rowSlots != null) {
-                g.transferToDevice(DataTransferMode.EVERY_EXECUTION, rowSlots, stepRows);
+                g.transferToDevice(
+                        DataTransferMode.EVERY_EXECUTION, rowSlots, stepRows, queryTiles);
             }
             if (attnPartials != null) {
                 g.transferToDevice(DataTransferMode.FIRST_EXECUTION, attnPartials);
@@ -273,7 +295,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 g.consumeFromDevice(pred, context, blockTable);
             }
             if (rowSlots != null) {
-                g.consumeFromDevice(pred, context, rowSlots, stepRows);
+                g.consumeFromDevice(pred, context, rowSlots, stepRows, queryTiles);
             }
             if (attnPartials != null) {
                 g.consumeFromDevice(pred, context, attnPartials);
@@ -452,7 +474,28 @@ public class LlamaFP16LayersBatchDecodeMMA {
                         dim);
             }
 
-            if (attnPartials != null) {
+            if (tiled()) {
+                g.task(
+                        "batch_attention",
+                        TransformerRaggedBatchKernels::raggedFlashAttentionMMA,
+                        context,
+                        seqPositions,
+                        rowSlots,
+                        queryTiles,
+                        blockTable,
+                        state.workspace.qkvResultBatch,
+                        keyCacheBatchFP16,
+                        valueCacheBatchFP16,
+                        attnPartials,
+                        config.numberOfHeads(),
+                        config.headSize(),
+                        kvDim,
+                        config.kvMul(),
+                        layerIndex,
+                        config.numberOfLayers(),
+                        blockCfg,
+                        kvSplits | (kvSplitMin << 16));
+            } else if (attnPartials != null) {
                 g.task(
                         "batch_attention",
                         groupedAttention()
@@ -474,6 +517,8 @@ public class LlamaFP16LayersBatchDecodeMMA {
                         config.numberOfLayers(),
                         blockCfg,
                         kvSplits | (kvSplitMin << 16));
+            }
+            if (attnPartials != null) {
                 g.task(
                         "batch_attention_combine",
                         TransformerRaggedBatchKernels::raggedSplitKvAttentionCombine,
@@ -876,6 +921,15 @@ public class LlamaFP16LayersBatchDecodeMMA {
      * @param realRows the step's tokens, before rounding up to {@code rows}
      */
     public void setActiveRows(int rows, int realRows) {
+        setActiveRows(rows, realRows, rows);
+    }
+
+    /**
+     * {@link #setActiveRows(int, int)}, with the step's query-tile count for tiled attention.
+     *
+     * @param tiles query tiles written to {@link #queryTiles()}, at most {@code batchSize}
+     */
+    public void setActiveRows(int rows, int realRows, int tiles) {
         if (rows <= 0 || rows > batchSize || rows % 16 != 0) {
             throw new IllegalArgumentException(
                     "active rows must be a positive multiple of 16 up to "
@@ -891,7 +945,7 @@ public class LlamaFP16LayersBatchDecodeMMA {
         ffnRmsApplyWorker.setGlobalWork((long) rows * dim, 1, 1);
         ropeWorker.setGlobalWork((long) rows * (dim / 2), 1, 1);
         attnWorker.setGlobalWork(
-                (long) rows
+                (long) (tiled() ? Math.max(tiles, 1) : rows)
                         * (config.numberOfHeads() / attnHeadsPerGroup())
                         * attnGroupsPerHead()
                         * attnLocalSize(),
@@ -931,8 +985,11 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 && config.kvMul() * config.headSize() <= 1024;
     }
 
-    /** Threads per attention workgroup: a KV head's query heads grouped, else one head. */
+    /** Threads per attention workgroup: a warp on tensor cores, else per the scalar kernel. */
     private int attnLocalSize() {
+        if (tiled()) {
+            return 32;
+        }
         return groupedAttention()
                 ? config.kvMul() * config.headSize()
                 : Math.min(config.headSize(), 128);
@@ -943,9 +1000,27 @@ public class LlamaFP16LayersBatchDecodeMMA {
         return attnPartials != null ? kvSplits : 1;
     }
 
+    /** Whether attention runs on tensor cores, one warp per query tile. */
+    private boolean tiled() {
+        return attnPartials != null
+                && flashAttention
+                && config.headSize() == 64
+                && TransformerRaggedBatchKernels.FLASH_TILE_ROWS % config.kvMul() == 0;
+    }
+
+    /** Rows of one sequence per attention query tile: 16 / kvMul on tensor cores, else one. */
+    public int queryTileRows() {
+        return tiled() ? TransformerRaggedBatchKernels.FLASH_TILE_ROWS / config.kvMul() : 1;
+    }
+
+    /** The executor writes each step's query tiles here: first row and row count per tile. */
+    public IntArray queryTiles() {
+        return queryTiles;
+    }
+
     /** Query heads per attention workgroup. */
     private int attnHeadsPerGroup() {
-        return groupedAttention() ? config.kvMul() : 1;
+        return tiled() || groupedAttention() ? config.kvMul() : 1;
     }
 
     public List<ImmutableTaskGraph> getLayerImmutableTaskGraphs() {
