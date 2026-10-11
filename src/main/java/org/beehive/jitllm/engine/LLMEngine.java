@@ -141,6 +141,17 @@ public final class LLMEngine implements AutoCloseable {
      * "full" from "broken" should not have to read an exception type to do it.
      */
     public RequestHandle addRequest(int[] promptTokens, int maxNewTokens, IntConsumer onToken) {
+        return addRequest(promptTokens, maxNewTokens, false, onToken);
+    }
+
+    /**
+     * Submits a request that may run past its stop tokens.
+     *
+     * @param ignoreStopTokens generate exactly {@code maxNewTokens}, delivering a stop token as
+     *     ordinary output. For load tests, where every engine must produce the same token count
+     */
+    public RequestHandle addRequest(
+            int[] promptTokens, int maxNewTokens, boolean ignoreStopTokens, IntConsumer onToken) {
         if (promptTokens == null || promptTokens.length == 0) {
             throw new IllegalArgumentException(
                     "a request needs prepared prompt tokens. The engine"
@@ -162,6 +173,7 @@ public final class LLMEngine implements AutoCloseable {
             request = scheduler.submit(declaredBudgetTokens);
             request.promptTokens(promptTokens);
             request.maxNewTokens(maxNewTokens);
+            request.ignoreStopTokens(ignoreStopTokens);
             handle = new RequestHandle(request, onToken);
             handles.put(request, handle);
             if (metrics.isEnabled()) {
@@ -295,7 +307,8 @@ public final class LLMEngine implements AutoCloseable {
                     int count = generated.merge(request, 1, Integer::sum);
                     // The stop token is the model's vocabulary; the budget is the scheduler's.
                     boolean finished =
-                            executor.isStopToken(token) || count >= request.maxNewTokens();
+                            (executor.isStopToken(token) && !request.ignoresStopTokens())
+                                    || count >= request.maxNewTokens();
                     if (finished) {
                         scheduler.complete(request);
                         terminal.add(handle);

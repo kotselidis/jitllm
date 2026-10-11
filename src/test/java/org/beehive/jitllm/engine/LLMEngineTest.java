@@ -116,6 +116,28 @@ public class LLMEngineTest {
         }
     }
 
+    /** A load test needs every engine to emit the same count, so the stop token must not end it. */
+    @Test
+    public void ignoringStopTokensRunsToTheBudget() {
+        try (KvCacheManager manager = manager(2, 4)) {
+            FakeBatchExecutor executor = new FakeBatchExecutor(2, 3);
+            try (LLMEngine engine = engine(manager, executor, 2, 8)) {
+                RequestHandle handle = engine.addRequest(PROMPT, 10, true, null);
+
+                while (!handle.isTerminal()) {
+                    engine.step();
+                }
+
+                assertEquals(RequestState.COMPLETED, handle.state());
+                assertEquals("the whole budget, stop tokens included", 10, handle.tokenCount());
+                assertTrue(
+                        "a stop token was delivered as output",
+                        handle.tokens().contains(FakeBatchExecutor.STOP_TOKEN));
+                assertEquals("the lease went back", 0, manager.liveLeases());
+            }
+        }
+    }
+
     /** 0…B active per step; inactive slots are passed to the executor, not skipped. */
     @Test
     public void inactiveSlotsAreStillPartOfTheBatch() {

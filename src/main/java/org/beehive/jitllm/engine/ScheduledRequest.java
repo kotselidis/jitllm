@@ -37,6 +37,14 @@ public final class ScheduledRequest {
 
     private int maxNewTokens;
 
+    /**
+     * Generate exactly {@link #maxNewTokens} tokens, past any stop token.
+     *
+     * <p>Exists for load testing: engines compared on throughput must produce the same number of
+     * tokens per request, and without it each stops wherever its own model says.
+     */
+    private boolean ignoreStopTokens;
+
     private RequestState state = RequestState.QUEUED;
     private RejectionReason rejectionReason;
     private Throwable failure;
@@ -72,6 +80,15 @@ public final class ScheduledRequest {
 
     void maxNewTokens(int maxNewTokens) {
         this.maxNewTokens = maxNewTokens;
+    }
+
+    /** Whether a stop token is delivered as ordinary output instead of ending the request. */
+    public boolean ignoresStopTokens() {
+        return ignoreStopTokens;
+    }
+
+    void ignoreStopTokens(boolean ignore) {
+        this.ignoreStopTokens = ignore;
     }
 
     /** Tokens fed so far, which is also the position the next one occupies. */

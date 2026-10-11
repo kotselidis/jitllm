@@ -44,9 +44,27 @@ public final class InferenceService {
     /**
      * A single generation request. {@code messages} are role/content turns (chat); a lone user turn
      * covers the completions endpoint.
+     *
+     * @param ignoreEos generate exactly {@code maxTokens}, past any stop token. Load tests need it
+     *     so every engine produces the same count; only the continuous-batching path supports it
      */
     public record Request(
-            List<ChatMessage> messages, int maxTokens, float temperature, float topP, long seed) {}
+            List<ChatMessage> messages,
+            int maxTokens,
+            float temperature,
+            float topP,
+            long seed,
+            boolean ignoreEos) {
+
+        public Request(
+                List<ChatMessage> messages,
+                int maxTokens,
+                float temperature,
+                float topP,
+                long seed) {
+            this(messages, maxTokens, temperature, topP, seed, false);
+        }
+    }
 
     /** Result of a generation: the text and the token counts (for {@code usage}). */
     public record Result(String text, int promptTokens, int completionTokens, boolean stopped) {}

@@ -39,6 +39,7 @@ public final class EngineInferenceService implements AutoCloseable {
     private final TornadoBatchExecutor executor;
     private final KvLease planLease;
     private final Thread driver;
+    private final ServingMetrics metrics;
 
     private volatile boolean running = true;
 
@@ -53,13 +54,15 @@ public final class EngineInferenceService implements AutoCloseable {
      *     repeats its openings — a system prompt, a tool schema — and every repetition is prefill
      *     the device has already done. The trade is pool capacity: a remembered prefix holds its
      *     blocks whether or not anyone is using them
+     * @param servedModel the name {@code /metrics} labels every series with
      */
     public EngineInferenceService(
             Model model,
             int batchSize,
             int maxQueuedRequests,
             int contextLength,
-            int prefixCacheEntries) {
+            int prefixCacheEntries,
+            String servedModel) {
         if (batchSize < 2) {
             throw new IllegalArgumentException(
                     "the batched executor needs B >= 2, got "
@@ -68,6 +71,7 @@ public final class EngineInferenceService implements AutoCloseable {
                             + " for, so at B = 1 there is no batched plan to run");
         }
         this.model = model;
+        this.metrics = new ServingMetrics(servedModel);
 
         int blockTokens = State.KV_BLOCK_SIZE;
         int blocksPerSlot = (contextLength + blockTokens - 1) / blockTokens;
@@ -104,7 +108,10 @@ public final class EngineInferenceService implements AutoCloseable {
                         executor,
                         batchSize,
                         maxQueuedRequests,
-                        org.beehive.jitllm.auxiliary.metrics.RunMetricsSink.installedOrDisabled());
+                        alsoTo(
+                                metrics,
+                                org.beehive.jitllm.auxiliary.metrics.RunMetricsSink
+                                        .installedOrDisabled()));
 
         this.driver = new Thread(this::drive, "engine-step");
         this.driver.setDaemon(true);
@@ -119,6 +126,30 @@ public final class EngineInferenceService implements AutoCloseable {
         return model;
     }
 
+    /** The {@code /metrics} body: what has been recorded, plus the engine's levels right now. */
+    public String metricsText() {
+        var capacity = manager.capacity();
+        return metrics.render(
+                new ServingMetrics.Levels(
+                        engine.runningCount(),
+                        engine.queueDepth(),
+                        capacity.usedBlocks(),
+                        capacity.totalBlocks()));
+    }
+
+    /** {@code primary}, and {@code secondary} as well when it is enabled. */
+    private static org.beehive.jitllm.runtime.metrics.MetricsSink alsoTo(
+            org.beehive.jitllm.runtime.metrics.MetricsSink primary,
+            org.beehive.jitllm.runtime.metrics.MetricsSink secondary) {
+        if (!secondary.isEnabled()) {
+            return primary;
+        }
+        return (key, value) -> {
+            primary.record(key, value);
+            secondary.record(key, value);
+        };
+    }
+
     /**
      * Generates a completion for one request, blocking until it terminates.
      *
@@ -127,15 +158,22 @@ public final class EngineInferenceService implements AutoCloseable {
      */
     public InferenceService.Result generate(
             InferenceService.Request request, Consumer<String> onToken) {
+        long submittedNanos = System.nanoTime();
         int[] promptTokens = prepareTokens(request);
         int maxNewTokens = request.maxTokens() > 0 ? request.maxTokens() : 256;
 
         StringBuilder text = new StringBuilder();
+        // Written by the engine thread, read here after await(), which orders the two.
+        long[] firstTokenNanos = {-1L};
         RequestHandle handle =
                 engine.addRequest(
                         promptTokens,
                         maxNewTokens,
+                        request.ignoreEos(),
                         token -> {
+                            if (firstTokenNanos[0] < 0) {
+                                firstTokenNanos[0] = System.nanoTime() - submittedNanos;
+                            }
                             if (!model.tokenizer().shouldDisplayToken(token)) {
                                 return;
                             }
@@ -161,11 +199,18 @@ public final class EngineInferenceService implements AutoCloseable {
 
         List<Integer> produced = handle.tokens();
         boolean stopped =
-                !produced.isEmpty()
+                !request.ignoreEos()
+                        && !produced.isEmpty()
                         && model.chatFormat()
                                 .getStopTokens()
                                 .contains(produced.get(produced.size() - 1));
         int completion = produced.size() - (stopped ? 1 : 0);
+        metrics.requestFinished(
+                promptTokens.length,
+                Math.max(0, completion),
+                firstTokenNanos[0],
+                System.nanoTime() - submittedNanos,
+                stopped);
         return new InferenceService.Result(
                 text.toString(), promptTokens.length, Math.max(0, completion), stopped);
     }
