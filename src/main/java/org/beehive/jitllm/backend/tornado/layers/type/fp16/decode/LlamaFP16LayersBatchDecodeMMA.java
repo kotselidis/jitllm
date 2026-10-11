@@ -3,6 +3,7 @@ package org.beehive.jitllm.backend.tornado.layers.type.fp16.decode;
 import java.util.List;
 import java.util.stream.IntStream;
 import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerRaggedBatchKernels;
 import org.beehive.jitllm.backend.tornado.scheduling.WorkerGridFactory;
 import org.beehive.jitllm.inference.state.LlamaState;
 import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
@@ -38,6 +39,12 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  *
  * <p>The KV cache and {@code seqPositions} are supplied by the engine (not State), so the context
  * length can be capped independently to fit B×L×ctx×kvDim in VRAM.
+ *
+ * <p><b>Ragged mode.</b> Given {@code rowSlots}, a row is a token rather than a sequence: row
+ * {@code r} sits at {@code seqPositions[r]} in the sequence whose KV slot is {@code rowSlots[r]},
+ * so one pass carries prompt chunks and decode tokens of several sequences, and a negative slot is
+ * a padding row. Only the two KV-addressing kernels change, to their {@link
+ * TransformerRaggedBatchKernels} twins; every other task already works row by row.
  */
 public class LlamaFP16LayersBatchDecodeMMA {
 
@@ -61,6 +68,8 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private final IntArray blockTable;
     private final int blockSize;
     private final int maxBlocksPerSlot;
+    // Ragged mode (optional): each row's KV slot, or negative for a padding row.
+    private final IntArray rowSlots;
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
 
@@ -100,6 +109,39 @@ public class LlamaFP16LayersBatchDecodeMMA {
             IntArray blockTable,
             int blockSize,
             int maxBlocksPerSlot) {
+        this(
+                state,
+                weights,
+                config,
+                batchSize,
+                decodeCtx,
+                keyCacheBatch,
+                valueCacheBatch,
+                seqPositions,
+                blockTable,
+                blockSize,
+                maxBlocksPerSlot,
+                null);
+    }
+
+    /**
+     * Ragged constructor when {@code rowSlots} is given: {@code batchSize} rows are tokens, each at
+     * {@code seqPositions[row]} in the sequence whose KV slot {@code rowSlots[row]} names. Paged
+     * FP16 pools only. With {@code rowSlots} null, a row is a sequence and its slot is its index.
+     */
+    public LlamaFP16LayersBatchDecodeMMA(
+            LlamaState state,
+            LlamaTornadoWeights weights,
+            LlamaConfiguration config,
+            int batchSize,
+            int decodeCtx,
+            Object keyCacheBatch,
+            Object valueCacheBatch,
+            IntArray seqPositions,
+            IntArray blockTable,
+            int blockSize,
+            int maxBlocksPerSlot,
+            IntArray rowSlots) {
         this.state = state;
         this.weights = weights;
         this.config = config;
@@ -123,6 +165,10 @@ public class LlamaFP16LayersBatchDecodeMMA {
         this.blockTable = blockTable;
         this.blockSize = blockSize;
         this.maxBlocksPerSlot = maxBlocksPerSlot;
+        this.rowSlots = rowSlots;
+        if (rowSlots != null && (!paged || keyCacheBatchFP16 == null)) {
+            throw new IllegalArgumentException("ragged rows need a paged FP16 key/value pool");
+        }
         this.layerITGs =
                 IntStream.range(0, config.numberOfLayers())
                         .mapToObj(this::createLayerTaskGraph)
@@ -142,6 +188,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
             g.transferToDevice(DataTransferMode.EVERY_EXECUTION, seqPositions);
             if (paged) {
                 g.transferToDevice(DataTransferMode.EVERY_EXECUTION, blockTable);
+            }
+            if (rowSlots != null) {
+                g.transferToDevice(DataTransferMode.EVERY_EXECUTION, rowSlots);
             }
             g.transferToDevice(
                     DataTransferMode.FIRST_EXECUTION,
@@ -163,6 +212,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
             String pred = "batchDecodeLayer_" + (layerIndex - 1);
             if (paged) {
                 g.consumeFromDevice(pred, context, blockTable);
+            }
+            if (rowSlots != null) {
+                g.consumeFromDevice(pred, context, rowSlots);
             }
             g.consumeFromDevice(
                     pred,
@@ -236,7 +288,25 @@ public class LlamaFP16LayersBatchDecodeMMA {
         // DECODE: per-slot position + per-slot KV region (paged via block table, or contiguous).
         if (paged) {
             int blockCfg = blockSize | (maxBlocksPerSlot << 16);
-            if (keyCacheBatchFP16 != null) {
+            if (rowSlots != null) {
+                g.task(
+                        "batch_rope_kv",
+                        TransformerRaggedBatchKernels::raggedPagedRopeWithKVCachePackedKVFP16,
+                        context,
+                        seqPositions,
+                        rowSlots,
+                        blockTable,
+                        state.workspace.qkvResultBatch,
+                        keyCacheBatchFP16,
+                        valueCacheBatchFP16,
+                        config.ropeTheta(),
+                        kvDim,
+                        config.headSize(),
+                        layerIndex,
+                        config.numberOfLayers(),
+                        blockCfg,
+                        dim);
+            } else if (keyCacheBatchFP16 != null) {
                 g.task(
                         "batch_rope_kv",
                         TransformerBatchPrefillKernels
@@ -273,7 +343,26 @@ public class LlamaFP16LayersBatchDecodeMMA {
                         dim);
             }
 
-            if (keyCacheBatchFP16 != null) {
+            if (rowSlots != null) {
+                g.task(
+                        "batch_attention",
+                        TransformerRaggedBatchKernels::raggedPagedAttentionFP16OutKVFP16,
+                        context,
+                        seqPositions,
+                        rowSlots,
+                        blockTable,
+                        state.workspace.qkvResultBatch,
+                        keyCacheBatchFP16,
+                        valueCacheBatchFP16,
+                        state.workspace.attnOutFP16,
+                        config.numberOfHeads(),
+                        config.headSize(),
+                        kvDim,
+                        config.kvMul(),
+                        layerIndex,
+                        config.numberOfLayers(),
+                        blockCfg);
+            } else if (keyCacheBatchFP16 != null) {
                 g.task(
                         "batch_attention",
                         TransformerBatchPrefillKernels::batchedDecodePagedAttentionFP16OutKVFP16,

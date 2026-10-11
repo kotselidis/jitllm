@@ -1,0 +1,364 @@
+package org.beehive.jitllm.backend.tornado.batch;
+
+import java.lang.foreign.MemorySegment;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerBatchPrefillKernels;
+import org.beehive.jitllm.backend.tornado.kernels.TransformerRaggedBatchKernels;
+import org.beehive.jitllm.backend.tornado.kv.TornadoKvStore;
+import org.beehive.jitllm.backend.tornado.layers.type.fp16.decode.LlamaFP16LayersBatchDecodeMMA;
+import org.beehive.jitllm.backend.tornado.plan.components.activation.BatchPrefillActivation;
+import org.beehive.jitllm.inference.state.LlamaState;
+import org.beehive.jitllm.inference.state.State;
+import org.beehive.jitllm.inference.weights.tornado.LlamaTornadoWeights;
+import org.beehive.jitllm.model.Configuration;
+import org.beehive.jitllm.model.Model;
+import org.beehive.jitllm.model.llama.LlamaConfiguration;
+import org.beehive.jitllm.runtime.backend.ExecutionInfo;
+import org.beehive.jitllm.runtime.batch.BatchSlots;
+import org.beehive.jitllm.runtime.batch.StepOutput;
+import org.beehive.jitllm.runtime.batch.TokenBatch;
+import org.beehive.jitllm.runtime.kv.KvStorage;
+import uk.ac.manchester.tornado.api.GridScheduler;
+import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
+import uk.ac.manchester.tornado.api.KernelContext;
+import uk.ac.manchester.tornado.api.TaskGraph;
+import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
+import uk.ac.manchester.tornado.api.WorkerGrid;
+import uk.ac.manchester.tornado.api.WorkerGrid1D;
+import uk.ac.manchester.tornado.api.WorkerGrid2D;
+import uk.ac.manchester.tornado.api.enums.DataTransferMode;
+import uk.ac.manchester.tornado.api.types.HalfFloat;
+import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+
+/**
+ * Runs ragged token batches: prompt chunks and decode tokens of up to B sequences in one forward
+ * pass of up to T rows.
+ *
+ * <p><b>A row is a token.</b> Row {@code r} carries one token, the position it occupies and the KV
+ * slot of its sequence; rows past the step's token count are padding and touch no KV. Projections
+ * and the FFN are GEMMs over the rows, exactly as on the batched decode path; the two KV kernels
+ * look the slot up per row instead of taking it from the row index. Each row attends over its own
+ * sequence up to its own position, and the RoPE task writes every row's key and value before
+ * attention reads any, so the tokens of a chunk see each other causally with no mask.
+ *
+ * <p><b>Logits only where something is sampled.</b> Each sequence's last row is gathered into a
+ * dense block of B rows before the vocabulary projection, so a 256-token step pays for B logits
+ * rows, not 256.
+ *
+ * <p><b>Batch invariance.</b> Every kernel computes a row from that row's inputs, its own
+ * sequence's KV and the weights, in an order that does not depend on the other rows. A token
+ * computed inside a prompt chunk is therefore bit-for-bit the token the one-per-step path computes
+ * at that position, and greedy output does not depend on what else ran in the step.
+ *
+ * <p>FP16 Llama weights, a paged FP16 KV pool and greedy on-device sampling. T rows run every step
+ * for now; running only as many as the step needs is the next change.
+ */
+public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor {
+
+    private static final int RMS_LOCAL = 256;
+
+    private final int maxSequences;
+    private final int maxRows;
+    private final int dim;
+    private final Set<Integer> stopTokens;
+
+    private final TornadoExecutionPlan plan;
+    private final GridScheduler gridScheduler;
+    private final int layerCount;
+    private final int logitsGraphIndex;
+
+    private final IntArray rowPositions;
+    private final IntArray rowSlots;
+    private final IntArray sampleRows;
+    private final IntArray sampledTokens;
+    private final MemorySegment embeddingTable;
+    private final MemorySegment embeddingBatch;
+    private final long dimBytes;
+    private final TornadoKvStore store;
+
+    private boolean closed;
+
+    /**
+     * @param state built with a prefill width of {@code maxRows}, which sizes the row buffers
+     * @param maxSequences B: KV slots, and sequences one step may touch
+     * @param maxRows T: tokens one step may carry; at least B
+     */
+    public TornadoRaggedBatchExecutor(
+            Model model,
+            State state,
+            KvStorage storage,
+            int maxSequences,
+            int maxRows,
+            int blocksPerSlot) {
+        Configuration config = model.configuration();
+        if (!org.beehive.jitllm.backend.tornado.TensorCoreSupport.isTensorCoreCapableBackend()) {
+            throw new IllegalArgumentException(
+                    "Ragged batching requires a CUDA device with tensor-core MMA support");
+        }
+        if (!(state instanceof LlamaState llamaState)
+                || !(config instanceof LlamaConfiguration llamaConfig)) {
+            throw new IllegalArgumentException("Ragged batching supports FP16 Llama only so far");
+        }
+        if (!(storage instanceof TornadoKvStore kvStore) || kvStore.keyPoolFP16() == null) {
+            throw new IllegalArgumentException(
+                    "Ragged batching needs the TornadoVM-backed FP16 key/value pool");
+        }
+        if (maxRows < maxSequences) {
+            throw new IllegalArgumentException(
+                    "a step must fit one token per sequence: T="
+                            + maxRows
+                            + " is below B="
+                            + maxSequences);
+        }
+        this.maxSequences = maxSequences;
+        this.maxRows = maxRows;
+        this.store = kvStore;
+        this.dim = config.dim();
+        this.stopTokens = model.chatFormat().getStopTokens();
+        LlamaTornadoWeights weights = (LlamaTornadoWeights) model.weights();
+
+        int vocab = config.vocabularySize();
+        int paddedSequences = (maxSequences + 127) & ~127;
+
+        this.rowPositions = new IntArray(maxRows);
+        this.rowSlots = new IntArray(maxRows);
+        this.rowSlots.init(-1);
+        this.sampleRows = new IntArray(maxSequences);
+        this.sampleRows.init(-1);
+        this.sampledTokens = new IntArray(paddedSequences);
+        FloatArray gathered = new FloatArray(maxSequences * dim);
+        FloatArray finalScale = new FloatArray(maxSequences);
+        HalfFloatArray normedFinalFP16 = new HalfFloatArray(paddedSequences * dim);
+        normedFinalFP16.init(new HalfFloat(0.0f));
+        FloatArray logits = new FloatArray(paddedSequences * vocab);
+
+        BatchPrefillActivation activation =
+                new BatchPrefillActivation(state, config, maxRows, false);
+        LlamaFP16LayersBatchDecodeMMA layers =
+                new LlamaFP16LayersBatchDecodeMMA(
+                        llamaState,
+                        weights,
+                        llamaConfig,
+                        maxRows,
+                        blocksPerSlot * kvStore.blockSizeTokens(),
+                        kvStore.keyPoolFP16(),
+                        kvStore.valuePoolFP16(),
+                        rowPositions,
+                        kvStore.blockTable(),
+                        kvStore.blockSizeTokens(),
+                        blocksPerSlot,
+                        rowSlots);
+        List<ImmutableTaskGraph> layerGraphs = layers.getLayerImmutableTaskGraphs();
+
+        KernelContext logitsContext = new KernelContext();
+        HalfFloatArray wclsHalf = weights.wclsByteArray.asHalfFloatArray();
+        FloatArray rmsFinal = weights.rms_final_weight_as_floatArray.asFloatArray();
+        // Gather the sampling rows, then the final norm, the vocabulary GEMM and greedy argmax
+        // over B rows; only B token ids cross to the host.
+        TaskGraph logitsGraph =
+                new TaskGraph("raggedLogits")
+                        .consumeFromDevice(
+                                layers.getLastLayerTaskGraphID(), state.workspace.wrapXBatch)
+                        .transferToDevice(DataTransferMode.EVERY_EXECUTION, sampleRows)
+                        .transferToDevice(
+                                DataTransferMode.FIRST_EXECUTION,
+                                logitsContext,
+                                gathered,
+                                finalScale,
+                                normedFinalFP16,
+                                wclsHalf,
+                                rmsFinal,
+                                sampledTokens)
+                        .task(
+                                "gather",
+                                TransformerRaggedBatchKernels::gatherRows,
+                                logitsContext,
+                                state.workspace.wrapXBatch,
+                                sampleRows,
+                                gathered,
+                                dim)
+                        .task(
+                                "rms_reduce",
+                                TransformerBatchPrefillKernels::batchedRmsReduceParallel,
+                                logitsContext,
+                                gathered,
+                                finalScale,
+                                dim,
+                                config.rmsNormEps(),
+                                RMS_LOCAL)
+                        .task(
+                                "rms_apply",
+                                TransformerBatchPrefillKernels::batchedFFNRmsApplyFP16,
+                                logitsContext,
+                                normedFinalFP16,
+                                gathered,
+                                rmsFinal,
+                                finalScale,
+                                dim)
+                        .task(
+                                "vocab",
+                                TransformerBatchPrefillKernels::gemmMMA,
+                                logitsContext,
+                                normedFinalFP16,
+                                wclsHalf,
+                                logits,
+                                paddedSequences,
+                                vocab,
+                                dim)
+                        .task(
+                                "argmax",
+                                TransformerBatchPrefillKernels::batchedArgmaxLogits,
+                                logitsContext,
+                                logits,
+                                sampledTokens,
+                                vocab)
+                        .transferToHost(DataTransferMode.EVERY_EXECUTION, sampledTokens);
+
+        GridScheduler schedule = new GridScheduler();
+        activation.updateGridScheduler(schedule);
+        layers.updateGridScheduler(schedule);
+        schedule.addWorkerGrid("raggedLogits.gather", worker(maxSequences * dim, 256));
+        schedule.addWorkerGrid(
+                "raggedLogits.rms_reduce", worker(maxSequences * RMS_LOCAL, RMS_LOCAL));
+        schedule.addWorkerGrid("raggedLogits.rms_apply", worker(maxSequences * dim, 256));
+        schedule.addWorkerGrid("raggedLogits.vocab", mmaGrid(paddedSequences, vocab));
+        schedule.addWorkerGrid("raggedLogits.argmax", worker(maxSequences * 256, 256));
+        this.gridScheduler = schedule;
+
+        List<ImmutableTaskGraph> all = new ArrayList<>();
+        all.add(activation.getImmutableTaskGraph());
+        all.addAll(layerGraphs);
+        all.add(logitsGraph.snapshot());
+        this.layerCount = layerGraphs.size();
+        this.logitsGraphIndex = 1 + layerCount;
+        this.plan = new TornadoExecutionPlan(all.toArray(new ImmutableTaskGraph[0]));
+
+        this.embeddingTable = weights.getTokenEmbeddingTable().asHalfFloatArray().getSegment();
+        this.embeddingBatch = state.workspace.embeddingXBatch.getSegment();
+        this.dimBytes = (long) dim * Short.BYTES;
+    }
+
+    @Override
+    public ExecutionInfo executionInfo() {
+        var backend =
+                uk.ac.manchester.tornado.api.runtime.TornadoRuntimeProvider.getTornadoRuntime()
+                        .getBackend(0);
+        var module = TornadoExecutionPlan.class.getModule().getDescriptor();
+        String version = module == null ? "unknown" : module.rawVersion().orElse("unknown");
+        return new ExecutionInfo(
+                backend.getBackendType().name(),
+                backend.getDefaultDevice().getPhysicalDevice().getDeviceName(),
+                "TornadoVM " + version,
+                "ragged-batch (chunked prefill)",
+                1,
+                "FP16",
+                "FP16 tensor-core MMA",
+                "JIT kernels",
+                false,
+                false);
+    }
+
+    @Override
+    public int maxBatchSize() {
+        return maxSequences;
+    }
+
+    @Override
+    public int maxTokensPerStep() {
+        return maxRows;
+    }
+
+    @Override
+    public int maxTokensPerSequence() {
+        return maxRows;
+    }
+
+    @Override
+    public StepOutput execute(TokenBatch batch) {
+        if (closed) {
+            throw new IllegalStateException("this executor is closed");
+        }
+        int rows = batch.tokenCount();
+        int sequences = batch.sequenceCount();
+        if (rows > maxRows || sequences > maxSequences) {
+            throw new IllegalArgumentException(
+                    rows
+                            + " tokens of "
+                            + sequences
+                            + " sequences exceed this executor's "
+                            + maxRows
+                            + " rows and "
+                            + maxSequences
+                            + " sequences");
+        }
+        for (int r = 0; r < rows; r++) {
+            int slot = batch.kvSlots()[batch.sequenceOf()[r]];
+            if (slot < 0 || slot >= maxSequences) {
+                throw new IllegalArgumentException(
+                        "token " + r + " names KV slot " + slot + " of " + maxSequences);
+            }
+            MemorySegment.copy(
+                    embeddingTable,
+                    batch.tokens()[r] * dimBytes,
+                    embeddingBatch,
+                    (long) r * dimBytes,
+                    dimBytes);
+            rowPositions.set(r, batch.positions()[r]);
+            rowSlots.set(r, slot);
+        }
+        for (int r = rows; r < maxRows; r++) {
+            rowPositions.set(r, 0);
+            rowSlots.set(r, -1);
+        }
+        for (int s = 0; s < maxSequences; s++) {
+            sampleRows.set(s, s < sequences ? batch.lastTokenOf(s) : -1);
+        }
+
+        plan.withGraph(0).withGridScheduler(gridScheduler).execute();
+        for (int layer = 0; layer < layerCount; layer++) {
+            plan.withGraph(1 + layer).withGridScheduler(gridScheduler).execute();
+        }
+        plan.withGraph(logitsGraphIndex).withGridScheduler(gridScheduler).execute();
+
+        int[] sampled = new int[sequences];
+        for (int s = 0; s < sequences; s++) {
+            sampled[s] = sampledTokens.get(s);
+        }
+        return new StepOutput(sampled);
+    }
+
+    @Override
+    public int[] decodeStep(BatchSlots batch) {
+        throw new UnsupportedOperationException(
+                "the ragged executor is driven through execute(TokenBatch)");
+    }
+
+    @Override
+    public boolean isStopToken(int token) {
+        return stopTokens.contains(token);
+    }
+
+    @Override
+    public void close() {
+        if (!closed) {
+            closed = true;
+            plan.freeDeviceMemory();
+        }
+    }
+
+    private static WorkerGrid worker(int global, int local) {
+        WorkerGrid1D grid = new WorkerGrid1D(global);
+        grid.setLocalWork(local, 1, 1);
+        return grid;
+    }
+
+    private static WorkerGrid mmaGrid(int paddedM, int n) {
+        WorkerGrid2D grid = new WorkerGrid2D(paddedM / 128 * 256, n / 128);
+        grid.setLocalWork(256, 1, 1);
+        return grid;
+    }
+}

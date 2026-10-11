@@ -4,6 +4,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 import org.beehive.jitllm.backend.tornado.batch.TornadoBatchExecutor;
+import org.beehive.jitllm.backend.tornado.batch.TornadoRaggedBatchExecutor;
+import org.beehive.jitllm.backend.tornado.batch.TornadoServingExecutor;
 import org.beehive.jitllm.engine.LLMEngine;
 import org.beehive.jitllm.engine.RequestHandle;
 import org.beehive.jitllm.engine.RequestState;
@@ -36,7 +38,7 @@ public final class EngineInferenceService implements AutoCloseable {
     private final Model model;
     private final LLMEngine engine;
     private final KvCacheManager manager;
-    private final TornadoBatchExecutor executor;
+    private final TornadoServingExecutor executor;
     private final KvLease planLease;
     private final Thread driver;
     private final ServingMetrics metrics;
@@ -55,6 +57,8 @@ public final class EngineInferenceService implements AutoCloseable {
      *     the device has already done. The trade is pool capacity: a remembered prefix holds its
      *     blocks whether or not anyone is using them
      * @param servedModel the name {@code /metrics} labels every series with
+     * @param maxBatchedTokens tokens one step carries, prompt chunks and decode tokens together, or
+     *     0 to feed every request one token per step on the original batched executor
      */
     public EngineInferenceService(
             Model model,
@@ -62,7 +66,8 @@ public final class EngineInferenceService implements AutoCloseable {
             int maxQueuedRequests,
             int contextLength,
             int prefixCacheEntries,
-            String servedModel) {
+            String servedModel,
+            int maxBatchedTokens) {
         if (batchSize < 2) {
             throw new IllegalArgumentException(
                     "the batched executor needs B >= 2, got "
@@ -97,8 +102,13 @@ public final class EngineInferenceService implements AutoCloseable {
         // One state builds the plan; the per-slot addressing comes from the block table, so the
         // lease that state held goes straight back to the pool once the buffers are bound.
         this.planLease = manager.acquire(blockTokens);
-        State state = State.withPrefillBatchSize(batchSize, () -> model.createNewState(planLease));
-        this.executor = new TornadoBatchExecutor(model, state, store, batchSize, blocksPerSlot);
+        int rows = maxBatchedTokens > 0 ? maxBatchedTokens : batchSize;
+        State state = State.withPrefillBatchSize(rows, () -> model.createNewState(planLease));
+        this.executor =
+                maxBatchedTokens > 0
+                        ? new TornadoRaggedBatchExecutor(
+                                model, state, store, batchSize, maxBatchedTokens, blocksPerSlot)
+                        : new TornadoBatchExecutor(model, state, store, batchSize, blocksPerSlot);
         planLease.close();
 
         this.engine =
