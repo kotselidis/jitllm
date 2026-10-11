@@ -54,6 +54,15 @@ public final class LLMEngine implements AutoCloseable {
     /** Rule 17: written from below, read from above. Disabled by default, and then free. */
     private final MetricsSink metrics;
 
+    /**
+     * Guards the scheduler, the handle maps and the step. Fair, so a submission waiting while a
+     * step runs gets in before the next step: the driver re-enters {@code step()} the moment it
+     * returns, and on an unfair monitor it kept winning, so new requests waited until every running
+     * one had finished.
+     */
+    private final java.util.concurrent.locks.ReentrantLock lock =
+            new java.util.concurrent.locks.ReentrantLock(true);
+
     /** Whichever thread is inside {@code step()}; the re-entrancy and single-caller guard. */
     private volatile Thread stepping;
 
@@ -183,7 +192,8 @@ public final class LLMEngine implements AutoCloseable {
         int declaredBudgetTokens = promptTokens.length + maxNewTokens;
         ScheduledRequest request;
         RequestHandle handle;
-        synchronized (this) {
+        lock.lock();
+        try {
             if (closed) {
                 request = new ScheduledRequest(-1, declaredBudgetTokens);
                 handle = new RequestHandle(request, onToken);
@@ -202,6 +212,8 @@ public final class LLMEngine implements AutoCloseable {
                     metrics.record(MetricKey.REQUESTS_REJECTED, 1);
                 }
             }
+        } finally {
+            lock.unlock();
         }
         if (request.isTerminal()) {
             handle.signalTerminal();
@@ -211,8 +223,11 @@ public final class LLMEngine implements AutoCloseable {
 
     /** Cancels from any thread. Queued leaves at once; running gives back its slot here. */
     public void cancel(RequestHandle handle) {
-        synchronized (this) {
+        lock.lock();
+        try {
             scheduler.cancel(handle.request());
+        } finally {
+            lock.unlock();
         }
         if (handle.isTerminal()) {
             handle.signalTerminal();
@@ -252,7 +267,8 @@ public final class LLMEngine implements AutoCloseable {
         List<RequestHandle> terminal = new ArrayList<>();
         int advanced = 0;
         try {
-            synchronized (this) {
+            lock.lock();
+            try {
                 if (closed) {
                     return 0;
                 }
@@ -362,6 +378,8 @@ public final class LLMEngine implements AutoCloseable {
                         }
                     }
                 }
+            } finally {
+                lock.unlock();
             }
             // Outside every lock, on this thread.
             for (Runnable callback : callbacks) {
@@ -384,10 +402,13 @@ public final class LLMEngine implements AutoCloseable {
         try {
             handle.callback().accept(token);
         } catch (RuntimeException | Error e) {
-            synchronized (this) {
+            lock.lock();
+            try {
                 if (!handle.request().isTerminal()) {
                     scheduler.fail(handle.request(), e);
                 }
+            } finally {
+                lock.unlock();
             }
             handle.signalTerminal();
         }
@@ -401,7 +422,8 @@ public final class LLMEngine implements AutoCloseable {
     @Override
     public void close() {
         List<RequestHandle> toSignal = new ArrayList<>();
-        synchronized (this) {
+        lock.lock();
+        try {
             if (closed) {
                 return;
             }
@@ -415,6 +437,8 @@ public final class LLMEngine implements AutoCloseable {
                     toSignal.add(handles.get(running));
                 }
             }
+        } finally {
+            lock.unlock();
         }
         for (RequestHandle handle : toSignal) {
             if (handle != null) {
