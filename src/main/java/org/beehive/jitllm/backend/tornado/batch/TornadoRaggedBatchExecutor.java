@@ -80,6 +80,15 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
     private final long dimBytes;
     private final TornadoKvStore store;
 
+    private final LlamaFP16LayersBatchDecodeMMA layers;
+    private final WorkerGrid activationGrid;
+
+    /**
+     * Launch only the rows a step uses, rounded up to 16, instead of all T. On by default; the
+     * property exists to measure the difference.
+     */
+    private final boolean trimRows = !"false".equals(System.getProperty("jitllm.ragged.trimRows"));
+
     private boolean closed;
 
     /**
@@ -106,6 +115,11 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         if (!(storage instanceof TornadoKvStore kvStore) || kvStore.keyPoolFP16() == null) {
             throw new IllegalArgumentException(
                     "Ragged batching needs the TornadoVM-backed FP16 key/value pool");
+        }
+        if (maxRows % 16 != 0) {
+            throw new IllegalArgumentException(
+                    "T must be a multiple of 16, the granularity steps are launched at; got "
+                            + maxRows);
         }
         if (maxRows < maxSequences) {
             throw new IllegalArgumentException(
@@ -138,7 +152,7 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
 
         BatchPrefillActivation activation =
                 new BatchPrefillActivation(state, config, maxRows, false);
-        LlamaFP16LayersBatchDecodeMMA layers =
+        this.layers =
                 new LlamaFP16LayersBatchDecodeMMA(
                         llamaState,
                         weights,
@@ -220,6 +234,9 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
 
         GridScheduler schedule = new GridScheduler();
         activation.updateGridScheduler(schedule);
+        // Replaces the activation's grid with one this executor can resize per step.
+        this.activationGrid = worker(maxRows * dim, 128);
+        schedule.addWorkerGrid("prefillActivation.updateX", activationGrid);
         layers.updateGridScheduler(schedule);
         schedule.addWorkerGrid("raggedLogits.gather", worker(maxSequences * dim, 256));
         schedule.addWorkerGrid(
@@ -317,6 +334,9 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         for (int s = 0; s < maxSequences; s++) {
             sampleRows.set(s, s < sequences ? batch.lastTokenOf(s) : -1);
         }
+        int activeRows = trimRows ? Math.min(maxRows, (rows + 15) & ~15) : maxRows;
+        layers.setActiveRows(activeRows);
+        activationGrid.setGlobalWork((long) activeRows * dim, 1, 1);
 
         plan.withGraph(0).withGridScheduler(gridScheduler).execute();
         for (int layer = 0; layer < layerCount; layer++) {

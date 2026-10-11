@@ -171,8 +171,9 @@ record ServerOptions(
                 case "--prefix-cache-entries" -> prefixes = Integer.parseInt(value);
                 case "--max-batched-tokens" -> {
                     batchedTokens = Integer.parseInt(value);
-                    if (batchedTokens < 1)
-                        throw new IllegalArgumentException("--max-batched-tokens must be positive");
+                    if (batchedTokens < 1 || batchedTokens % 16 != 0)
+                        throw new IllegalArgumentException(
+                                "--max-batched-tokens must be a positive multiple of 16");
                 }
                 case "--batch-prefill-size" -> {
                     int width = Integer.parseInt(value);

@@ -73,6 +73,18 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
 
+    // The row-proportional grids, kept so a ragged step can launch only the rows it uses.
+    private WorkerGrid rmsWorker;
+    private WorkerGrid rmsApplyWorker;
+    private WorkerGrid ffnRmsApplyWorker;
+    private WorkerGrid ropeWorker;
+    private WorkerGrid attnWorker;
+    private WorkerGrid mmaQkvWorker;
+    private WorkerGrid mmaDimWorker;
+    private WorkerGrid mmaGateUpWorker;
+    private WorkerGrid ewDimWorker;
+    private WorkerGrid ewHidWorker;
+
     public LlamaFP16LayersBatchDecodeMMA(
             LlamaState state,
             LlamaTornadoWeights weights,
@@ -530,26 +542,24 @@ public class LlamaFP16LayersBatchDecodeMMA {
         int nHeads = config.numberOfHeads();
         int headSz = config.headSize();
 
-        WorkerGrid rmsWorker =
-                WorkerGridFactory.genericWorker(batchSize * RMS_LOCAL_SIZE, RMS_LOCAL_SIZE);
-        WorkerGrid rmsApplyWorker = WorkerGridFactory.genericWorker(batchSize * dim, 256);
-        WorkerGrid ffnRmsApplyWorker = WorkerGridFactory.genericWorker(batchSize * dim, 256);
+        rmsWorker = WorkerGridFactory.genericWorker(batchSize * RMS_LOCAL_SIZE, RMS_LOCAL_SIZE);
+        rmsApplyWorker = WorkerGridFactory.genericWorker(batchSize * dim, 256);
+        ffnRmsApplyWorker = WorkerGridFactory.genericWorker(batchSize * dim, 256);
 
         int ropeGlobal = batchSize * (dim / 2);
         int ropeLocal = Math.min(512, ropeGlobal);
         while (ropeLocal > 1 && ropeGlobal % ropeLocal != 0) ropeLocal--;
-        WorkerGrid ropeWorker = WorkerGridFactory.genericWorker(ropeGlobal, ropeLocal);
+        ropeWorker = WorkerGridFactory.genericWorker(ropeGlobal, ropeLocal);
 
         int attnLocal = Math.min(headSz, 128);
-        WorkerGrid attnWorker =
-                WorkerGridFactory.genericWorker(batchSize * nHeads * attnLocal, attnLocal);
+        attnWorker = WorkerGridFactory.genericWorker(batchSize * nHeads * attnLocal, attnLocal);
 
-        WorkerGrid mmaQkvWorker = mmaGrid(paddedBatch, dim + 2 * kvDim);
-        WorkerGrid mmaDimWorker = mmaGrid(paddedBatch, dim);
-        WorkerGrid mmaGateUpWorker = mmaGrid(paddedBatch, 2 * hidDim);
+        mmaQkvWorker = mmaGrid(paddedBatch, dim + 2 * kvDim);
+        mmaDimWorker = mmaGrid(paddedBatch, dim);
+        mmaGateUpWorker = mmaGrid(paddedBatch, 2 * hidDim);
 
-        WorkerGrid ewDimWorker = elementwiseGrid(batchSize * dim);
-        WorkerGrid ewHidWorker = elementwiseGrid(batchSize * hidDim);
+        ewDimWorker = elementwiseGrid(batchSize * dim);
+        ewHidWorker = elementwiseGrid(batchSize * hidDim);
 
         for (int i = 0; i < config.numberOfLayers(); i++) {
             String p = "batchDecodeLayer_" + i + ".";
@@ -566,6 +576,38 @@ public class LlamaFP16LayersBatchDecodeMMA {
             scheduler.addWorkerGrid(p + "w2Proj", mmaDimWorker);
             scheduler.addWorkerGrid(p + "w2Resid", ewDimWorker);
         }
+    }
+
+    /**
+     * Launches only the first {@code rows} rows on the next execution, instead of all {@code
+     * batchSize}: row-wise kernels cover {@code rows}, the tensor-core GEMMs the 128-row tiles that
+     * hold them. Rows past {@code rows} must be padding, which no kernel reads for a real row, so
+     * what a real row computes does not change. Call after {@link #updateGridScheduler}.
+     *
+     * @param rows a multiple of 16, at most {@code batchSize}
+     */
+    public void setActiveRows(int rows) {
+        if (rows <= 0 || rows > batchSize || rows % 16 != 0) {
+            throw new IllegalArgumentException(
+                    "active rows must be a positive multiple of 16 up to "
+                            + batchSize
+                            + ", got "
+                            + rows);
+        }
+        int dim = config.dim();
+        int hidDim = config.hiddenDim();
+        int mmaRows = (rows + 127) & ~127;
+        rmsWorker.setGlobalWork((long) rows * RMS_LOCAL_SIZE, 1, 1);
+        rmsApplyWorker.setGlobalWork((long) rows * dim, 1, 1);
+        ffnRmsApplyWorker.setGlobalWork((long) rows * dim, 1, 1);
+        ropeWorker.setGlobalWork((long) rows * (dim / 2), 1, 1);
+        attnWorker.setGlobalWork(
+                (long) rows * config.numberOfHeads() * Math.min(config.headSize(), 128), 1, 1);
+        mmaQkvWorker.setGlobalWork(mmaRows / 128 * 256L, (dim + 2L * config.kvDim()) / 128, 1);
+        mmaDimWorker.setGlobalWork(mmaRows / 128 * 256L, dim / 128, 1);
+        mmaGateUpWorker.setGlobalWork(mmaRows / 128 * 256L, 2L * hidDim / 128, 1);
+        ewDimWorker.setGlobalWork((long) rows * dim, 1, 1);
+        ewHidWorker.setGlobalWork((long) rows * hidDim, 1, 1);
     }
 
     public List<ImmutableTaskGraph> getLayerImmutableTaskGraphs() {
