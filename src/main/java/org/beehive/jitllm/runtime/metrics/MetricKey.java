@@ -74,6 +74,15 @@ public enum MetricKey {
     /** Batched iterations executed. The denominator for {@link #BATCH_OCCUPANCY}. */
     ENGINE_STEPS(Unit.COUNT, Aggregation.SUM),
 
+    /**
+     * Tokens computed, summed over steps — decode tokens and prompt chunks alike — so the mean step
+     * size is this over {@link #ENGINE_STEPS}.
+     *
+     * <p>Next to {@link #BATCH_OCCUPANCY} it says how much of each step was prompt: the two are
+     * equal when prompts go in one token per step.
+     */
+    BATCHED_TOKENS(Unit.COUNT, Aggregation.SUM),
+
     /** Leased KV blocks at the last step — a level, like device memory. */
     KV_BLOCKS_IN_USE(Unit.COUNT, Aggregation.LATEST),
 
