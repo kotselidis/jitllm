@@ -119,6 +119,12 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private final boolean skinnyGemm =
             !"false".equals(System.getProperty("jitllm.ragged.skinnyGemm"));
 
+    /**
+     * Steps of 9 to {@link TransformerRaggedBatchKernels#MID_ROWS} tokens run their projections on
+     * the 32 x 64-tile GEMM instead of the 128-row one. Same output bits.
+     */
+    private final boolean midGemm = !"false".equals(System.getProperty("jitllm.ragged.midGemm"));
+
     // The step's real token count, read on the device to pick the GEMM; ragged mode only.
     private final IntArray stepRows;
     private final List<ImmutableTaskGraph> layerITGs;
@@ -140,6 +146,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
     private WorkerGrid skinnyDimWorker;
     private WorkerGrid skinnyKvWorker;
     private WorkerGrid skinnyHidWorker;
+    private WorkerGrid midDimWorker;
+    private WorkerGrid midKvWorker;
+    private WorkerGrid midHidWorker;
 
     public LlamaFP16LayersBatchDecodeMMA(
             LlamaState state,
@@ -243,7 +252,8 @@ public class LlamaFP16LayersBatchDecodeMMA {
                         (decodeCtx + kvSplitMin - 1) / kvSplitMin);
         this.queryTiles = rowSlots != null ? new IntArray(2 * batchSize) : null;
         this.decodeRowSlots = rowSlots != null ? new IntArray(batchSize) : null;
-        this.stepRows = rowSlots != null ? new IntArray(1) : null;
+        // [0] the step's tokens, [1] whether steps of 9-32 tokens take the mid GEMM.
+        this.stepRows = rowSlots != null ? new IntArray(2) : null;
         this.attnPartials =
                 rowSlots != null && splitKv
                         ? new FloatArray(
@@ -423,6 +433,33 @@ public class LlamaFP16LayersBatchDecodeMMA {
                     state.workspace.qkvResultBatch,
                     dim,
                     qkvStride,
+                    dim + kvDim);
+            midTask(
+                    g,
+                    "qProj_mid",
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wqLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    dim,
+                    dim + 2 * kvDim,
+                    0);
+            midTask(
+                    g,
+                    "kProj_mid",
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wkLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    dim,
+                    dim + 2 * kvDim,
+                    dim);
+            midTask(
+                    g,
+                    "vProj_mid",
+                    state.workspace.wrapXbFP16Batch,
+                    weights.wvLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.qkvResultBatch,
+                    dim,
+                    dim + 2 * kvDim,
                     dim + kvDim);
         }
 
@@ -685,6 +722,15 @@ public class LlamaFP16LayersBatchDecodeMMA {
                     dim,
                     dim,
                     0);
+            midTask(
+                    g,
+                    "woProj_mid",
+                    state.workspace.attnOutFP16,
+                    weights.woLayered[layerIndex].asHalfFloatArray(),
+                    state.workspace.woOut,
+                    dim,
+                    dim,
+                    0);
         }
 
         g.task(
@@ -753,6 +799,24 @@ public class LlamaFP16LayersBatchDecodeMMA {
                     dim,
                     2 * hidDim,
                     hidDim);
+            midTask(
+                    g,
+                    "gateProj_mid",
+                    state.workspace.normedXFFNFP16,
+                    weights.w1Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.gateUpResultBatch,
+                    dim,
+                    2 * hidDim,
+                    0);
+            midTask(
+                    g,
+                    "upProj_mid",
+                    state.workspace.normedXFFNFP16,
+                    weights.w3Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.gateUpResultBatch,
+                    dim,
+                    2 * hidDim,
+                    hidDim);
         }
 
         g.task(
@@ -796,6 +860,15 @@ public class LlamaFP16LayersBatchDecodeMMA {
                     hidDim,
                     dim,
                     0);
+            midTask(
+                    g,
+                    "w2Proj_mid",
+                    state.workspace.wrapHbFP16Batch,
+                    weights.w2Layered[layerIndex].asHalfFloatArray(),
+                    state.workspace.w2Out,
+                    hidDim,
+                    dim,
+                    0);
         }
         g.task(
                 "w2Resid",
@@ -809,6 +882,29 @@ public class LlamaFP16LayersBatchDecodeMMA {
     }
 
     // @formatter:on
+
+    /** Adds a mid GEMM writing {@code out[t, colOffset + n]}; see {@link #skinnyTask}. */
+    private void midTask(
+            TaskGraph g,
+            String name,
+            HalfFloatArray x,
+            HalfFloatArray w,
+            FloatArray out,
+            int k,
+            int ldc,
+            int colOffset) {
+        g.task(
+                name,
+                TransformerRaggedBatchKernels::gemmMMAMid,
+                context,
+                x,
+                w,
+                out,
+                stepRows,
+                k,
+                ldc,
+                colOffset);
+    }
 
     /** Whether this graph carries the skinny GEMM tasks next to the 128-row ones. */
     private boolean skinny() {
@@ -847,6 +943,13 @@ public class LlamaFP16LayersBatchDecodeMMA {
         int nBlocks = N / 128;
         WorkerGrid2D grid = new WorkerGrid2D(mBlocks * 256, nBlocks);
         grid.setLocalWork(256, 1, 1);
+        return grid;
+    }
+
+    static WorkerGrid midGrid(int n) {
+        WorkerGrid2D grid =
+                new WorkerGrid2D(128, n / TransformerRaggedBatchKernels.MID_COLS_PER_GROUP);
+        grid.setLocalWork(128, 1, 1);
         return grid;
     }
 
@@ -905,6 +1008,9 @@ public class LlamaFP16LayersBatchDecodeMMA {
         skinnyDimWorker = skinnyGrid(dim);
         skinnyKvWorker = skinnyGrid(kvDim);
         skinnyHidWorker = skinnyGrid(hidDim);
+        midDimWorker = midGrid(dim);
+        midKvWorker = midGrid(kvDim);
+        midHidWorker = midGrid(hidDim);
 
         for (int i = 0; i < config.numberOfLayers(); i++) {
             String p = "batchDecodeLayer_" + i + ".";
@@ -934,6 +1040,13 @@ public class LlamaFP16LayersBatchDecodeMMA {
                 scheduler.addWorkerGrid(p + "gateProj_skinny", skinnyHidWorker);
                 scheduler.addWorkerGrid(p + "upProj_skinny", skinnyHidWorker);
                 scheduler.addWorkerGrid(p + "w2Proj_skinny", skinnyDimWorker);
+                scheduler.addWorkerGrid(p + "qProj_mid", midDimWorker);
+                scheduler.addWorkerGrid(p + "kProj_mid", midKvWorker);
+                scheduler.addWorkerGrid(p + "vProj_mid", midKvWorker);
+                scheduler.addWorkerGrid(p + "woProj_mid", midDimWorker);
+                scheduler.addWorkerGrid(p + "gateProj_mid", midHidWorker);
+                scheduler.addWorkerGrid(p + "upProj_mid", midHidWorker);
+                scheduler.addWorkerGrid(p + "w2Proj_mid", midDimWorker);
             }
         }
     }
@@ -1005,7 +1118,18 @@ public class LlamaFP16LayersBatchDecodeMMA {
         mmaGateUpWorker.setGlobalWork(mmaRows / 128 * 256L, 2L * hidDim / 128, 1);
         if (skinny()) {
             stepRows.set(0, realRows);
+            stepRows.set(1, midGemm ? 1 : 0);
             boolean small = realRows <= TransformerRaggedBatchKernels.SKINNY_ROWS;
+            boolean mid = midGemm && !small && realRows <= TransformerRaggedBatchKernels.MID_ROWS;
+            int midCols = TransformerRaggedBatchKernels.MID_COLS_PER_GROUP;
+            midDimWorker.setGlobalWork(128, mid ? dim / midCols : 1, 1);
+            midKvWorker.setGlobalWork(128, mid ? config.kvDim() / midCols : 1, 1);
+            midHidWorker.setGlobalWork(128, mid ? hidDim / midCols : 1, 1);
+            if (mid) {
+                mmaQkvWorker.setGlobalWork(256, 1, 1);
+                mmaDimWorker.setGlobalWork(256, 1, 1);
+                mmaGateUpWorker.setGlobalWork(256, 1, 1);
+            }
             int cols = TransformerRaggedBatchKernels.SKINNY_COLS_PER_GROUP;
             skinnyDimWorker.setGlobalWork(small ? dim / cols * 128L : 128, 1, 1);
             skinnyKvWorker.setGlobalWork(small ? config.kvDim() / cols * 128L : 128, 1, 1);

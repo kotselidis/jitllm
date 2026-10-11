@@ -157,7 +157,7 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
         this.sampleRows = new IntArray(maxSequences);
         this.sampleRows.init(-1);
         this.sampledTokens = new IntArray(paddedSequences);
-        this.logitsRows = new IntArray(1);
+        this.logitsRows = new IntArray(2); // [1] = 0: the vocabulary GEMM has no mid kernel
         this.vocabSize = vocab;
         FloatArray gathered = new FloatArray(maxSequences * dim);
         FloatArray finalScale = new FloatArray(maxSequences);
