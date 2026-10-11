@@ -274,4 +274,90 @@ public class ChunkedPrefillTest {
             }
         }
     }
+
+    /**
+     * A submission made while the engine steps back to back must get in between steps, not wait
+     * until the running requests finish: the driver re-enters {@code step()} at once, and an unfair
+     * lock let it win every time.
+     */
+    @Test
+    public void submissionsGetInWhileTheEngineStepsBackToBack() throws Exception {
+        try (KvCacheManager manager = manager(4)) {
+            RaggedFakeExecutor fast = new RaggedFakeExecutor(4, 64, 64);
+            org.beehive.jitllm.runtime.batch.BatchExecutor slow =
+                    new org.beehive.jitllm.runtime.batch.BatchExecutor() {
+                        @Override
+                        public int maxBatchSize() {
+                            return 4;
+                        }
+
+                        @Override
+                        public int maxTokensPerStep() {
+                            return 64;
+                        }
+
+                        @Override
+                        public int maxTokensPerSequence() {
+                            return 64;
+                        }
+
+                        @Override
+                        public org.beehive.jitllm.runtime.batch.StepOutput execute(
+                                org.beehive.jitllm.runtime.batch.TokenBatch batch) {
+                            try {
+                                Thread.sleep(2); // a GPU step
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return fast.execute(batch);
+                        }
+
+                        @Override
+                        public int[] decodeStep(org.beehive.jitllm.runtime.batch.BatchSlots b) {
+                            throw new AssertionError();
+                        }
+
+                        @Override
+                        public boolean isStopToken(int token) {
+                            return false;
+                        }
+                    };
+            try (LLMEngine engine =
+                    new LLMEngine(TestModels.sharedKvCapable(), manager, slow, 4, 16)) {
+                RequestHandle running = engine.addRequest(prompt(4, 20), 1000, null);
+                java.util.concurrent.atomic.AtomicBoolean stop =
+                        new java.util.concurrent.atomic.AtomicBoolean();
+                Thread driver =
+                        new Thread(
+                                () -> {
+                                    while (!stop.get()) {
+                                        engine.step();
+                                    }
+                                });
+                driver.start();
+                try {
+                    Thread.sleep(20); // the engine is now stepping back to back
+                    long worst = 0;
+                    List<RequestHandle> late = new ArrayList<>();
+                    for (int i = 0; i < 3; i++) {
+                        long t0 = System.nanoTime();
+                        late.add(engine.addRequest(prompt(4, 21 + i), 4, null));
+                        worst = Math.max(worst, System.nanoTime() - t0);
+                    }
+                    assertTrue(
+                            "a submission waited " + worst / 1_000_000 + " ms",
+                            worst < 500_000_000L);
+                    for (RequestHandle handle : late) {
+                        handle.await();
+                        assertEquals(RequestState.COMPLETED, handle.state());
+                    }
+                    assertTrue(
+                            "they finished long before the running request", !running.isTerminal());
+                } finally {
+                    stop.set(true);
+                    driver.join();
+                }
+            }
+        }
+    }
 }
