@@ -24,5 +24,4 @@ llama-3.2 Llama-3.2-1B-Instruct-Q8_0.gguf
 qwen2.5 Qwen2.5-0.5B-Instruct-Q8_0.gguf
 qwen3 Qwen3-0.6B-Q8_0.gguf
 qwen3.8 Qwen3.8-27B-Q4_0.gguf
-granite-3.2 granite-3.2-2b-instruct-Q8_0.gguf
 MODELS

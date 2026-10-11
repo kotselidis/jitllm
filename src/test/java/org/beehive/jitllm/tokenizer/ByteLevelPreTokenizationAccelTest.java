@@ -35,6 +35,10 @@ import org.junit.Test;
  * b} split as {@code a}, both U+3000, {@code b} instead of {@code a}, one U+3000, U+3000 then
  * {@code b}. The expected ids are recorded by {@code record_llama_cpp_ids.sh}; Hugging Face's
  * tokenizers, given the same vocabulary, merges and pre-tokenizer, make the same ones.
+ *
+ * <p>Granite is not here: llama.cpp splits Granite 3.x as the Granite code models, digits first,
+ * and its official tokenizer does not. {@link ByteLevelHuggingFaceAccelTest} checks it, and the
+ * Qwen vocabularies on text that only the official tokenizers' NFC and case folding decide.
  */
 public class ByteLevelPreTokenizationAccelTest {
 
@@ -58,11 +62,6 @@ public class ByteLevelPreTokenizationAccelTest {
     @Test
     public void qwen38TokenizesAsLlamaCpp() throws IOException {
         assertTokenizesAsLlamaCpp(Fixture.QWEN3_8_27B_Q4_0, "qwen3.8");
-    }
-
-    @Test
-    public void granite32TokenizesAsLlamaCpp() throws IOException {
-        assertTokenizesAsLlamaCpp(Fixture.GRANITE_3_2_2B_Q8_0, "granite-3.2");
     }
 
     private static void assertTokenizesAsLlamaCpp(Fixture fixture, String name) throws IOException {

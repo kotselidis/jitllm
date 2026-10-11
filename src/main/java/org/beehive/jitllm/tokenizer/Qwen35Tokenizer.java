@@ -27,7 +27,7 @@ public class Qwen35Tokenizer extends Qwen3Tokenizer {
 
     /** The literal from llama.cpp's {@code LLAMA_VOCAB_PRE_TYPE_QWEN35}, in Java escaping. */
     private static final String QWEN35_PATTERN =
-            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)"
                     + "|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+"
                     + "|\\p{N}"
                     + "| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*"

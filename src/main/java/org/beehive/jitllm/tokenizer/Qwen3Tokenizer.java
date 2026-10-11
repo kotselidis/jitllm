@@ -1,6 +1,7 @@
 package org.beehive.jitllm.tokenizer;
 
 import java.nio.charset.StandardCharsets;
+import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -21,7 +22,7 @@ public class Qwen3Tokenizer implements Tokenizer {
             BYTE_ENCODER.entrySet().stream()
                     .collect(Collectors.toMap(Map.Entry::getValue, Map.Entry::getKey));
     private static final String QWEN3_PATTERN =
-            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     private final Pattern compiledPattern;
     private final Vocabulary vocabulary;
     private final Map<Pair<Integer, Integer>, Integer> merges;
@@ -106,8 +107,8 @@ public class Qwen3Tokenizer implements Tokenizer {
         specialTokens.remove("</think>");
 
         this.vocabulary = vocabulary;
-        // \s is Unicode White_Space, as in the engines the pattern was written for: U+00A0 and
-        // U+3000 are spaces
+        // \s is Unicode White_Space and (?i) folds Unicode case, as in the engines the pattern was
+        // written for: U+00A0 and U+3000 are spaces, 'ſ is a contraction
         this.compiledPattern = Pattern.compile(splitPattern, Pattern.UNICODE_CHARACTER_CLASS);
         this.specialTokens = new HashMap<>(specialTokens);
         this.merges = new HashMap<>();
@@ -237,6 +238,9 @@ public class Qwen3Tokenizer implements Tokenizer {
      *     (Hugging Face, llama.cpp) do
      */
     public List<Integer> encodeOrdinary(String text) {
+        // NFC first, as the normalizer in Qwen's tokenizer.json does: an e and a combining acute
+        // are an é, and the Kelvin sign is a K
+        text = Normalizer.normalize(text, Normalizer.Form.NFC);
         // split text into chunks of text by categories defined in regex pattern
         List<String> textChunks = findAll(compiledPattern, text);
         // all chunks of text are encoded separately, then results are joined

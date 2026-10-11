@@ -29,20 +29,23 @@ public class GraniteTokenizer implements Tokenizer {
     // Pretokenizer patterns
 
     /**
-     * The second stage of {@code refact} (Granite 3.x): GPT-2's split, run on what is left once
-     * every digit has been split off on its own ({@link #DIGIT}). Two stages, as llama.cpp's {@code
-     * LLAMA_VOCAB_PRE_TYPE_REFACT} and the Hugging Face pre-tokenizer ({@code Digits}, then {@code
-     * ByteLevel}) define it; the single Llama 3 style regex used before grouped newlines and
-     * indentation differently.
+     * GPT-2's split, the {@code refact} pre-tokenizer of the Granite 3.x GGUFs. Granite 3.0 to 3.3
+     * split with it alone ({@code ByteLevel(use_regex=true)} in their tokenizer.json); the Granite
+     * code models, which share the vocabulary and so the {@code refact} label, first split every
+     * digit off on its own ({@link #DIGIT}, {@code Digits} then {@code ByteLevel}), as llama.cpp's
+     * {@code LLAMA_VOCAB_PRE_TYPE_REFACT} does for both. The vocabulary merges no digit with a
+     * space, so the digit stage only changes the whitespace before a digit: of a newline, three
+     * spaces and a 1, Granite 3.x makes a newline and two spaces, then a space and the 1; the code
+     * models make a newline and three spaces, then the 1.
      */
     private static final String REFACT_PATTERN =
             "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
 
-    /** The first stage of {@code refact}: each digit is a chunk of its own. */
+    /** The first stage of {@code refact} for the Granite code models: each digit on its own. */
     private static final Pattern DIGIT = Pattern.compile("\\p{N}");
 
     private static final String DBRX_PATTERN =
-            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
     // Instance fields
     private final Pattern compiledPattern;
@@ -55,6 +58,7 @@ public class GraniteTokenizer implements Tokenizer {
     private final int eosTokenId;
     private final int padTokenId;
     private final String pretokenizerType;
+    private final boolean splitDigits;
 
     /** The tool-call markers, displayed although they are special tokens. */
     private final Set<Integer> toolCallMarkers;
@@ -64,13 +68,18 @@ public class GraniteTokenizer implements Tokenizer {
 
         // Detect pretokenizer type and select pattern
         this.pretokenizerType = (String) metadata.getOrDefault("tokenizer.ggml.pre", "refact");
+        // the code models are converted as llama; Granite 3.x is granite (or granitemoe)
+        this.splitDigits =
+                !"dbrx".equals(pretokenizerType)
+                        && !String.valueOf(metadata.get("general.architecture"))
+                                .startsWith("granite");
         String pattern =
                 switch (pretokenizerType) {
                     case "dbrx" -> DBRX_PATTERN;
                     default -> REFACT_PATTERN;
                 };
-        // \s is Unicode White_Space, as in the engines the pattern was written for: U+00A0 and
-        // U+3000 are spaces
+        // \s is Unicode White_Space and (?i) folds Unicode case, as in the engines the pattern was
+        // written for: U+00A0 and U+3000 are spaces, 'ſ is a contraction
         this.compiledPattern = Pattern.compile(pattern, Pattern.UNICODE_CHARACTER_CLASS);
 
         // Read token IDs from metadata
@@ -257,10 +266,7 @@ public class GraniteTokenizer implements Tokenizer {
     }
 
     public List<Integer> encodeOrdinary(String text) {
-        List<String> textChunks =
-                "dbrx".equals(pretokenizerType)
-                        ? findAll(compiledPattern, text)
-                        : splitRefact(text);
+        List<String> textChunks = splitDigits ? splitRefact(text) : findAll(compiledPattern, text);
         List<Integer> ids = new ArrayList<>();
         for (String chunk : textChunks) {
             ids.addAll(encodeChunk(byteLevel(chunk)));
@@ -283,7 +289,7 @@ public class GraniteTokenizer implements Tokenizer {
         return sb.toString();
     }
 
-    /** The {@code refact} split: each digit alone, then {@link #REFACT_PATTERN} between them. */
+    /** The code models' split: each digit alone, then {@link #REFACT_PATTERN} between them. */
     private List<String> splitRefact(String text) {
         List<String> chunks = new ArrayList<>();
         Matcher digit = DIGIT.matcher(text);
