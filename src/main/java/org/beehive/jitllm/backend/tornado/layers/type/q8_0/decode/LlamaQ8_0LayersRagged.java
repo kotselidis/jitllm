@@ -61,7 +61,12 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
     private final IntArray decodeRowSlots;
     private final FloatArray attnPartials;
     private final int kvSplits;
+    // A prompt tile's split covers kvSplitMin positions: kvSplits * kvSplitMin spans the context,
+    // so the split never depends on the tile's last row and a row's bits not on its tile-mates.
     private final int kvSplitMin = 256;
+    // A generated token's split depends on its own length only, so it can be shorter: more splits
+    // run in parallel for the short rows decode mostly has.
+    private final int decodeSplitMin = Integer.getInteger("jitllm.ragged.decodeSplitMin", 64);
     private final boolean flash;
 
     // The int8 GEMMs compute the first int8Rows[1] rows; [0] is unused.
@@ -323,6 +328,7 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                 dim);
 
         int splitCfg = kvSplits | (kvSplitMin << 16);
+        int decodeSplitCfg = kvSplits | (decodeSplitMin << 16);
         int nKvHeads = config.numberOfHeads() / config.kvMul();
         if (flash) {
             g.task(
@@ -364,7 +370,7 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                 layerIndex,
                 config.numberOfLayers(),
                 blockCfg,
-                splitCfg);
+                decodeSplitCfg);
         g.task(
                 "batch_attention_combine",
                 TransformerRaggedBatchKernels::raggedSplitKvAttentionCombine,
