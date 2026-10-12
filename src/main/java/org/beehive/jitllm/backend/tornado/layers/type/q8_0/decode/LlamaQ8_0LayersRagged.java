@@ -78,6 +78,11 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
     // cuBLAS projections over FP16 copies of the weights, at a fixed row count (the step capacity):
     // the library picks its algorithm by shape, so the shape never changes and neither do the bits.
     private final boolean cublas = Boolean.getBoolean("jitllm.ragged.cublas");
+    // Tensor-core GEMMs reading the Q8_0 blocks and the FP16 activations directly, decoding the
+    // weights in shared memory: half cuBLAS's weight bytes, no FP16 copy, invariant by
+    // construction.
+    private final boolean q8f16 = !cublas && Boolean.getBoolean("jitllm.ragged.q8f16");
+    private final List<WorkerGrid2D> q8f16Grids = new ArrayList<>();
 
     private final List<ImmutableTaskGraph> layerITGs;
     private String lastLayerTaskGraphID;
@@ -139,8 +144,18 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
         long partialFloats = 0;
         for (int[] nk : new int[][] {{dim, dim}, {config.kvDim(), dim}, {hid, dim}, {dim, hid}}) {
             int splits = gemmSplits(nk[0], nk[1]);
-            if (splits > 1 && !cublas) {
+            if (splits > 1 && !cublas && !q8f16) {
                 partialFloats = Math.max(partialFloats, (long) splits * paddedRows * nk[0]);
+            }
+        }
+        if (Boolean.getBoolean("jitllm.ragged.q8f16")
+                && !Boolean.getBoolean("jitllm.ragged.cublas")) {
+            int qkv = dim + 2 * config.kvDim();
+            for (int[] nk : new int[][] {{qkv, dim}, {dim, dim}, {2 * hid, dim}, {dim, hid}}) {
+                int splits = q8f16Splits(nk[0], nk[1]);
+                if (splits > 1) {
+                    partialFloats = Math.max(partialFloats, (long) splits * paddedRows * nk[0]);
+                }
             }
         }
         this.splitPartial = TornadoWorkspaces.floats((int) Math.max(1, partialFloats));
@@ -219,7 +234,7 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
             g.consumeFromDevice(pred, shared);
             g.consumeFromDevice(pred, state.workspace.wrapXBatch);
         }
-        if (cublas) {
+        if (cublas || q8f16) {
             g.transferToDevice(
                     DataTransferMode.FIRST_EXECUTION,
                     weights.rms_att_weightLayered[layerIndex].asFloatArray(),
@@ -264,7 +279,19 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                 state.workspace.attnScaleBatch,
                 dim);
 
-        if (cublas) {
+        if (q8f16) {
+            q8f16Gemm(
+                    g,
+                    "qkvProj",
+                    stack(
+                            weights.wqLayered[layerIndex],
+                            weights.wkLayered[layerIndex],
+                            weights.wvLayered[layerIndex]),
+                    state.workspace.wrapXbFP16Batch,
+                    state.workspace.qkvResultBatch,
+                    qkvDim,
+                    dim);
+        } else if (cublas) {
             nativeGemm(
                     g,
                     "qkvProj",
@@ -395,7 +422,16 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                 config.numberOfHeads() * config.headSize(),
                 config.headSize());
 
-        if (cublas) {
+        if (q8f16) {
+            q8f16Gemm(
+                    g,
+                    "woProj",
+                    stack(weights.woLayered[layerIndex]),
+                    state.workspace.attnOutFP16,
+                    state.workspace.woOut,
+                    dim,
+                    dim);
+        } else if (cublas) {
             nativeGemm(
                     g,
                     "woProj",
@@ -439,7 +475,16 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                 state.workspace.ffnScaleBatch,
                 dim);
 
-        if (cublas) {
+        if (q8f16) {
+            q8f16Gemm(
+                    g,
+                    "gateUpProj",
+                    stack(weights.w1Layered[layerIndex], weights.w3Layered[layerIndex]),
+                    state.workspace.normedXFFNFP16,
+                    state.workspace.gateUpResultBatch,
+                    2 * hidDim,
+                    dim);
+        } else if (cublas) {
             nativeGemm(
                     g,
                     "gateUpProj",
@@ -479,7 +524,16 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                 state.workspace.gateUpResultBatch,
                 hidDim);
 
-        if (cublas) {
+        if (q8f16) {
+            q8f16Gemm(
+                    g,
+                    "w2Proj",
+                    stack(weights.w2Layered[layerIndex]),
+                    state.workspace.wrapHbFP16Batch,
+                    state.workspace.w2Out,
+                    dim,
+                    hidDim);
+        } else if (cublas) {
             nativeGemm(
                     g,
                     "w2Proj",
@@ -553,6 +607,90 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                 0.0f,
                 out,
                 n);
+    }
+
+    /**
+     * K splits for an {@code n x k} {@link TransformerRaggedBatchKernels#gemmQ8F16}: enough
+     * 64-column workgroups for two per multiprocessor, at most eight, at least four blocks each.
+     * Fixed per shape, so a row's sum is cut the same way whatever the step.
+     */
+    private static int q8f16Splits(int n, int k) {
+        int forced = Integer.getInteger("jitllm.ragged.q8f16Splits", 0);
+        int kBlocks = k / 32;
+        if (forced > 0) {
+            return Math.min(forced, kBlocks);
+        }
+        int sms = org.beehive.jitllm.backend.tornado.device.TornadoDevices.target().computeUnits();
+        int tiles = n / TransformerRaggedBatchKernels.Q8F16_COLS;
+        int splits = sms <= 0 ? 1 : (2 * sms + tiles - 1) / tiles;
+        return Math.max(1, Math.min(Math.min(8, kBlocks / 4), splits));
+    }
+
+    /**
+     * {@code out[r * n + c] = x[r] . w[c]} on {@link TransformerRaggedBatchKernels#gemmQ8F16}, the
+     * Q8_0 blocks as the file stores them; split along K by {@link #q8f16Splits} and finished by an
+     * ordered reduce. {@code out} rows are {@code n} wide (stacked projections fill them).
+     */
+    private void q8f16Gemm(
+            TaskGraph g, String task, ByteArray w, HalfFloatArray x, FloatArray out, int n, int k) {
+        int splits = q8f16Splits(n, k);
+        g.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+        g.task(
+                task,
+                TransformerRaggedBatchKernels::gemmQ8F16,
+                context,
+                x,
+                w,
+                out,
+                splits > 1 ? splitPartial : out,
+                int8Rows,
+                n,
+                k,
+                splits,
+                paddedRows * n,
+                n,
+                0);
+        int tokenGroups =
+                (rows + TransformerRaggedBatchKernels.Q8F16_TOKENS - 1)
+                        / TransformerRaggedBatchKernels.Q8F16_TOKENS;
+        WorkerGrid2D grid =
+                new WorkerGrid2D(
+                        n / TransformerRaggedBatchKernels.Q8F16_COLS * splits * 128, tokenGroups);
+        grid.setLocalWork(128, 1, 1);
+        q8f16Grids.add(grid);
+        grids.put(g.getTaskGraphName() + "." + task, grid);
+        if (splits > 1) {
+            g.task(
+                    task + "_reduce",
+                    TransformerRaggedBatchKernels::reduceSplitsPacked,
+                    context,
+                    splitPartial,
+                    out,
+                    paddedRows * n,
+                    splits,
+                    int8Rows,
+                    n,
+                    n,
+                    0);
+            rowTask(g, task + "_reduce", rows * n, n, 256);
+        }
+    }
+
+    /** Q8_0 projections stacked row after row: each row's blocks are self-contained. */
+    private static ByteArray stack(TornadoTensor... projections) {
+        long total = 0;
+        for (TornadoTensor t : projections) {
+            total += t.asByteArray().getSize();
+        }
+        ByteArray out = new ByteArray((int) total);
+        long at = 0;
+        for (TornadoTensor t : projections) {
+            ByteArray b = t.asByteArray();
+            java.lang.foreign.MemorySegment.copy(
+                    b.getSegment(), 0, out.getSegment(), at, b.getSize());
+            at += b.getSize();
+        }
+        return out;
     }
 
     /**
@@ -719,6 +857,12 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
                             (long) mTiles * Int8GemmKernels.Q8_GEMM_THREADS,
                             gemmGridColumns.get(i),
                             1);
+        }
+        int tokenGroups =
+                (activeRows + TransformerRaggedBatchKernels.Q8F16_TOKENS - 1)
+                        / TransformerRaggedBatchKernels.Q8F16_TOKENS;
+        for (WorkerGrid2D grid : q8f16Grids) {
+            grid.setGlobalWork(grid.getGlobalWork()[0], Math.max(1, tokenGroups), 1);
         }
         if (flashWorker != null) {
             int nKvHeads = config.numberOfHeads() / config.kvMul();

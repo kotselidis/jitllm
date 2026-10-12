@@ -4,6 +4,7 @@ import uk.ac.manchester.tornado.api.KernelContext;
 import uk.ac.manchester.tornado.api.enums.MMAShape;
 import uk.ac.manchester.tornado.api.math.TornadoMath;
 import uk.ac.manchester.tornado.api.types.HalfFloat;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
@@ -1464,6 +1465,260 @@ public class TransformerRaggedBatchKernels {
         if (t + 1 < rows) {
             C.set((t + 1) * ldc + n, acc[1]);
             C.set((t + 1) * ldc + n + 8, acc[3]);
+        }
+    }
+
+    /** Output columns one {@link #gemmQ8F16} workgroup computes: four warps of sixteen. */
+    public static final int Q8F16_COLS = 64;
+
+    /** Tokens one {@link #gemmQ8F16} workgroup computes: eight m16n8k16 B tiles. */
+    public static final int Q8F16_TOKENS = 64;
+
+    /** Q8_0 blocks (32 K positions each) of the token tile staged at a time. */
+    private static final int Q8F16_CHUNK_BLOCKS = 8;
+
+    // @formatter:off
+    /**
+     * Tensor-core GEMM over Q8_0 weights and FP16 tokens: {@code C[t, colOffset + n] = sum_k X[t,
+     * k] * fp16(q[n, k] * scale[n, k / 32])} for {@code t < stepRows[1]}.
+     *
+     * <p>A ragged step is mostly a few tokens against every weight, so the time is reading the
+     * weights; read as Q8_0 they are half the bytes of FP16. As in {@link #gemmMMASkinny} the
+     * weights are the m16n8k16 A operand and the tokens the B operand. Each Q8_0 block is decoded
+     * to FP16 into shared memory (one block of 64 columns per round, a lane decoding sixteen values
+     * of one column), the tokens are staged {@value #Q8F16_CHUNK_BLOCKS} blocks at a time, and each
+     * warp multiplies its sixteen columns against the workgroup's {@value #Q8F16_TOKENS} tokens in
+     * eight 8-token accumulators (all eight always: a fragment assigned under a condition is
+     * lowered to an assignment NVRTC rejects).
+     *
+     * <p>Every output value is its K blocks' two k16 products summed into one accumulator in
+     * ascending K order (within a split; splits are fixed per shape and added in order by {@link
+     * #reduceSplitsPacked}), whatever the step's size or the workgroup's other tokens: a row's bits
+     * do not depend on the batch.
+     *
+     * <p>Requires {@code N % 64 == 0}, {@code K % 32 == 0}, and {@code X} holding at least {@code
+     * 64 * gridY} rows. Worker: {@code WorkerGrid2D(N / 64 * splits * 128, ceil(rows / 64))}, local
+     * (128, 1, 1).
+     *
+     * @param partial split partial sums, {@code splits * total} floats, when {@code splits > 1}
+     * @param total {@code rows capacity * N}, the stride of one split in {@code partial}
+     * @param ldc row stride of {@code C}
+     * @param colOffset first column of {@code C} this product writes, for packed outputs
+     */
+    // @formatter:on
+    public static void gemmQ8F16(
+            KernelContext ctx,
+            HalfFloatArray X,
+            ByteArray W,
+            FloatArray C,
+            FloatArray partial,
+            IntArray stepRows,
+            int N,
+            int K,
+            int splits,
+            int total,
+            int ldc,
+            int colOffset) {
+        int rows = stepRows.get(1);
+        int tokBase = ctx.groupIdy * Q8F16_TOKENS;
+        // Uniform across the workgroup, so it returns as one and the barriers stay uniform.
+        if (tokBase >= rows) {
+            return;
+        }
+        int tid = ctx.localIdx;
+        int lane = tid & 31;
+        int warp = tid >>> 5;
+        int colTile = ctx.groupIdx / splits;
+        int split = ctx.groupIdx - colTile * splits;
+        int blockCol = colTile * Q8F16_COLS;
+        int kBlocks = K / 32;
+        int blocksPerSplit = (kBlocks + splits - 1) / splits;
+        int kb0 = split * blocksPerSplit;
+        int kb1 = Math.min(kBlocks, kb0 + blocksPerSplit);
+
+        // Decoded weights: [k16 step of the block][column][k pair], 512 bytes per 16 columns.
+        int[] aTile = ctx.allocateIntLocalArray(2 * Q8F16_COLS * 8);
+        // Tokens: [B tile][k16 step][kRow * 4 + token pair], 256 bytes per step.
+        int[] xTile = ctx.allocateIntLocalArray(8 * Q8F16_CHUNK_BLOCKS * 2 * 64);
+
+        float[] c0 = ctx.mmaFragment(0.0f);
+        float[] c1 = ctx.mmaFragment(0.0f);
+        float[] c2 = ctx.mmaFragment(0.0f);
+        float[] c3 = ctx.mmaFragment(0.0f);
+        float[] c4 = ctx.mmaFragment(0.0f);
+        float[] c5 = ctx.mmaFragment(0.0f);
+        float[] c6 = ctx.mmaFragment(0.0f);
+        float[] c7 = ctx.mmaFragment(0.0f);
+
+        // This lane decodes sixteen values of one column per block: column tid / 2, half tid % 2.
+        int wCol = tid >>> 1;
+        int half = tid & 1;
+        int wRowBase = (blockCol + wCol) * kBlocks;
+        int aDst = half * Q8F16_COLS * 8 + wCol * 8;
+        int stepsPerChunk = Q8F16_CHUNK_BLOCKS * 2;
+        int perFrag = stepsPerChunk * 64;
+        int liveFrags = Math.min(8, (rows - tokBase + 7) >>> 3);
+
+        int[] wBits = new int[8];
+        int off0 = (wRowBase + kb0) * 34;
+        float wScale = W.getHalfFloat(off0).getFloat32();
+        for (int p = 0; p < 8; p++) {
+            wBits[p] = W.getHalfFloat(off0 + 2 + half * 16 + 2 * p).getHalfFloatValue();
+        }
+
+        // One flat loop over the blocks (a fragment carried through nested loops is lowered to an
+        // assignment NVRTC rejects).
+        for (int kb = kb0; kb < kb1; kb++) {
+            int inChunk = (kb - kb0) % Q8F16_CHUNK_BLOCKS;
+            if (inChunk == 0) {
+                ctx.localBarrier();
+                int kc = kb * 32;
+                int chunkSteps = Math.min(stepsPerChunk, (kb1 - kb) * 2);
+                // Only the B tiles holding real tokens; lanes walk K fastest so a warp's loads of a
+                // token row are contiguous. Tiles past the step keep stale values that feed only
+                // accumulators never stored.
+                for (int idx = tid; idx < liveFrags * perFrag; idx += 128) {
+                    int kRow = idx & 15;
+                    int step = (idx >>> 4) % stepsPerChunk;
+                    int fp = (idx >>> 4) / stepsPerChunk;
+                    int frag = fp >>> 2;
+                    int pair = fp & 3;
+                    if (step < chunkSteps) {
+                        int t = tokBase + frag * 8 + (pair << 1);
+                        int k = kc + step * 16 + kRow;
+                        int lo = X.get(t * K + k).getHalfFloatValue() & 0xFFFF;
+                        int hi = X.get((t + 1) * K + k).getHalfFloatValue() & 0xFFFF;
+                        xTile[frag * perFrag + step * 64 + kRow * 4 + pair] = lo | (hi << 16);
+                    }
+                }
+                ctx.localBarrier();
+            }
+            // Decode the block loaded last round, then load the next one so its latency overlaps
+            // this round's multiplies.
+            for (int p = 0; p < 8; p++) {
+                int bits = wBits[p];
+                float v0 = (float) ((byte) (bits & 0xFF)) * wScale;
+                float v1 = (float) ((byte) (bits >> 8)) * wScale;
+                int h0 = new HalfFloat(v0).getHalfFloatValue() & 0xFFFF;
+                int h1 = new HalfFloat(v1).getHalfFloatValue() & 0xFFFF;
+                aTile[aDst + p] = h0 | (h1 << 16);
+            }
+            ctx.localBarrier();
+            if (kb + 1 < kb1) {
+                int off = (wRowBase + kb + 1) * 34;
+                wScale = W.getHalfFloat(off).getFloat32();
+                int q = off + 2 + half * 16;
+                for (int p = 0; p < 8; p++) {
+                    wBits[p] = W.getHalfFloat(q + 2 * p).getHalfFloatValue();
+                }
+            }
+
+            int s0 = inChunk * 2;
+            HalfFloat[] a0 = ctx.mmaLoadA(aTile, 16, warp * 512);
+            HalfFloat[] a1 = ctx.mmaLoadA(aTile, 16, Q8F16_COLS * 32 + warp * 512);
+            HalfFloat[] b0 = ctx.mmaLoadB(xTile, 16, s0 * 256);
+            HalfFloat[] b1 = ctx.mmaLoadB(xTile, 16, (s0 + 1) * 256);
+            c0 = ctx.mma(a0, b0, c0, MMAShape.M16N8K16);
+            c0 = ctx.mma(a1, b1, c0, MMAShape.M16N8K16);
+            HalfFloat[] b2 = ctx.mmaLoadB(xTile, 16, (stepsPerChunk + s0) * 256);
+            HalfFloat[] b3 = ctx.mmaLoadB(xTile, 16, (stepsPerChunk + s0 + 1) * 256);
+            c1 = ctx.mma(a0, b2, c1, MMAShape.M16N8K16);
+            c1 = ctx.mma(a1, b3, c1, MMAShape.M16N8K16);
+            HalfFloat[] b4 = ctx.mmaLoadB(xTile, 16, (2 * stepsPerChunk + s0) * 256);
+            HalfFloat[] b5 = ctx.mmaLoadB(xTile, 16, (2 * stepsPerChunk + s0 + 1) * 256);
+            c2 = ctx.mma(a0, b4, c2, MMAShape.M16N8K16);
+            c2 = ctx.mma(a1, b5, c2, MMAShape.M16N8K16);
+            HalfFloat[] b6 = ctx.mmaLoadB(xTile, 16, (3 * stepsPerChunk + s0) * 256);
+            HalfFloat[] b7 = ctx.mmaLoadB(xTile, 16, (3 * stepsPerChunk + s0 + 1) * 256);
+            c3 = ctx.mma(a0, b6, c3, MMAShape.M16N8K16);
+            c3 = ctx.mma(a1, b7, c3, MMAShape.M16N8K16);
+            HalfFloat[] b8 = ctx.mmaLoadB(xTile, 16, (4 * stepsPerChunk + s0) * 256);
+            HalfFloat[] b9 = ctx.mmaLoadB(xTile, 16, (4 * stepsPerChunk + s0 + 1) * 256);
+            c4 = ctx.mma(a0, b8, c4, MMAShape.M16N8K16);
+            c4 = ctx.mma(a1, b9, c4, MMAShape.M16N8K16);
+            HalfFloat[] b10 = ctx.mmaLoadB(xTile, 16, (5 * stepsPerChunk + s0) * 256);
+            HalfFloat[] b11 = ctx.mmaLoadB(xTile, 16, (5 * stepsPerChunk + s0 + 1) * 256);
+            c5 = ctx.mma(a0, b10, c5, MMAShape.M16N8K16);
+            c5 = ctx.mma(a1, b11, c5, MMAShape.M16N8K16);
+            HalfFloat[] b12 = ctx.mmaLoadB(xTile, 16, (6 * stepsPerChunk + s0) * 256);
+            HalfFloat[] b13 = ctx.mmaLoadB(xTile, 16, (6 * stepsPerChunk + s0 + 1) * 256);
+            c6 = ctx.mma(a0, b12, c6, MMAShape.M16N8K16);
+            c6 = ctx.mma(a1, b13, c6, MMAShape.M16N8K16);
+            HalfFloat[] b14 = ctx.mmaLoadB(xTile, 16, (7 * stepsPerChunk + s0) * 256);
+            HalfFloat[] b15 = ctx.mmaLoadB(xTile, 16, (7 * stepsPerChunk + s0 + 1) * 256);
+            c7 = ctx.mma(a0, b14, c7, MMAShape.M16N8K16);
+            c7 = ctx.mma(a1, b15, c7, MMAShape.M16N8K16);
+            ctx.localBarrier();
+        }
+
+        // Fragment j element i: column n0 + lane / 4 + 8 * (i / 2), token 8j + (lane % 4) * 2 + i %
+        // 2.
+        int n = blockCol + warp * 16 + lane / 4;
+        int t = tokBase + (lane & 3) * 2;
+        int base = split * total;
+        storeQ8F16(
+                C, partial, splits, base, rows, t, n, N, ldc, colOffset, c0[0], c0[1], c0[2],
+                c0[3]);
+        storeQ8F16(
+                C, partial, splits, base, rows, t + 8, n, N, ldc, colOffset, c1[0], c1[1], c1[2],
+                c1[3]);
+        storeQ8F16(
+                C, partial, splits, base, rows, t + 16, n, N, ldc, colOffset, c2[0], c2[1], c2[2],
+                c2[3]);
+        storeQ8F16(
+                C, partial, splits, base, rows, t + 24, n, N, ldc, colOffset, c3[0], c3[1], c3[2],
+                c3[3]);
+        storeQ8F16(
+                C, partial, splits, base, rows, t + 32, n, N, ldc, colOffset, c4[0], c4[1], c4[2],
+                c4[3]);
+        storeQ8F16(
+                C, partial, splits, base, rows, t + 40, n, N, ldc, colOffset, c5[0], c5[1], c5[2],
+                c5[3]);
+        storeQ8F16(
+                C, partial, splits, base, rows, t + 48, n, N, ldc, colOffset, c6[0], c6[1], c6[2],
+                c6[3]);
+        storeQ8F16(
+                C, partial, splits, base, rows, t + 56, n, N, ldc, colOffset, c7[0], c7[1], c7[2],
+                c7[3]);
+    }
+
+    /**
+     * Tokens {@code t} and {@code t + 1} of columns {@code n} and {@code n + 8} of {@link
+     * #gemmQ8F16}: into {@code C}, or this split's partial sums laid out {@code N} wide.
+     */
+    private static void storeQ8F16(
+            FloatArray C,
+            FloatArray partial,
+            int splits,
+            int base,
+            int rows,
+            int t,
+            int n,
+            int N,
+            int ldc,
+            int colOffset,
+            float v0,
+            float v1,
+            float v2,
+            float v3) {
+        if (splits > 1) {
+            if (t < rows) {
+                partial.set(base + t * N + n, v0);
+                partial.set(base + t * N + n + 8, v2);
+            }
+            if (t + 1 < rows) {
+                partial.set(base + (t + 1) * N + n, v1);
+                partial.set(base + (t + 1) * N + n + 8, v3);
+            }
+        } else {
+            if (t < rows) {
+                C.set(t * ldc + colOffset + n, v0);
+                C.set(t * ldc + colOffset + n + 8, v2);
+            }
+            if (t + 1 < rows) {
+                C.set((t + 1) * ldc + colOffset + n, v1);
+                C.set((t + 1) * ldc + colOffset + n + 8, v3);
+            }
         }
     }
 
