@@ -697,7 +697,7 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
      * The Q8_0 projections decoded to FP16 and stacked row after row, {@code k} inputs a row:
      * {@code q * scale} in FP32, rounded once to FP16.
      */
-    private static HalfFloatArray dequantize(int k, TornadoTensor... projections) {
+    public static HalfFloatArray dequantize(int k, TornadoTensor... projections) {
         int blocksPerRow = k / 32;
         long total = 0;
         for (TornadoTensor t : projections) {

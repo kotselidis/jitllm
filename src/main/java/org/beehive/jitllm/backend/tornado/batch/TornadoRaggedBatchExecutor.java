@@ -270,7 +270,31 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
                                 rmsFinal,
                                 finalScale,
                                 dim);
-        if (q8) {
+        if (q8 && Boolean.getBoolean("jitllm.ragged.cublas")) {
+            // Q8_0 with cuBLAS projections: the vocabulary projection too, over an FP16 copy, for
+            // all maxSequences rows every step so cuBLAS never changes its algorithm.
+            HalfFloatArray wclsFP16 =
+                    org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LlamaQ8_0LayersRagged
+                            .dequantize(dim, weights.wclsByteArray);
+            logitsGraph
+                    .transferToDevice(DataTransferMode.FIRST_EXECUTION, wclsFP16)
+                    .libraryTask(
+                            "vocab",
+                            uk.ac.manchester.tornado.cublas.CuBlas::cublasGemmExFP16FP32,
+                            1,
+                            0,
+                            vocab,
+                            maxSequences,
+                            dim,
+                            1.0f,
+                            wclsFP16,
+                            dim,
+                            normedFinalFP16,
+                            dim,
+                            0.0f,
+                            logits,
+                            vocab);
+        } else if (q8) {
             // Q8_0: the vocabulary projection on the int8 GEMM, its weight through the repack.
             state.workspace.packedRepack.upload(logitsGraph, weights.wclsByteArray);
             logitsGraph
