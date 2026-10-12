@@ -276,24 +276,37 @@ public final class TornadoRaggedBatchExecutor implements TornadoServingExecutor 
             HalfFloatArray wclsFP16 =
                     org.beehive.jitllm.backend.tornado.layers.type.q8_0.decode.LlamaQ8_0LayersRagged
                             .dequantize(dim, weights.wclsByteArray);
-            logitsGraph
-                    .transferToDevice(DataTransferMode.FIRST_EXECUTION, wclsFP16)
-                    .libraryTask(
-                            "vocab",
-                            uk.ac.manchester.tornado.cublas.CuBlas::cublasGemmExFP16FP32,
-                            1,
-                            0,
-                            vocab,
-                            maxSequences,
-                            dim,
-                            1.0f,
-                            wclsFP16,
-                            dim,
-                            normedFinalFP16,
-                            dim,
-                            0.0f,
-                            logits,
-                            vocab);
+            logitsGraph.transferToDevice(DataTransferMode.FIRST_EXECUTION, wclsFP16);
+            if (Boolean.getBoolean("jitllm.ragged.cublasPinned")) {
+                logitsGraph.libraryTask(
+                        "vocab",
+                        org.beehive.jitllm.backend.tornado.nativelib.PinnedLt::gemmFP16FP32,
+                        vocab,
+                        maxSequences,
+                        dim,
+                        wclsFP16,
+                        normedFinalFP16,
+                        logits,
+                        logitsRowsInt8,
+                        1,
+                        vocab);
+            } else
+                logitsGraph.libraryTask(
+                        "vocab",
+                        uk.ac.manchester.tornado.cublas.CuBlas::cublasGemmExFP16FP32,
+                        1,
+                        0,
+                        vocab,
+                        maxSequences,
+                        dim,
+                        1.0f,
+                        wclsFP16,
+                        dim,
+                        normedFinalFP16,
+                        dim,
+                        0.0f,
+                        logits,
+                        vocab);
         } else if (q8) {
             // Q8_0: the vocabulary projection on the int8 GEMM, its weight through the repack.
             state.workspace.packedRepack.upload(logitsGraph, weights.wclsByteArray);

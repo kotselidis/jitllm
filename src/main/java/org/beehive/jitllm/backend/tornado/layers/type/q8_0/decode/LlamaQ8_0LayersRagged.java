@@ -78,6 +78,9 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
     // cuBLAS projections over FP16 copies of the weights, at a fixed row count (the step capacity):
     // the library picks its algorithm by shape, so the shape never changes and neither do the bits.
     private final boolean cublas = Boolean.getBoolean("jitllm.ragged.cublas");
+    // cuBLAS on one algorithm per shape, over only the step's rows (rounded to 16): small decode
+    // steps and large prompt steps on one GEMM, same bits at every row count.
+    static final boolean PINNED = Boolean.getBoolean("jitllm.ragged.cublasPinned");
     // Tensor-core GEMMs reading the Q8_0 blocks and the FP16 activations directly, decoding the
     // weights in shared memory: half cuBLAS's weight bytes, no FP16 copy, invariant by
     // construction.
@@ -591,6 +594,21 @@ public class LlamaQ8_0LayersRagged implements RaggedLayers {
             int n,
             int k) {
         g.transferToDevice(DataTransferMode.FIRST_EXECUTION, w);
+        if (PINNED) {
+            g.libraryTask(
+                    task,
+                    org.beehive.jitllm.backend.tornado.nativelib.PinnedLt::gemmFP16FP32,
+                    n,
+                    rows,
+                    k,
+                    w,
+                    x,
+                    out,
+                    int8Rows,
+                    1,
+                    n);
+            return;
+        }
         g.libraryTask(
                 task,
                 uk.ac.manchester.tornado.cublas.CuBlas::cublasGemmExFP16FP32,
