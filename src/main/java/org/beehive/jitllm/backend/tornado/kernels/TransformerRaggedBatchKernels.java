@@ -1290,6 +1290,34 @@ public class TransformerRaggedBatchKernels {
     }
 
     /**
+     * Finishes a split {@code Int8GemmKernels.gemmInt8Q8_0} into a packed row: {@code out[r * ldo +
+     * colOffset + c] = partial[0][r][c] + ... + partial[splits - 1][r][c]}, the splits added in
+     * order. As {@code Int8GemmKernels.reduceSplitsQ8_0}, but the result can land beside other
+     * projections in one row (Q, K and V; gate and up). Only the first {@code rowsHolder[1]} rows.
+     * Worker: {@code n} lanes per row.
+     */
+    public static void reduceSplitsPacked(
+            KernelContext context,
+            FloatArray partial,
+            FloatArray out,
+            int total,
+            int splits,
+            IntArray rowsHolder,
+            int n,
+            int ldo,
+            int colOffset) {
+        int i = context.globalIdx;
+        if (i < total && i < rowsHolder.get(1) * n) {
+            float sum = partial.get(i);
+            for (int s = 1; s < splits; s++) {
+                sum += partial.get(s * total + i);
+            }
+            int row = i / n;
+            out.set(row * ldo + colOffset + i - row * n, sum);
+        }
+    }
+
+    /**
      * Split-K paged attention, second pass: one workgroup per (row, head), one thread per head
      * dimension. Rescales each split's partial result to the overall max and normalises by the
      * rescaled sum of the splits, visiting them in order.
